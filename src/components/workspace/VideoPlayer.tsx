@@ -119,10 +119,14 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
             </div>
           )}
 
-          {/* Subtitle overlay */}
+          {/* Subtitle overlay — outlined text, no background box, matching
+              Aegisub's own preview rendering rather than a solid caption bar */}
           {activeSub && (
             <div className="absolute bottom-10 left-0 right-0 flex justify-center pointer-events-none px-4">
-              <div className="bg-black/80 text-white text-sm px-3 py-1.5 rounded text-center max-w-xl leading-snug">
+              <div
+                className="text-white text-base font-medium text-center max-w-2xl leading-snug whitespace-pre-line"
+                style={{ textShadow: '-1.5px -1.5px 0 #000, 1.5px -1.5px 0 #000, -1.5px 1.5px 0 #000, 1.5px 1.5px 0 #000, 0 0 4px rgba(0,0,0,0.8)' }}
+              >
                 {activeSub.text.replace(/\\N/gi, '\n').replace(/\{[^}]+\}/g, '')}
               </div>
             </div>

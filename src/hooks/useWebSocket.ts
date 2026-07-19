@@ -6,6 +6,7 @@ export function useWebSocket() {
   const backendPort = useAppStore((s) => s.backendPort)
   const handleWsMessage = useAppStore((s) => s.handleWsMessage)
   const setBackendReady = useAppStore((s) => s.setBackendReady)
+  const reconcileActiveJobs = useAppStore((s) => s.reconcileActiveJobs)
   const ws = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -19,6 +20,12 @@ export function useWebSocket() {
       socket.onopen = () => {
         setBackendReady(true)
         console.log('[ws] Connected to backend')
+        // Drop any "running" job the frontend remembers that the backend
+        // itself no longer knows about — see reconcileActiveJobs for why.
+        fetch(`http://localhost:${backendPort}/api/jobs`)
+          .then((r) => r.json())
+          .then((jobs: Array<{ id: string }>) => reconcileActiveJobs(jobs.map((j) => j.id)))
+          .catch(() => {})
       }
 
       socket.onmessage = (event) => {
@@ -43,7 +50,7 @@ export function useWebSocket() {
     } catch {
       reconnectTimer.current = setTimeout(connect, 2000)
     }
-  }, [backendPort, handleWsMessage, setBackendReady])
+  }, [backendPort, handleWsMessage, setBackendReady, reconcileActiveJobs])
 
   useEffect(() => {
     // Wait a bit for backend to start

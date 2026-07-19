@@ -23,6 +23,7 @@ interface AppState {
   clearIncomingPowerShareRequest: () => void
   upsertJob: (job: JobStatus) => void
   removeJob: (jobId: string) => void
+  reconcileActiveJobs: (liveJobIds: string[]) => void
   handleWsMessage: (msg: WsMessage) => void
 }
 
@@ -57,6 +58,26 @@ export const useAppStore = create<AppState>((set, get) => ({
     const jobs = new Map(state.activeJobs)
     jobs.delete(jobId)
     return { activeJobs: jobs }
+  }),
+
+  // job_manager's job registry lives only in the backend's process memory —
+  // it's wiped on every backend restart. If the frontend still thinks a job
+  // is "running" from before a restart (or a missed/dropped WS message), the
+  // backend will never send another update for that id, and the tile's
+  // percent/message freezes forever. Called once per WS (re)connect with the
+  // backend's current job list, so anything the backend no longer knows
+  // about gets dropped instead of showing a stale progress bar indefinitely.
+  reconcileActiveJobs: (liveJobIds) => set((state) => {
+    const live = new Set(liveJobIds)
+    let changed = false
+    const jobs = new Map(state.activeJobs)
+    for (const [id, job] of jobs) {
+      if (job.status === 'running' && !live.has(id)) {
+        jobs.delete(id)
+        changed = true
+      }
+    }
+    return changed ? { activeJobs: jobs } : state
   }),
 
   handleWsMessage: (msg) => {

@@ -9,8 +9,12 @@ import type { Title, Episode, JobStatus, HikkaAnimeResult } from '../types'
 
 function formatDuration(seconds: number | null): string {
   if (!seconds) return '—'
-  const m = Math.floor(seconds / 60)
-  const s = seconds % 60
+  // ffprobe's duration is a float (e.g. 1428.427), and `% 60` on a float
+  // exposes raw binary floating-point error (e.g. "48.42699999999995")
+  // instead of a clean seconds count if not rounded first.
+  const total = Math.round(seconds)
+  const m = Math.floor(total / 60)
+  const s = total % 60
   return `${m}:${String(s).padStart(2, '0')}`
 }
 

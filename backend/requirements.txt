@@ -1,0 +1,17 @@
+requests==2.32.3
+fastapi==0.111.1
+uvicorn[standard]==0.30.3
+websockets==12.0
+aiofiles==23.2.1
+python-multipart==0.0.9
+SQLAlchemy==2.0.31
+alembic==1.13.2
+pydantic==2.8.2
+pydantic-settings==2.3.4
+webrtcvad==2.0.10
+silero-vad==5.1
+
+# audio-separator pulls its own compatible numpy/scipy/librosa/soundfile/torch —
+# do not pin those separately, it causes version conflicts (verified 2026-07-19).
+# [cpu] extra pulls onnxruntime (CPU); swap to [gpu] on a machine with CUDA.
+audio-separator[cpu]==0.44.3

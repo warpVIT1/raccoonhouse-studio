@@ -1,0 +1,161 @@
+"""
+Vocal separation via audio-separator (wraps Ultimate Vocal Remover's models).
+
+Models exposed match UVR's own dropdown:
+  - MDX-Net   → UVR-MDX-NET Inst HQ 3 (default — fast, low VRAM)
+  - VR Arch   → UVR-DeEcho-Normal (VR Architecture)
+  - Demucs    → htdemucs_ft (Demucs v4 fine-tuned)
+  - MDX23C    → MDX23C-InstVoc HQ
+  - BS-RoFormer → BS-Roformer-Viperx-1297 (best quality, slow/high VRAM)
+
+Ensemble mode: run all selected models and average the stems, the way UVR's
+own ensemble mode combines multiple model outputs.
+
+NOTE: audio_separator.Separator.load_model() requires the *exact* filename
+(including extension) from its model registry (Separator().list_supported_model_files()),
+not the bare display name — verified 2026-07-19 against audio-separator 0.44.3.
+"""
+import os
+import shutil
+from pathlib import Path
+from sqlalchemy.orm import Session
+
+from ..models import Episode
+from ..database import SessionLocal
+from ..job_manager import ProgressReporter
+
+DATA_DIR = os.environ.get("RH_DATA_DIR", os.path.join(os.path.expanduser("~"), ".raccoonhouse"))
+
+DEFAULT_MODEL = "MDX-Net"
+
+MODEL_MAP = {
+    "MDX-Net": "UVR-MDX-NET-Inst_HQ_3.onnx",
+    "VR Arch": "UVR-De-Echo-Normal.pth",
+    "Demucs": "htdemucs_ft.yaml",
+    "MDX23C": "MDX23C-8KFFT-InstVoc_HQ.ckpt",
+    "BS-RoFormer": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+}
+
+
+def separate_file(
+    audio_path: str,
+    output_dir: str,
+    model_name: str,
+    ensemble: bool,
+    on_progress=None,  # Optional[Callable[[int, str], None]] — no DB/job coupling
+    is_cancelled=None,  # Optional[Callable[[], bool]]
+) -> str:
+    """Core separation routine, independent of any Episode/DB — used both for
+    local jobs (run_separation below) and for power-shared jobs run on a peer
+    machine that has no record of this episode at all."""
+    try:
+        from audio_separator.separator import Separator
+    except ImportError:
+        raise RuntimeError("audio-separator not installed. Run: pip install audio-separator")
+
+    os.makedirs(output_dir, exist_ok=True)
+    models_to_run = list(MODEL_MAP.keys()) if ensemble else [model_name]
+    vocal_stems: list[str] = []
+
+    def progress(pct, msg):
+        if on_progress:
+            on_progress(pct, msg)
+
+    for idx, mdl in enumerate(models_to_run):
+        if is_cancelled and is_cancelled():
+            raise RuntimeError("Скасовано")
+
+        uvr_model = MODEL_MAP.get(mdl, mdl)
+        base_pct = int(idx / len(models_to_run) * 80)
+        progress(base_pct + 5, f"Завантаження моделі {mdl}…")
+
+        sep = Separator(
+            output_dir=output_dir,
+            output_format="WAV",
+            normalization_threshold=0.9,
+            model_file_dir=str(Path(DATA_DIR) / "models"),
+        )
+        sep.load_model(uvr_model)
+
+        progress(base_pct + 15, f"Ізоляція вокалу ({mdl})…")
+
+        output_files = sep.separate(audio_path)
+
+        # audio-separator names output files like: {stem}_(Vocals)_model.wav
+        vocal_file = None
+        for f in output_files:
+            if "Vocals" in f or "vocals" in f or "vocal" in f.lower():
+                vocal_file = f
+                break
+        if not vocal_file and output_files:
+            vocal_file = output_files[0]
+
+        if vocal_file and os.path.isfile(vocal_file):
+            vocal_stems.append(vocal_file)
+
+        progress(base_pct + int(80 / len(models_to_run)), f"Готово {mdl}")
+
+    if not vocal_stems:
+        raise RuntimeError("Не вдалося отримати вокальний стем")
+
+    final_vocal = str(Path(output_dir) / "vocal_isolated.wav")
+    if len(vocal_stems) == 1:
+        shutil.copy2(vocal_stems[0], final_vocal)
+    else:
+        progress(85, "Об'єднання стемів (ensemble)…")
+        _average_stems(vocal_stems, final_vocal)
+
+    progress(100, "Вокал відокремлено")
+    return final_vocal
+
+
+def run_separation(
+    episode_id: int,
+    audio_path: str,
+    model_name: str,
+    ensemble: bool,
+    reporter: ProgressReporter,
+    db: Session,
+) -> dict:
+    ep = db.get(Episode, episode_id)
+    if not ep:
+        raise ValueError(f"Episode {episode_id} not found")
+
+    ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
+    output_dir = ep_dir / "stems"
+
+    final_vocal = separate_file(
+        audio_path, str(output_dir), model_name, ensemble,
+        on_progress=reporter.update, is_cancelled=lambda: reporter.cancelled,
+    )
+
+    reporter.update(95, "Оновлення БД…")
+    ep.vocal_stem_path = final_vocal
+    ep.status = "vocal_isolated"
+    db.commit()
+
+    return {"vocal_stem_path": final_vocal}
+
+
+def _average_stems(stems: list[str], output_path: str):
+    """Average multiple audio stems (ensemble mode)."""
+    try:
+        import numpy as np
+        import soundfile as sf
+
+        arrays = []
+        sr = None
+        for path in stems:
+            data, s = sf.read(path, dtype="float32", always_2d=True)
+            arrays.append(data)
+            sr = s
+
+        # Align lengths
+        min_len = min(a.shape[0] for a in arrays)
+        arrays = [a[:min_len] for a in arrays]
+
+        averaged = np.mean(np.stack(arrays, axis=0), axis=0)
+        sf.write(output_path, averaged, sr, subtype="PCM_24")
+    except Exception as e:
+        # Fallback: just copy first stem
+        shutil.copy2(stems[0], output_path)

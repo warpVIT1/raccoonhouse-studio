@@ -1,0 +1,58 @@
+appId: com.raccoonhouse.studio
+productName: RaccoonHouse Studio
+copyright: "RaccoonHouse Studio"
+
+# Auto-update source (electron-updater checks this repo's Releases for newer
+# versions). Publishing a release requires a GH_TOKEN env var with repo scope
+# when running `npm run publish` — this config alone doesn't push anything.
+publish:
+  provider: github
+  owner: warpvit
+  repo: raccoonhouse-studio
+
+directories:
+  # Must NOT be "dist" — that's Vite's renderer output dir, and "files" below
+  # globs dist/**/*. If they're the same folder, each build packages its own
+  # previous installer output back into the next app.asar (blank-window bug).
+  output: release
+  buildResources: resources
+
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - "!node_modules"
+  - "!backend"
+  - "!backend-dist"
+  - "!src"
+
+extraResources:
+  - from: backend-dist/
+    to: backend/
+    filter:
+      - "**/*"
+  - from: resources/bin/
+    to: bin/
+    filter:
+      - "**/*"
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: resources/icon.ico
+
+nsis:
+  oneClick: false
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: RaccoonHouse Studio
+  installerIcon: resources/icon.ico
+  uninstallerIcon: resources/icon.ico
+  installerHeader: resources/installer-header.bmp
+  installerSidebar: resources/installer-sidebar.bmp
+  runAfterFinish: true
+
+compression: maximum

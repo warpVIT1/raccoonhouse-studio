@@ -1,0 +1,104 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body, #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+  }
+
+  body {
+    background-color: #0F0F11;
+    color: #E8E8F0;
+    font-family: 'Archivo', system-ui, -apple-system, sans-serif;
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    user-select: none;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #38383F;
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #505060;
+  }
+}
+
+@layer components {
+  .rh-card {
+    @apply bg-rh-card border border-rh-border rounded-lg;
+  }
+
+  .rh-input {
+    @apply bg-rh-card2 border border-rh-border text-rh-text rounded-md px-3 py-1.5 text-sm
+           focus:outline-none focus:border-rh-accent focus:ring-1 focus:ring-rh-accent/30
+           placeholder:text-rh-muted;
+  }
+
+  .rh-btn {
+    @apply inline-flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium
+           transition-colors duration-150 cursor-pointer select-none;
+  }
+
+  .rh-btn-primary {
+    @apply rh-btn bg-rh-accent text-white hover:bg-rh-accent-h active:scale-[0.98];
+  }
+
+  .rh-btn-ghost {
+    @apply rh-btn text-rh-text-dim hover:text-rh-text hover:bg-white/5 active:scale-[0.98];
+  }
+
+  .rh-btn-outline {
+    @apply rh-btn border border-rh-border text-rh-text-dim hover:text-rh-text hover:border-rh-border2 active:scale-[0.98];
+  }
+
+  .status-new      { @apply bg-zinc-700/50 text-zinc-300 border border-zinc-600/50; }
+  .status-progress { @apply bg-amber-900/40 text-amber-300 border border-amber-700/40; }
+  .status-done     { @apply bg-emerald-900/40 text-emerald-300 border border-emerald-700/40; }
+  .status-vocal    { @apply bg-violet-900/40 text-violet-300 border border-violet-700/40; }
+  .status-marked   { @apply bg-blue-900/40 text-blue-300 border border-blue-700/40; }
+}
+
+/* Drag-over state */
+.drag-over {
+  border-color: #E52128 !important;
+  background-color: rgba(229, 33, 40, 0.05) !important;
+}
+
+/* Subtitle grid row hover */
+.sub-row:hover {
+  background-color: rgba(255,255,255,0.03);
+}
+.sub-row.active {
+  background-color: rgba(229, 33, 40, 0.08);
+  border-left: 2px solid #E52128;
+}
+
+/* Waveform canvas */
+.waveform-container canvas {
+  display: block;
+}
+
+/* Frameless window drag region */
+.drag-region {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}

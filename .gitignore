@@ -1,0 +1,22 @@
+node_modules/
+dist/
+dist-electron/
+release/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+build-pyinstaller/
+backend-dist/
+*.db
+*.sqlite
+*.log
+.env
+resources/*.ico
+resources/*.bmp
+# ffmpeg/ffprobe binaries (~240MB each) — GitHub's hard limit is 100MB/file.
+# Bundled at build time by copying a local ffmpeg install into resources/bin/
+# (see README) — never meant to live in git history.
+resources/bin/
+# Local Claude Code tooling config, not part of the app itself.
+.claude/

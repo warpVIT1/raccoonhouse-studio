@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react'
 import { useApi } from '../hooks/useApi'
 import { PowerSharePanel } from './PowerSharePanel'
 import { UpdatePanel } from './UpdatePanel'
-import type { AppSettings, CacheInfo } from '../types'
+import type { AppSettings } from '../types'
 
 const EMPTY_SETTINGS: AppSettings = {
   reaper_path: null,
@@ -10,7 +10,6 @@ const EMPTY_SETTINGS: AppSettings = {
   ensemble_default: false,
   position_format: 'time',
   default_bpm: null,
-  cache_dir: null,
   available_models: ['MDX-Net', 'VR Arch', 'Demucs', 'MDX23C', 'BS-RoFormer'],
   active_profile_id: null,
   active_profile: null,
@@ -19,19 +18,14 @@ const EMPTY_SETTINGS: AppSettings = {
   manual_peer_port: 8765,
 }
 
-const EMPTY_CACHE: CacheInfo = { cache_dir: '', size_bytes: 0, size_label: '—', file_count: 0 }
-
 export function SettingsPage() {
-  const { get, put, post } = useApi()
+  const { get, put } = useApi()
   const [settings, setSettings] = useState<AppSettings>(EMPTY_SETTINGS)
-  const [cache, setCache] = useState<CacheInfo>(EMPTY_CACHE)
   const [editingModel, setEditingModel] = useState(false)
   const [editingReaper, setEditingReaper] = useState(false)
-  const [clearing, setClearing] = useState(false)
 
   useEffect(() => {
     get<AppSettings>('/settings').then(setSettings).catch(() => {})
-    get<CacheInfo>('/settings/cache-info').then(setCache).catch(() => {})
   }, [get])
 
   const save = async (patch: Partial<AppSettings>) => {
@@ -53,18 +47,6 @@ export function SettingsPage() {
       if (path) await save({ reaper_path: path })
     } else {
       setEditingReaper(true)
-    }
-  }
-
-  const clearCache = async () => {
-    setClearing(true)
-    try {
-      const result = await post<CacheInfo>('/settings/cache/clear')
-      setCache(result)
-    } catch {
-      setCache({ ...cache, size_label: '0 Б', file_count: 0 })
-    } finally {
-      setClearing(false)
     }
   }
 
@@ -155,7 +137,7 @@ export function SettingsPage() {
           </div>
         </div>
         {settings.position_format === 'bars_beats' && (
-          <div className="flex items-center gap-3 py-3 px-4 border-b border-rh-border/70">
+          <div className="flex items-center gap-3 py-3 px-4">
             <div className="flex-1 text-[12px] text-rh-text-dim">BPM тайтлу (для розрахунку тактів)</div>
             <input
               type="number"
@@ -167,16 +149,6 @@ export function SettingsPage() {
             />
           </div>
         )}
-
-        {/* Proxy cache */}
-        <Row
-          label="Кеш прев'ю (480p)"
-          value={`${cache.size_label} · ${cache.cache_dir}`}
-          action={clearing ? 'Очищення…' : 'Очистити'}
-          danger
-          onAction={clearCache}
-          last
-        />
       </div>
 
       <PowerSharePanel

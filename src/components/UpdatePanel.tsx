@@ -24,6 +24,9 @@ export function UpdatePanel() {
     window.electronAPI?.checkForUpdate()
   }
 
+  function download() {
+    window.electronAPI?.downloadUpdate()
+  }
   function install() {
     window.electronAPI?.installUpdate()
   }
@@ -31,7 +34,7 @@ export function UpdatePanel() {
   const label = (() => {
     switch (state.status) {
       case 'checking': return 'Перевірка оновлень…'
-      case 'available': return `Доступне оновлення ${state.version ?? ''} — завантаження…`
+      case 'available': return `Доступне оновлення ${state.version ?? ''}`
       case 'downloading': return `Завантаження оновлення… ${state.percent ?? 0}%`
       case 'downloaded': return `Оновлення ${state.version ?? ''} завантажено — готове до встановлення`
       case 'not-available': return 'Встановлено останню версію'
@@ -56,6 +59,10 @@ export function UpdatePanel() {
         {state.status === 'downloaded' ? (
           <button onClick={install} className="rh-btn-primary text-[11px] px-3 py-1.5">
             Перезапустити й встановити
+          </button>
+        ) : state.status === 'available' ? (
+          <button onClick={download} className="rh-btn-primary text-[11px] px-3 py-1.5">
+            Завантажити
           </button>
         ) : (
           <button

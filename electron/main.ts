@@ -128,21 +128,27 @@ const AUTO_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000 // 4 hours
 function initAutoUpdater() {
   if (!app.isPackaged) return // electron-updater needs a real packaged build + app-update.yml
 
-  // Download as soon as an update is found, and — if the user never clicks
-  // "Перезапустити й встановити" themselves — install it silently the next
-  // time the app closes normally, instead of requiring them to babysit an
-  // installer window. Either path runs the NSIS installer with its silent
-  // flag (see quitAndInstall(true, ...) below), so no installer UI ever
-  // appears either way.
-  autoUpdater.autoDownload = true
+  // Checking happens automatically (launch + every 4h), but downloading is a
+  // deliberate click from the update dialog (see UpdateDialog.tsx) — not
+  // silent/automatic — so the person actually sees the changelog before
+  // committing to it. Installing itself, once downloaded, IS silent (no NSIS
+  // wizard window) either via the dialog's button or automatically the next
+  // time the app quits normally.
+  autoUpdater.autoDownload = false
   autoUpdater.autoInstallOnAppQuit = true
 
   autoUpdater.on('checking-for-update', () => sendUpdateStatus('checking'))
-  autoUpdater.on('update-available', (info) => sendUpdateStatus('available', { version: info.version }))
+  autoUpdater.on('update-available', (info) => sendUpdateStatus('available', {
+    version: info.version,
+    releaseNotes: formatReleaseNotes(info.releaseNotes),
+  }))
   autoUpdater.on('update-not-available', () => sendUpdateStatus('not-available'))
   autoUpdater.on('error', (err) => sendUpdateStatus('error', { message: err.message }))
   autoUpdater.on('download-progress', (p) => sendUpdateStatus('downloading', { percent: Math.round(p.percent) }))
-  autoUpdater.on('update-downloaded', (info) => sendUpdateStatus('downloaded', { version: info.version }))
+  autoUpdater.on('update-downloaded', (info) => sendUpdateStatus('downloaded', {
+    version: info.version,
+    releaseNotes: formatReleaseNotes(info.releaseNotes),
+  }))
 
   const check = () => autoUpdater.checkForUpdates().catch((err) => console.error('[updater] check failed', err))
   check()
@@ -151,9 +157,19 @@ function initAutoUpdater() {
   setInterval(check, AUTO_CHECK_INTERVAL_MS)
 }
 
+function formatReleaseNotes(notes: string | { version: string; note: string | null }[] | null | undefined): string {
+  if (!notes) return ''
+  if (typeof notes === 'string') return notes
+  return notes.map((n) => n.note || '').filter(Boolean).join('\n\n')
+}
+
 ipcMain.handle('update:check', () => {
   if (!app.isPackaged) return
   autoUpdater.checkForUpdates().catch((err) => console.error('[updater] check failed', err))
+})
+
+ipcMain.handle('update:download', () => {
+  autoUpdater.downloadUpdate().catch((err) => sendUpdateStatus('error', { message: err.message }))
 })
 
 ipcMain.handle('update:install', () => {

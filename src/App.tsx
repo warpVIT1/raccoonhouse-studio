@@ -7,6 +7,7 @@ import { Sidebar } from './components/layout/Sidebar'
 import { TitleBar } from './components/layout/TitleBar'
 import { PowerShareConsentPopup } from './components/PowerShareConsentPopup'
 import { PowerShareLendingBanner } from './components/PowerShareLendingBanner'
+import { UpdateDialog } from './components/UpdateDialog'
 import { useAppStore } from './stores/appStore'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useApi } from './hooks/useApi'
@@ -84,6 +85,7 @@ export default function App() {
       </div>
       <PowerShareConsentPopup />
       <PowerShareLendingBanner />
+      <UpdateDialog />
     </div>
   )
 }

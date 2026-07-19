@@ -33,14 +33,19 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   const [currentTimeMs, setCurrentTimeMs] = useState(0)
   const [duration, setDuration] = useState(0)
 
-  // Video panel is resizable (by width, against the waveform) since a
-  // fixed-width video felt too wide on most screens — dragged size is
-  // remembered across episodes for the session.
+  // Video panel is resizable both by width (against the waveform) and by
+  // height (against the subtitles/markers grid below) — a fixed size felt
+  // too wide/cramped on most screens. Both dragged sizes are remembered.
   const [videoWidthPct, setVideoWidthPct] = useState(() => {
     const saved = Number(localStorage.getItem('rh_video_width_pct'))
     return saved >= 20 && saved <= 85 ? saved : 65
   })
+  const [videoHeightPct, setVideoHeightPct] = useState(() => {
+    const saved = Number(localStorage.getItem('rh_video_height_pct'))
+    return saved >= 20 && saved <= 75 ? saved : 42
+  })
   const topRowRef = useRef<HTMLDivElement>(null)
+  const workspaceRef = useRef<HTMLDivElement>(null)
   const resizingRef = useRef(false)
 
   // Separation panel state
@@ -176,6 +181,27 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
   }, [videoWidthPct])
+
+  const startVideoResizeVertical = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    resizingRef.current = true
+    let lastPct = videoHeightPct
+    const onMove = (ev: MouseEvent) => {
+      if (!resizingRef.current || !workspaceRef.current) return
+      const rect = workspaceRef.current.getBoundingClientRect()
+      const pct = ((ev.clientY - rect.top) / rect.height) * 100
+      lastPct = Math.min(75, Math.max(20, pct))
+      setVideoHeightPct(lastPct)
+    }
+    const onUp = () => {
+      resizingRef.current = false
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      localStorage.setItem('rh_video_height_pct', String(lastPct))
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }, [videoHeightPct])
 
   const handleTimeUpdate = useCallback((t: number) => {
     setCurrentTimeMs(Math.round(t * 1000))
@@ -548,9 +574,9 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
       )}
 
       {/* Main workspace */}
-      <div className="flex-1 flex flex-col overflow-hidden">
+      <div ref={workspaceRef} className="flex-1 flex flex-col overflow-hidden">
         {/* Top: video + waveform — width split between them is resizable */}
-        <div ref={topRowRef} className="flex p-2 flex-shrink-0" style={{ height: '42%' }}>
+        <div ref={topRowRef} className="flex p-2 flex-shrink-0" style={{ height: `${videoHeightPct}%` }}>
           {/* Video player */}
           <div style={{ width: `${videoWidthPct}%` }} className="min-w-0">
             <VideoPlayer
@@ -584,6 +610,15 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
               backendPort={backendPort}
             />
           </div>
+        </div>
+
+        {/* Drag handle — resize video/waveform panel height */}
+        <div
+          onMouseDown={startVideoResizeVertical}
+          className="h-2 flex-shrink-0 cursor-row-resize group flex items-center justify-center"
+          title="Перетягніть, щоб змінити висоту відео"
+        >
+          <div className="h-1 w-8 rounded-full bg-rh-border group-hover:bg-rh-accent transition-colors" />
         </div>
 
         {/* Bottom: subtitle grid + markers */}

@@ -22,7 +22,6 @@ export interface Episode {
   number: number
   duration: number | null
   original_file_path: string | null
-  proxy_480p_path: string | null
   original_size: number | null
   original_bitrate: number | null
   original_format: string | null
@@ -107,20 +106,12 @@ export interface AppSettings {
   ensemble_default: boolean
   position_format: 'time' | 'bars_beats'
   default_bpm: number | null
-  cache_dir: string | null
   available_models: string[]
   active_profile_id: number | null
   active_profile: Profile | null
   power_share_enabled: boolean
   manual_peer_host: string | null
   manual_peer_port: number
-}
-
-export interface CacheInfo {
-  cache_dir: string
-  size_bytes: number
-  size_label: string
-  file_count: number
 }
 
 export interface Profile {

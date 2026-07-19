@@ -22,6 +22,7 @@ interface Window {
     maximize: () => void
     close: () => void
     checkForUpdate: () => Promise<void>
+    downloadUpdate: () => Promise<void>
     installUpdate: () => Promise<void>
     onUpdateStatus: (callback: (status: Record<string, unknown>) => void) => () => void
   }

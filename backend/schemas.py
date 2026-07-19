@@ -45,7 +45,6 @@ class EpisodeUpdate(BaseModel):
     number: Optional[int] = None
     duration: Optional[float] = None
     original_file_path: Optional[str] = None
-    proxy_480p_path: Optional[str] = None
     audio_stem_path: Optional[str] = None
     vocal_stem_path: Optional[str] = None
     original_size: Optional[int] = None
@@ -59,7 +58,6 @@ class EpisodeOut(EpisodeBase):
     title_id: int
     duration: Optional[float] = None
     original_file_path: Optional[str] = None
-    proxy_480p_path: Optional[str] = None
     audio_stem_path: Optional[str] = None
     vocal_stem_path: Optional[str] = None
     original_size: Optional[int] = None
@@ -203,7 +201,6 @@ class AppSettingsOut(BaseModel):
     ensemble_default: bool = False
     position_format: str = "time"
     default_bpm: Optional[float] = None
-    cache_dir: Optional[str] = None
     available_models: List[str] = []
     active_profile_id: Optional[int] = None
     active_profile: Optional["ProfileOut"] = None
@@ -220,7 +217,6 @@ class AppSettingsUpdate(BaseModel):
     ensemble_default: Optional[bool] = None
     position_format: Optional[str] = None
     default_bpm: Optional[float] = None
-    cache_dir: Optional[str] = None
     active_profile_id: Optional[int] = None
     power_share_enabled: Optional[bool] = None
     manual_peer_host: Optional[str] = None
@@ -264,13 +260,6 @@ class PowerShareDecisionOut(BaseModel):
     request_id: str
     approved: bool
     reason: str = ""  # "approved" | "denied" | "timeout" | "remembered"
-
-
-class CacheInfoOut(BaseModel):
-    cache_dir: str
-    size_bytes: int
-    size_label: str
-    file_count: int
 
 
 class HikkaAnimeResult(BaseModel):

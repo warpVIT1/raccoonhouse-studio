@@ -29,7 +29,6 @@ class Episode(Base):
     number: Mapped[int] = mapped_column(Integer, nullable=False)
     duration: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     original_file_path: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
-    proxy_480p_path: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     audio_stem_path: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     vocal_stem_path: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     original_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -125,7 +124,6 @@ class AppSettings(Base):
     ensemble_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     position_format: Mapped[str] = mapped_column(String(16), nullable=False, default="time")  # time | bars_beats
     default_bpm: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    cache_dir: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     active_profile_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("profiles.id"), nullable=True)
     power_share_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Manual fallback for when both PCs aren't on the same LAN (auto-discovery via

@@ -248,10 +248,6 @@ export function TitlePage({ titleId }: TitlePageProps) {
         </button>
 
         <div className="ml-auto flex items-center gap-2">
-          <span className="inline-flex items-center gap-1.5 rounded-full bg-white/5 border border-rh-border px-3 py-1 text-xs text-rh-muted">
-            <span className="w-1.5 h-1.5 rounded-full bg-amber-500 flex-shrink-0" />
-            Автостиснення в 480p для перегляду, оригінал зберігається
-          </span>
           <button
             onClick={() => fileInputRef.current?.click()}
             className="rh-btn-outline"

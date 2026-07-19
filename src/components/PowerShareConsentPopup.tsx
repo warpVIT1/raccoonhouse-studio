@@ -45,7 +45,8 @@ export function PowerShareConsentPopup() {
       </div>
       <p className="text-xs text-rh-text-dim leading-relaxed">
         <span className="font-semibold text-rh-text">{request.requester_name}</span> хоче скористатися потужністю
-        цього ПК для обробки «{request.title_name}», серія {String(request.episode_number).padStart(2, '0')}.
+        цього ПК для {request.task === 'import' ? 'імпорту відео (ffmpeg)' : 'відокремлення вокалу (нейромережа)'}:
+        «{request.title_name}», серія {String(request.episode_number).padStart(2, '0')}.
       </p>
       <div className="flex gap-2">
         <button onClick={() => respond(false)} className="rh-btn-ghost flex-1">Ні</button>

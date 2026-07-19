@@ -20,6 +20,7 @@ import socket
 import threading
 import uuid
 import logging
+import zipfile
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -124,8 +125,9 @@ def handle_incoming_consent_request(body: dict, broadcast_fn=None, loop=None) ->
             _pending[request_id] = {"event": event, "approved": False}
 
         power_logger.info(
-            "ASK requester=%s(%s) title=%s ep=%s request_id=%s",
-            body["requester_name"], body["requester_host"], body["title_name"], body["episode_number"], request_id,
+            "ASK requester=%s(%s) title=%s ep=%s task=%s request_id=%s",
+            body["requester_name"], body["requester_host"], body["title_name"], body["episode_number"],
+            body.get("task", "separate"), request_id,
         )
 
         if broadcast_fn and loop:
@@ -138,6 +140,7 @@ def handle_incoming_consent_request(body: dict, broadcast_fn=None, loop=None) ->
                         "requester_name": body["requester_name"],
                         "title_name": body["title_name"],
                         "episode_number": body["episode_number"],
+                        "task": body.get("task", "separate"),
                         "timeout_seconds": CONSENT_TIMEOUT_SECONDS,
                     },
                 }),
@@ -201,9 +204,147 @@ def _ask_peer(peer: dict, payload: dict) -> tuple[dict, bool, str]:
         return peer, False, "unreachable"
 
 
-def request_remote_power(episode_id: int, model: str, ensemble: bool, db: Session) -> dict:
+_DENY_REASON_TEXT = {
+    "disabled": "вимкнув розподілену обробку в налаштуваннях",
+    "no_profile": "ніхто не залогінений на тому ПК (немає активного профілю)",
+    "denied": "відхилив запит",
+    "timeout": f"не відповів за {CONSENT_TIMEOUT_SECONDS} секунд",
+    "unreachable": "не вдалося з'єднатися (перевірте мережу/фаєрвол)",
+}
+
+
+def _deny_reason_text(reason: str) -> str:
+    return _DENY_REASON_TEXT.get(reason, reason or "відмова")
+
+
+def _acquire_peer(title_id: int, title_name: str, episode_number: int, task: str, reporter, db: Session) -> dict:
+    """Shared negotiation step for BOTH power-share flows (vocal separation and
+    full remote import): find an already-remembered peer for this title, or
+    broadcast a consent-request to everyone available and wait for the first
+    Так. Reports each stage through `reporter` (may be None) so the requesting
+    UI always shows a specific, human-readable status instead of a bare
+    'Обробка' — including WHY, per peer, if nobody agrees."""
     from . import discovery_service
 
+    if reporter:
+        reporter.update(5, "Шукаю доступні ПК у мережі…")
+
+    peers = [p for p in discovery_service.get_discovered_peers() if p["power_share_enabled"] and p["logged_in"]]
+    if not peers:
+        raise ValueError(
+            "Немає жодного доступного ПК на мережі — переконайтесь, що на іншому ПК увімкнено "
+            "розподілену обробку в Налаштуваннях і хтось там залогінений (обраний профіль)"
+        )
+
+    remembered_hosts = {
+        c.peer_host for c in db.query(PowerShareConsent).filter(
+            PowerShareConsent.title_id == title_id, PowerShareConsent.granted == True  # noqa: E712
+        ).all()
+    }
+
+    for peer in peers:
+        if peer["host"] in remembered_hosts:
+            power_logger.info("USE-REMEMBERED peer=%s title=%s", peer["host"], title_name)
+            if reporter:
+                reporter.update(15, f"{peer['name']} вже погоджувався для цього тайтлу — надсилаю без повторного питання…")
+            return peer
+
+    payload = {
+        "requester_name": _active_profile_name(db),
+        "requester_host": get_own_ip(),
+        "requester_port": BACKEND_PORT,
+        "title_id": title_id,
+        "title_name": title_name,
+        "episode_number": episode_number,
+        "task": task,
+    }
+
+    if reporter:
+        names = ", ".join(p["name"] for p in peers)
+        reporter.update(10, f"Надсилаю запит на дозвіл: {names} (очікую підтвердження, до {CONSENT_TIMEOUT_SECONDS}с)…")
+    power_logger.info(
+        "BROADCAST title=%s ep=%s task=%s peers=%s", title_name, episode_number, task, [p["host"] for p in peers]
+    )
+
+    chosen: Optional[dict] = None
+    denials: list[str] = []
+    pool = ThreadPoolExecutor(max_workers=max(1, len(peers)))
+    try:
+        futures = {pool.submit(_ask_peer, p, payload): p for p in peers}
+        for future in as_completed(futures):
+            peer, approved, reason = future.result()
+            if approved:
+                chosen = peer
+                db.add(PowerShareConsent(peer_host=peer["host"], title_id=title_id, granted=True))
+                db.commit()
+                break  # first Так wins — don't wait on the rest (they may be
+                       # slow, unreachable, or simply never get clicked)
+            denials.append(f"{peer['name']} — {_deny_reason_text(reason)}")
+    finally:
+        # Plain shutdown(wait=True) (what a `with` block does on exit) would
+        # block here until EVERY peer's up-to-70s _ask_peer call finishes —
+        # even the ones we no longer care about once someone already said Так.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    if not chosen:
+        power_logger.info("NO-PEER-APPROVED title=%s ep=%s task=%s", title_name, episode_number, task)
+        detail = "; ".join(denials) if denials else "немає відповіді від жодного ПК"
+        raise ValueError(f"Ніхто не погодився надати потужність. {detail}.")
+
+    if reporter:
+        reporter.update(20, f"{chosen['name']} погодився — готую передачу…")
+    return chosen
+
+
+class _ProgressFile:
+    """Wraps a file for streaming upload via `requests`, reporting read
+    progress as bytes are consumed — used for the full-video upload in
+    request_remote_import, where the file can be hundreds of MB to a few GB
+    and a silent multi-minute upload would look identical to a frozen app."""
+
+    def __init__(self, path: str, total_size: int, on_progress=None, pct_lo: int = 20, pct_hi: int = 80):
+        self._f = open(path, "rb")
+        self._total = max(1, total_size)
+        self._sent = 0
+        self._on_progress = on_progress
+        self._pct_lo = pct_lo
+        self._pct_hi = pct_hi
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._f.read(size if size and size > 0 else 1024 * 1024)
+        self._sent += len(chunk)
+        if self._on_progress:
+            frac = min(1.0, self._sent / self._total)
+            pct = int(self._pct_lo + (self._pct_hi - self._pct_lo) * frac)
+            self._on_progress(pct)
+        return chunk
+
+    def __len__(self) -> int:
+        return self._total
+
+    def close(self):
+        self._f.close()
+
+
+def request_remote_power(episode_id: int, model: str, ensemble: bool, reporter=None) -> dict:
+    """Requester side for vocal separation: negotiates a peer, uploads the
+    already-extracted audio track, and stores the returned vocal stem.
+
+    Opens its own DB session rather than reusing the request's — this runs in
+    a background thread pool that outlives the HTTP request, and a request-
+    scoped Session gets closed by FastAPI's dependency teardown as soon as the
+    endpoint returns, well before this (which can take minutes: consent wait +
+    upload + remote processing) actually finishes. Reusing it intermittently
+    raised "identity map is no longer valid" once real work happened between
+    the two — confirmed via a live two-process end-to-end test."""
+    db = SessionLocal()
+    try:
+        return _request_remote_power(episode_id, model, ensemble, db, reporter)
+    finally:
+        db.close()
+
+
+def _request_remote_power(episode_id: int, model: str, ensemble: bool, db: Session, reporter=None) -> dict:
     ep = db.get(Episode, episode_id)
     if not ep:
         raise ValueError("Episode not found")
@@ -211,69 +352,38 @@ def request_remote_power(episode_id: int, model: str, ensemble: bool, db: Sessio
     if not title:
         raise ValueError("Title not found")
     if not ep.audio_stem_path or not os.path.isfile(ep.audio_stem_path):
-        raise ValueError("Audio stem not found — import video first")
+        raise ValueError("Аудіодоріжка не знайдена — спершу імпортуйте відео")
 
-    peers = [p for p in discovery_service.get_discovered_peers() if p["power_share_enabled"] and p["logged_in"]]
-    if not peers:
-        raise ValueError("Немає жодного доступного ПК на мережі — переконайтесь, що на іншому ПК увімкнено розподілену обробку і хтось залогінений")
+    chosen = _acquire_peer(title.id, title.name_ua, ep.number, "separate", reporter, db)
 
-    remembered_hosts = {
-        c.peer_host for c in db.query(PowerShareConsent).filter(
-            PowerShareConsent.title_id == title.id, PowerShareConsent.granted == True  # noqa: E712
-        ).all()
-    }
+    file_size = os.path.getsize(ep.audio_stem_path)
 
-    chosen: Optional[dict] = None
-    for peer in peers:
-        if peer["host"] in remembered_hosts:
-            chosen = peer
-            power_logger.info("USE-REMEMBERED peer=%s title=%s", peer["host"], title.name_ua)
-            break
+    def on_upload_progress(pct):
+        if reporter:
+            reporter.update(pct, f"Надсилаю аудіо на {chosen['name']}…")
 
-    payload = {
-        "requester_name": _active_profile_name(db),
-        "requester_host": get_own_ip(),
-        "requester_port": BACKEND_PORT,
-        "title_id": title.id,
-        "title_name": title.name_ua,
-        "episode_number": ep.number,
-    }
-
-    if not chosen:
-        to_ask = [p for p in peers if p["host"] not in remembered_hosts]
-        power_logger.info(
-            "BROADCAST title=%s ep=%s peers=%s", title.name_ua, ep.number, [p["host"] for p in to_ask]
-        )
-        with ThreadPoolExecutor(max_workers=max(1, len(to_ask))) as pool:
-            futures = {pool.submit(_ask_peer, p, payload): p for p in to_ask}
-            for future in as_completed(futures):
-                peer, approved, reason = future.result()
-                if approved:
-                    chosen = peer
-                    db.add(PowerShareConsent(peer_host=peer["host"], title_id=title.id, granted=True))
-                    db.commit()
-                    break
-
-    if not chosen:
-        power_logger.info("NO-PEER-APPROVED title=%s ep=%s", title.name_ua, ep.number)
-        raise ValueError("Ніхто не погодився надати потужність")
-
-    # Ship the audio to the chosen peer and run separation there.
-    power_logger.info("DISPATCH peer=%s title=%s ep=%s", chosen["host"], title.name_ua, ep.number)
-    with open(ep.audio_stem_path, "rb") as f:
+    stream = _ProgressFile(ep.audio_stem_path, file_size, on_upload_progress, pct_lo=20, pct_hi=45)
+    try:
+        power_logger.info("DISPATCH peer=%s title=%s ep=%s", chosen["host"], title.name_ua, ep.number)
         resp = requests.post(
             f"{peer_base_url(chosen['host'], chosen['port'])}/api/power-share/run-separation",
-            files={"audio": (os.path.basename(ep.audio_stem_path), f, "audio/wav")},
+            files={"audio": (os.path.basename(ep.audio_stem_path), stream, "audio/flac")},
             data={
                 "model": model,
-                "ensemble": str(ensemble).lower(),
-                "requester_name": payload["requester_name"],
+                "ensemble": str(bool(ensemble)).lower(),
+                "requester_name": _active_profile_name(db),
                 "title_name": title.name_ua,
                 "episode_number": ep.number,
             },
             timeout=3600,
         )
+    finally:
+        stream.close()
+    power_logger.info("DISPATCH-RESPONSE peer=%s status=%s bytes=%s", chosen["host"], resp.status_code, len(resp.content))
     resp.raise_for_status()
+
+    if reporter:
+        reporter.update(90, "Зберігаю отриманий вокальний стем…")
 
     ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
     output_dir = ep_dir / "stems"
@@ -287,4 +397,99 @@ def request_remote_power(episode_id: int, model: str, ensemble: bool, db: Sessio
     db.commit()
 
     power_logger.info("DONE peer=%s title=%s ep=%s", chosen["host"], title.name_ua, ep.number)
+    if reporter:
+        reporter.update(100, f"Готово — вокал відокремлено на {chosen['name']}")
     return {"vocal_stem_path": final_vocal, "peer": chosen["name"]}
+
+
+def request_remote_import(episode_id: int, file_path: str, reporter=None) -> dict:
+    """Requester side for a full remote import: negotiates a peer, uploads the
+    ORIGINAL video file (before any local ffmpeg work happens at all — meant
+    for a PC too weak to comfortably run ffmpeg itself), and stores back the
+    audio track + 480p proxy the peer produced.
+
+    Opens its own DB session — see request_remote_power's docstring for why."""
+    db = SessionLocal()
+    try:
+        return _request_remote_import(episode_id, file_path, db, reporter)
+    finally:
+        db.close()
+
+
+def _request_remote_import(episode_id: int, file_path: str, db: Session, reporter=None) -> dict:
+    ep = db.get(Episode, episode_id)
+    if not ep:
+        raise ValueError("Episode not found")
+    title = db.get(Title, ep.title_id)
+    if not title:
+        raise ValueError("Title not found")
+    if not os.path.isfile(file_path):
+        raise ValueError(f"Файл не знайдено: {file_path}")
+
+    chosen = _acquire_peer(title.id, title.name_ua, ep.number, "import", reporter, db)
+
+    file_size = os.path.getsize(file_path)
+    filename = os.path.basename(file_path)
+
+    def on_upload_progress(pct):
+        if reporter:
+            reporter.update(pct, f"Завантажую відео на {chosen['name']} (ffmpeg виконається там)…")
+
+    stream = _ProgressFile(file_path, file_size, on_upload_progress, pct_lo=20, pct_hi=75)
+    try:
+        power_logger.info("DISPATCH-IMPORT peer=%s title=%s ep=%s size=%s", chosen["host"], title.name_ua, ep.number, file_size)
+        resp = requests.post(
+            f"{peer_base_url(chosen['host'], chosen['port'])}/api/power-share/run-import",
+            params={
+                "filename": filename,
+                "requester_name": _active_profile_name(db),
+                "title_name": title.name_ua,
+                "episode_number": ep.number,
+            },
+            data=stream,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=3600,
+        )
+    finally:
+        stream.close()
+    resp.raise_for_status()
+
+    if reporter:
+        reporter.update(85, f"{chosen['name']} завершив ffmpeg — зберігаю результат…")
+
+    ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
+    ep_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = ep_dir / "_remote_import.zip"
+    with open(zip_path, "wb") as f:
+        f.write(resp.content)
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(ep_dir)
+    zip_path.unlink(missing_ok=True)
+
+    audio_out = str(ep_dir / "audio_full.flac")
+    proxy_out = str(ep_dir / "proxy_480p.mp4")
+
+    duration_hdr = resp.headers.get("X-Duration", "0")
+    bitrate_hdr = resp.headers.get("X-Bitrate", "0")
+
+    ep.original_file_path = file_path
+    ep.audio_stem_path = audio_out
+    ep.proxy_480p_path = proxy_out
+    ep.original_size = int(resp.headers.get("X-File-Size", str(file_size)))
+    ep.original_bitrate = int(bitrate_hdr) if bitrate_hdr.isdigit() and int(bitrate_hdr) > 0 else None
+    ep.original_format = resp.headers.get("X-Format") or None
+    ep.duration = float(duration_hdr) if _is_positive_float(duration_hdr) else None
+    ep.status = "processing"
+    db.commit()
+
+    power_logger.info("DONE-IMPORT peer=%s title=%s ep=%s", chosen["host"], title.name_ua, ep.number)
+    if reporter:
+        reporter.update(100, f"Готово — аудіо й проксі отримано з {chosen['name']}")
+    return {"audio_path": audio_out, "proxy_path": proxy_out, "peer": chosen["name"]}
+
+
+def _is_positive_float(s: str) -> bool:
+    try:
+        return float(s) > 0
+    except (TypeError, ValueError):
+        return False

@@ -80,7 +80,7 @@ async def import_ass(ep_id: int, body: AssImportRequest, db: Session = Depends(g
     from ..services.subtitle_parser import run_ass_import
     loop = asyncio.get_event_loop()
     asyncio.create_task(
-        job_manager.run_job(loop, job, lambda r: run_ass_import(ep_id, body.file_path, r, db))
+        job_manager.run_job(loop, job, lambda r: run_ass_import(ep_id, body.file_path, r))
     )
 
     return {"job_id": job.id}

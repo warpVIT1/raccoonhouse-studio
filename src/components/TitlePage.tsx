@@ -53,6 +53,8 @@ export function TitlePage({ titleId }: TitlePageProps) {
   const [importing, setImporting] = useState(false)
   const [pendingFiles, setPendingFiles] = useState<PendingImport[] | null>(null)
   const [showPosterModal, setShowPosterModal] = useState(false)
+  const [remotePeersAvailable, setRemotePeersAvailable] = useState(0)
+  const [importError, setImportError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -77,8 +79,15 @@ export function TitlePage({ titleId }: TitlePageProps) {
   useEffect(() => {
     if (!backendReady) return
     for (const job of activeJobs.values()) {
-      if (job.status !== 'complete' || !job.episode_id) continue
-      if (!episodes.some((e) => e.id === job.episode_id)) continue
+      if (!job.episode_id || !episodes.some((e) => e.id === job.episode_id)) continue
+      if (job.status === 'error' && job.type === 'import_video_remote') {
+        if (!handledJobIdsRef.current.has(job.id)) {
+          handledJobIdsRef.current.add(job.id)
+          setImportError(job.message || 'Не вдалося отримати потужність для імпорту')
+        }
+        continue
+      }
+      if (job.status !== 'complete') continue
       if (handledJobIdsRef.current.has(job.id)) continue
       handledJobIdsRef.current.add(job.id)
 
@@ -87,6 +96,15 @@ export function TitlePage({ titleId }: TitlePageProps) {
         .catch(() => {})
     }
   }, [activeJobs, backendReady, episodes, get])
+
+  // Only offer "process on another PC" up front if there's actually someone
+  // available right now — otherwise the option would be a dead end.
+  useEffect(() => {
+    if (!backendReady) return
+    get<Array<{ available: boolean }>>('/power-share/discovered')
+      .then((peers) => setRemotePeersAvailable(peers.filter((p) => p.available).length))
+      .catch(() => setRemotePeersAvailable(0))
+  }, [backendReady, get, pendingFiles])
 
   const handleFileDrop = useCallback((files: FileList) => {
     const videoFiles = Array.from(files).filter((f) =>
@@ -105,22 +123,25 @@ export function TitlePage({ titleId }: TitlePageProps) {
     setPendingFiles(items)
   }, [episodes.length])
 
-  const confirmImport = useCallback(async (items: PendingImport[]) => {
+  const confirmImport = useCallback(async (items: PendingImport[], useRemote: boolean) => {
     setPendingFiles(null)
     setImporting(true)
+    setImportError(null)
     for (const { file, season, number } of items) {
       try {
         if (backendReady) {
+          const filePath = (file as File & { path?: string }).path ?? file.name
+          const endpoint = useRemote ? `/titles/${titleId}/request-remote-import` : `/titles/${titleId}/import-video`
           const result = await post<{ job_id: string; episode: Episode }>(
-            `/titles/${titleId}/import-video`,
-            { file_path: (file as File & { path?: string }).path ?? file.name, episode_number: number, season }
+            endpoint,
+            { file_path: filePath, episode_number: number, season }
           )
           upsertJob({
             id: result.job_id,
-            type: 'import_video',
+            type: useRemote ? 'import_video_remote' : 'import_video',
             status: 'running',
             percent: 0,
-            message: `Імпорт ${file.name}…`,
+            message: useRemote ? `Попросити потужність: ${file.name}…` : `Імпорт ${file.name}…`,
             episode_id: result.episode.id,
           })
           setEpisodes((prev) => {
@@ -303,11 +324,15 @@ export function TitlePage({ titleId }: TitlePageProps) {
             </p>
           </div>
         </div>
+        {importError && (
+          <p className="text-xs text-red-400 mt-2">{importError}</p>
+        )}
       </div>
 
       {pendingFiles && (
         <ImportReviewModal
           items={pendingFiles}
+          remotePeersAvailable={remotePeersAvailable}
           onCancel={() => setPendingFiles(null)}
           onConfirm={confirmImport}
         />
@@ -368,11 +393,13 @@ function PosterModal({ titleId, defaultQuery, onClose, onSaved }: PosterModalPro
 
 interface ImportReviewModalProps {
   items: PendingImport[]
+  remotePeersAvailable: number
   onCancel: () => void
-  onConfirm: (items: PendingImport[]) => void
+  onConfirm: (items: PendingImport[], useRemote: boolean) => void
 }
-function ImportReviewModal({ items, onCancel, onConfirm }: ImportReviewModalProps) {
+function ImportReviewModal({ items, remotePeersAvailable, onCancel, onConfirm }: ImportReviewModalProps) {
   const [rows, setRows] = useState(items)
+  const [useRemote, setUseRemote] = useState(false)
 
   function update(idx: number, patch: Partial<PendingImport>) {
     setRows((prev) => prev.map((r, i) => (i === idx ? { ...r, ...patch } : r)))
@@ -408,9 +435,27 @@ function ImportReviewModal({ items, onCancel, onConfirm }: ImportReviewModalProp
             </div>
           ))}
         </div>
+        {remotePeersAvailable > 0 && (
+          <label className="flex items-start gap-2.5 rounded-lg border border-rh-border px-3 py-2.5 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={useRemote}
+              onChange={(e) => setUseRemote(e.target.checked)}
+              className="accent-rh-accent mt-0.5"
+            />
+            <span className="text-xs text-rh-text-dim leading-relaxed">
+              <span className="font-semibold text-rh-text">Попросити потужність для ffmpeg</span> — передати
+              оригінальне відео на потужніший ПК студії ({remotePeersAvailable}{' '}
+              {remotePeersAvailable === 1 ? 'доступний' : 'доступних'}) і обробити його там ще ДО того, як щось
+              почне рахуватись локально. Варто, якщо цей ПК слабкий.
+            </span>
+          </label>
+        )}
         <div className="flex gap-2 justify-end">
           <button onClick={onCancel} className="rh-btn-ghost">Скасувати</button>
-          <button onClick={() => onConfirm(rows)} className="rh-btn-primary">Імпортувати</button>
+          <button onClick={() => onConfirm(rows, useRemote)} className="rh-btn-primary">
+            {useRemote ? 'Попросити потужність' : 'Обробити тут'}
+          </button>
         </div>
       </div>
     </div>

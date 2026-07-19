@@ -27,8 +27,26 @@ def run_marker_detection(
     vocal_stem_path: str,
     char_codes: dict[str, Optional[str]],
     reporter: ProgressReporter,
-    db: Session,
     min_gap_seconds: float = DEFAULT_MIN_GAP_SECONDS,
+) -> dict:
+    """Opens its own DB session rather than reusing the request's — this runs
+    in a background thread pool that outlives the HTTP request, and a
+    request-scoped Session gets closed by FastAPI's dependency teardown right
+    after the endpoint returns, well before this actually finishes."""
+    db = SessionLocal()
+    try:
+        return _run_marker_detection(episode_id, vocal_stem_path, char_codes, reporter, db, min_gap_seconds)
+    finally:
+        db.close()
+
+
+def _run_marker_detection(
+    episode_id: int,
+    vocal_stem_path: str,
+    char_codes: dict[str, Optional[str]],
+    reporter: ProgressReporter,
+    db: Session,
+    min_gap_seconds: float,
 ) -> dict:
     ep = db.get(Episode, episode_id)
     if not ep:

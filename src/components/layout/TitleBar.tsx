@@ -28,8 +28,8 @@ export function TitleBar({ title = 'RaccoonHouse Studio' }: TitleBarProps) {
       {runningJobs.length > 0 && (
         <div className="ml-3 flex items-center gap-1.5 no-drag">
           <Spinner size={12} className="text-rh-accent" />
-          <span className="text-xs text-rh-text-dim">
-            {runningJobs[0].message || 'Обробка…'}
+          <span className="text-xs text-rh-text-dim font-mono">
+            {runningJobs[0].message || 'Обробка…'} {runningJobs[0].percent}%
           </span>
         </div>
       )}

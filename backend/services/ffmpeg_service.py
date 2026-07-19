@@ -60,29 +60,27 @@ def _probe(file_path: str) -> dict:
     return json.loads(result.stdout)
 
 
-def run_import_pipeline(
-    episode_id: int,
+def run_import_ffmpeg_only(
     file_path: str,
-    reporter: ProgressReporter,
-    db: Session,
+    out_dir: str,
+    on_progress=None,   # Optional[Callable[[int, str], None]] — no DB/job coupling
+    is_cancelled=None,  # Optional[Callable[[], bool]]
 ) -> dict:
-    """Extract audio + generate 480p proxy. Separation (local or remote) is a
-    deliberate next step the user triggers explicitly via a button — not
-    auto-chained here — so they can choose to run it locally or request it
-    from a peer over power-sharing before any processing actually starts."""
-    ep = db.get(Episode, episode_id)
-    if not ep:
-        raise ValueError(f"Episode {episode_id} not found")
+    """Core ffmpeg extraction routine, independent of any Episode/DB — used
+    both for local import jobs (run_import_pipeline below) and for a
+    power-shared import request run entirely on a peer machine (which has no
+    record of this episode at all — see power_share.run-import). Every stage
+    is prefixed 'ffmpeg:' so the UI never shows a bare, unexplained 'Обробка'
+    without saying which of the two engines (ffmpeg vs. the neural separator)
+    is actually running."""
+    os.makedirs(out_dir, exist_ok=True)
 
-    ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
-    ep_dir.mkdir(parents=True, exist_ok=True)
+    def progress(pct, msg):
+        if on_progress:
+            on_progress(pct, msg)
 
-    def ff_progress(pct, msg):
-        reporter.update(pct, msg)
+    progress(5, "ffmpeg: аналіз відеофайлу…")
 
-    ff_progress(5, "Аналіз відеофайлу…")
-
-    # Probe
     probe = _probe(file_path)
     fmt = probe.get("format", {})
     file_size = os.path.getsize(file_path)
@@ -90,10 +88,10 @@ def run_import_pipeline(
     bit_rate = int(fmt.get("bit_rate", 0)) // 1000 or None  # kbps
     fmt_name = fmt.get("format_name", "").split(",")[0]
 
-    ff_progress(10, "Витягую аудіо…")
+    progress(10, "ffmpeg: витягую лосслес-аудіо (FLAC)…")
 
     # --- Extract lossless audio (FLAC) ---
-    audio_out = str(ep_dir / "audio_full.flac")
+    audio_out = str(Path(out_dir) / "audio_full.flac")
     if not os.path.isfile(audio_out):
         cmd_audio = [
             _ffmpeg_bin(), "-y",
@@ -107,26 +105,25 @@ def run_import_pipeline(
             cmd_audio, stderr=subprocess.PIPE, text=True,
             encoding="utf-8", errors="replace",
         )
-        # Parse progress from ffmpeg stderr
         for line in proc.stderr:
-            if reporter.cancelled:
+            if is_cancelled and is_cancelled():
                 proc.kill()
                 raise RuntimeError("Скасовано")
             if "time=" in line and duration:
                 try:
                     t = _parse_time(line)
                     pct = min(40, int(10 + 30 * t / duration))
-                    ff_progress(pct, "Витягую аудіо…")
+                    progress(pct, "ffmpeg: витягую лосслес-аудіо (FLAC)…")
                 except Exception:
                     pass
         proc.wait()
         if proc.returncode != 0:
             raise RuntimeError("ffmpeg audio extraction failed")
 
-    ff_progress(45, "Генерую 480p проксі…")
+    progress(45, "ffmpeg: генерую 480p проксі для перегляду…")
 
     # --- 480p proxy ---
-    proxy_out = str(ep_dir / "proxy_480p.mp4")
+    proxy_out = str(Path(out_dir) / "proxy_480p.mp4")
     if not os.path.isfile(proxy_out):
         cmd_proxy = [
             _ffmpeg_bin(), "-y",
@@ -143,35 +140,77 @@ def run_import_pipeline(
             encoding="utf-8", errors="replace",
         )
         for line in proc.stderr:
-            if reporter.cancelled:
+            if is_cancelled and is_cancelled():
                 proc.kill()
                 raise RuntimeError("Скасовано")
             if "time=" in line and duration:
                 try:
                     t = _parse_time(line)
                     pct = min(90, int(45 + 45 * t / duration))
-                    ff_progress(pct, "Генерую 480p проксі…")
+                    progress(pct, "ffmpeg: генерую 480p проксі для перегляду…")
                 except Exception:
                     pass
         proc.wait()
         if proc.returncode != 0:
             raise RuntimeError("ffmpeg proxy generation failed")
 
-    ff_progress(95, "Оновлюю базу даних…")
+    progress(100, "ffmpeg: аудіо й проксі готові")
+    return {
+        "audio_path": audio_out,
+        "proxy_path": proxy_out,
+        "file_size": file_size,
+        "duration": duration,
+        "bit_rate": bit_rate,
+        "format_name": fmt_name,
+    }
 
-    # Update episode
-    ep.original_file_path = file_path
-    ep.audio_stem_path = audio_out
-    ep.proxy_480p_path = proxy_out
-    ep.original_size = file_size
-    ep.original_bitrate = bit_rate
-    ep.original_format = fmt_name
-    ep.duration = duration
-    ep.status = "processing"
-    db.commit()
 
-    ff_progress(100, "Аудіо готове")
-    return {"audio_path": audio_out, "proxy_path": proxy_out}
+def run_import_pipeline(
+    episode_id: int,
+    file_path: str,
+    reporter: ProgressReporter,
+) -> dict:
+    """Extract audio + generate 480p proxy. Separation (local or remote) is a
+    deliberate next step the user triggers explicitly via a button — not
+    auto-chained here — so they can choose to run it locally or request it
+    from a peer over power-sharing before any processing actually starts.
+
+    Opens its own DB session rather than reusing the request's — this runs in
+    a background thread pool that outlives the HTTP request, and a request-
+    scoped SQLAlchemy Session gets closed by FastAPI's dependency teardown as
+    soon as the endpoint returns, well before this actually finishes; reusing
+    it across threads/after close intermittently raises
+    "identity map is no longer valid" once real work (not just an instant
+    no-op) happens between the two."""
+    db = SessionLocal()
+    try:
+        ep = db.get(Episode, episode_id)
+        if not ep:
+            raise ValueError(f"Episode {episode_id} not found")
+
+        ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
+
+        result = run_import_ffmpeg_only(
+            file_path, str(ep_dir),
+            on_progress=reporter.update, is_cancelled=lambda: reporter.cancelled,
+        )
+
+        reporter.update(95, "Оновлюю базу даних…")
+
+        ep.original_file_path = file_path
+        ep.audio_stem_path = result["audio_path"]
+        ep.proxy_480p_path = result["proxy_path"]
+        ep.original_size = result["file_size"]
+        ep.original_bitrate = result["bit_rate"]
+        ep.original_format = result["format_name"]
+        ep.duration = result["duration"]
+        ep.status = "processing"
+        db.commit()
+
+        reporter.update(100, "Аудіо готове")
+        return {"audio_path": result["audio_path"], "proxy_path": result["proxy_path"]}
+    finally:
+        db.close()
 
 
 def run_mux_pipeline(
@@ -179,9 +218,23 @@ def run_mux_pipeline(
     original_video_path: str,
     mixed_audio_path: str,
     reporter: ProgressReporter,
+) -> dict:
+    """Mux rendered audio against original video, keeping video stream untouched.
+    Opens its own DB session — see run_import_pipeline's docstring for why."""
+    db = SessionLocal()
+    try:
+        return _run_mux_pipeline(episode_id, original_video_path, mixed_audio_path, reporter, db)
+    finally:
+        db.close()
+
+
+def _run_mux_pipeline(
+    episode_id: int,
+    original_video_path: str,
+    mixed_audio_path: str,
+    reporter: ProgressReporter,
     db: Session,
 ) -> dict:
-    """Mux rendered audio against original video, keeping video stream untouched."""
     ep = db.get(Episode, episode_id)
     if not ep:
         raise ValueError(f"Episode {episode_id} not found")
@@ -189,7 +242,7 @@ def run_mux_pipeline(
     ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
     ep_dir.mkdir(parents=True, exist_ok=True)
 
-    reporter.update(5, "Аналіз оригінального відео…")
+    reporter.update(5, "ffmpeg: аналіз оригінального відео…")
     probe = _probe(original_video_path)
 
     # Find original audio stream info
@@ -197,7 +250,7 @@ def run_mux_pipeline(
     orig_codec = audio_streams[0].get("codec_name", "aac") if audio_streams else "aac"
     orig_bitrate = str(int(audio_streams[0].get("bit_rate", "192000")) // 1000) + "k" if audio_streams else "192k"
 
-    reporter.update(15, "Мультиплексую…")
+    reporter.update(15, "ffmpeg: мультиплексую фінальне відео…")
 
     out_name = Path(original_video_path).stem + "_dub" + Path(original_video_path).suffix
     out_path = str(ep_dir / out_name)
@@ -224,7 +277,7 @@ def run_mux_pipeline(
             try:
                 t = _parse_time(line)
                 pct = min(90, int(15 + 75 * t / duration))
-                reporter.update(pct, "Мультиплексую…")
+                reporter.update(pct, "ffmpeg: мультиплексую фінальне відео…")
             except Exception:
                 pass
     proc.wait()

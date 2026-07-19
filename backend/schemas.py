@@ -251,6 +251,7 @@ class PowerShareRequestIn(BaseModel):
     title_id: int
     title_name: str
     episode_number: int
+    task: str = "separate"  # "separate" (vocal isolation) | "import" (full ffmpeg import)
 
 
 class PowerShareRespondIn(BaseModel):

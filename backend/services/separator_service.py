@@ -67,7 +67,7 @@ def separate_file(
 
         uvr_model = MODEL_MAP.get(mdl, mdl)
         base_pct = int(idx / len(models_to_run) * 80)
-        progress(base_pct + 5, f"Завантаження моделі {mdl}…")
+        progress(base_pct + 5, f"нейромережа: завантаження моделі {mdl}…")
 
         sep = Separator(
             output_dir=output_dir,
@@ -77,23 +77,33 @@ def separate_file(
         )
         sep.load_model(uvr_model)
 
-        progress(base_pct + 15, f"Ізоляція вокалу ({mdl})…")
+        progress(base_pct + 15, f"нейромережа: ізоляція вокалу ({mdl})…")
 
         output_files = sep.separate(audio_path)
+        # audio-separator returns bare filenames relative to output_dir, NOT
+        # full/absolute paths — joining is required, otherwise os.path.isfile
+        # below checks the process's CWD instead and silently "finds nothing"
+        # even though the file was written correctly (confirmed via a direct
+        # repro: separation succeeded and wrote both stems to output_dir, but
+        # every returned name failed the bare isfile() check).
+        output_paths = [
+            f if os.path.isabs(f) else str(Path(output_dir) / f)
+            for f in output_files
+        ]
 
         # audio-separator names output files like: {stem}_(Vocals)_model.wav
         vocal_file = None
-        for f in output_files:
+        for f in output_paths:
             if "Vocals" in f or "vocals" in f or "vocal" in f.lower():
                 vocal_file = f
                 break
-        if not vocal_file and output_files:
-            vocal_file = output_files[0]
+        if not vocal_file and output_paths:
+            vocal_file = output_paths[0]
 
         if vocal_file and os.path.isfile(vocal_file):
             vocal_stems.append(vocal_file)
 
-        progress(base_pct + int(80 / len(models_to_run)), f"Готово {mdl}")
+        progress(base_pct + int(80 / len(models_to_run)), f"нейромережа: готово {mdl}")
 
     if not vocal_stems:
         raise RuntimeError("Не вдалося отримати вокальний стем")
@@ -102,10 +112,10 @@ def separate_file(
     if len(vocal_stems) == 1:
         shutil.copy2(vocal_stems[0], final_vocal)
     else:
-        progress(85, "Об'єднання стемів (ensemble)…")
+        progress(85, "нейромережа: об'єднання стемів (ensemble)…")
         _average_stems(vocal_stems, final_vocal)
 
-    progress(100, "Вокал відокремлено")
+    progress(100, "нейромережа: вокал відокремлено")
     return final_vocal
 
 
@@ -115,26 +125,33 @@ def run_separation(
     model_name: str,
     ensemble: bool,
     reporter: ProgressReporter,
-    db: Session,
 ) -> dict:
-    ep = db.get(Episode, episode_id)
-    if not ep:
-        raise ValueError(f"Episode {episode_id} not found")
+    """Opens its own DB session rather than reusing the request's — this runs
+    in a background thread pool that outlives the HTTP request, and a
+    request-scoped Session gets closed by FastAPI's dependency teardown right
+    after the endpoint returns, well before this actually finishes."""
+    db = SessionLocal()
+    try:
+        ep = db.get(Episode, episode_id)
+        if not ep:
+            raise ValueError(f"Episode {episode_id} not found")
 
-    ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
-    output_dir = ep_dir / "stems"
+        ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
+        output_dir = ep_dir / "stems"
 
-    final_vocal = separate_file(
-        audio_path, str(output_dir), model_name, ensemble,
-        on_progress=reporter.update, is_cancelled=lambda: reporter.cancelled,
-    )
+        final_vocal = separate_file(
+            audio_path, str(output_dir), model_name, ensemble,
+            on_progress=reporter.update, is_cancelled=lambda: reporter.cancelled,
+        )
 
-    reporter.update(95, "Оновлення БД…")
-    ep.vocal_stem_path = final_vocal
-    ep.status = "vocal_isolated"
-    db.commit()
+        reporter.update(95, "Оновлення БД…")
+        ep.vocal_stem_path = final_vocal
+        ep.status = "vocal_isolated"
+        db.commit()
 
-    return {"vocal_stem_path": final_vocal}
+        return {"vocal_stem_path": final_vocal}
+    finally:
+        db.close()
 
 
 def _average_stems(stems: list[str], output_path: str):

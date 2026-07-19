@@ -88,6 +88,16 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     if (!backendReady) return
     for (const job of activeJobs.values()) {
       if (job.episode_id !== episodeId) continue
+      if (job.status === 'error' && job.type === 'request_remote_separation') {
+        // Surfaces the exact deny reason (per-peer) from the background job —
+        // otherwise a remote-power failure would only ever show up as a
+        // silently-vanished spinner in the title bar.
+        if (!handledJobIdsRef.current.has(job.id)) {
+          handledJobIdsRef.current.add(job.id)
+          setPowerShareError(job.message || 'Не вдалося отримати потужність')
+        }
+        continue
+      }
       if (job.status !== 'complete') continue
       if (handledJobIdsRef.current.has(job.id)) continue
       handledJobIdsRef.current.add(job.id)
@@ -252,11 +262,21 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     setRequestingPower(true)
     setPowerShareError(null)
     try {
-      await post(`/episodes/${episodeId}/request-remote-separation`, { model: sepModel, ensemble: ensembleMode })
-      setEpisode((prev) => (prev ? { ...prev, status: 'vocal_isolated' } : prev))
+      const result = await post<{ job_id: string }>(`/episodes/${episodeId}/request-remote-separation`, {
+        model: sepModel,
+        ensemble: ensembleMode,
+      })
+      upsertJob({
+        id: result.job_id,
+        type: 'request_remote_separation',
+        status: 'running',
+        percent: 0,
+        message: 'Шукаю доступні ПК у мережі…',
+        episode_id: episodeId,
+      })
       setShowSeparationPanel(false)
     } catch (err) {
-      setPowerShareError(err instanceof Error ? err.message : 'Не вдалося отримати потужність')
+      setPowerShareError(err instanceof Error ? err.message : 'Не вдалося надіслати запит')
     } finally {
       setRequestingPower(false)
     }

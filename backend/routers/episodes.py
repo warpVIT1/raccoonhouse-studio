@@ -102,8 +102,9 @@ async def import_video(
 
     from ..services.ffmpeg_service import run_import_pipeline
     loop = asyncio.get_event_loop()
+    ep_id_for_job = ep.id
     asyncio.create_task(
-        job_manager.run_job(loop, job, lambda r: run_import_pipeline(ep.id, body.file_path, r, db))
+        job_manager.run_job(loop, job, lambda r: run_import_pipeline(ep_id_for_job, body.file_path, r))
     )
 
     return {"job_id": job.id, "episode": _episode_out(ep, db)}
@@ -125,8 +126,9 @@ async def separate_vocals(ep_id: int, request: Request, db: Session = Depends(ge
 
     from ..services.separator_service import run_separation
     loop = asyncio.get_event_loop()
+    audio_stem_path = ep.audio_stem_path
     asyncio.create_task(
-        job_manager.run_job(loop, job, lambda r: run_separation(ep_id, ep.audio_stem_path, model, ensemble, r, db))
+        job_manager.run_job(loop, job, lambda r: run_separation(ep_id, audio_stem_path, model, ensemble, r))
     )
 
     return {"job_id": job.id}
@@ -148,9 +150,10 @@ async def detect_markers(ep_id: int, db: Session = Depends(get_db)):
     # Collect character codes for this episode's title
     chars = db.query(Character).filter(Character.title_id == ep.title_id).all()
     char_codes = {c.name: c.code for c in chars}
+    vocal_stem_path = ep.vocal_stem_path
 
     asyncio.create_task(
-        job_manager.run_job(loop, job, lambda r: run_marker_detection(ep_id, ep.vocal_stem_path, char_codes, r, db))
+        job_manager.run_job(loop, job, lambda r: run_marker_detection(ep_id, vocal_stem_path, char_codes, r))
     )
 
     return {"job_id": job.id}
@@ -170,8 +173,9 @@ async def mux_audio(ep_id: int, request: Request, db: Session = Depends(get_db))
 
     from ..services.ffmpeg_service import run_mux_pipeline
     loop = asyncio.get_event_loop()
+    original_file_path = ep.original_file_path
     asyncio.create_task(
-        job_manager.run_job(loop, job, lambda r: run_mux_pipeline(ep_id, ep.original_file_path, mixed_audio_path, r, db))
+        job_manager.run_job(loop, job, lambda r: run_mux_pipeline(ep_id, original_file_path, mixed_audio_path, r))
     )
 
     return {"job_id": job.id}

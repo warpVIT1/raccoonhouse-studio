@@ -7,7 +7,7 @@ copyright: "RaccoonHouse Studio"
 # when running `npm run publish` — this config alone doesn't push anything.
 publish:
   provider: github
-  owner: warpvit
+  owner: warpVIT1
   repo: raccoonhouse-studio
 
 directories:

@@ -35,7 +35,13 @@ export function UpdatePanel() {
       case 'downloading': return `Завантаження оновлення… ${state.percent ?? 0}%`
       case 'downloaded': return `Оновлення ${state.version ?? ''} завантажено — готове до встановлення`
       case 'not-available': return 'Встановлено останню версію'
-      case 'error': return `Помилка перевірки оновлень: ${state.message ?? ''}`
+      case 'error': {
+        const msg = state.message ?? ''
+        if (/404|cannot find latest|no published versions|release not found/i.test(msg)) {
+          return 'На GitHub ще немає жодного опублікованого релізу — це очікувано, доки не виконано npm run publish'
+        }
+        return `Помилка перевірки оновлень: ${msg}`
+      }
       default: return 'Оновлення застосунку'
     }
   })()

@@ -74,7 +74,7 @@ export interface Marker {
 
 export interface JobStatus {
   id: string
-  type: 'import_video' | 'separate_vocals' | 'detect_markers' | 'export_srt' | 'mux_audio'
+  type: 'import_video' | 'import_video_remote' | 'separate_vocals' | 'request_remote_separation' | 'detect_markers' | 'export_srt' | 'mux_audio'
   status: 'pending' | 'running' | 'complete' | 'error' | 'cancelled'
   percent: number
   message: string
@@ -135,11 +135,13 @@ export interface PowerShareRequestPayload {
   requester_name: string
   title_name: string
   episode_number: number
+  task: 'separate' | 'import'
   timeout_seconds: number
 }
 
 export interface PowerShareLendingPayload {
   active: boolean
+  task: 'separate' | 'import'
   requester_name: string
   title_name: string
   episode_number: number

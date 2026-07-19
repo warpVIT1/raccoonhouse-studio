@@ -75,6 +75,22 @@ def run_ass_import(
     episode_id: int,
     ass_path: str,
     reporter: ProgressReporter,
+) -> dict:
+    """Opens its own DB session rather than reusing the request's — this runs
+    in a background thread pool that outlives the HTTP request, and a
+    request-scoped Session gets closed by FastAPI's dependency teardown right
+    after the endpoint returns, well before this actually finishes."""
+    db = SessionLocal()
+    try:
+        return _run_ass_import(episode_id, ass_path, reporter, db)
+    finally:
+        db.close()
+
+
+def _run_ass_import(
+    episode_id: int,
+    ass_path: str,
+    reporter: ProgressReporter,
     db: Session,
 ) -> dict:
     ep = db.get(Episode, episode_id)

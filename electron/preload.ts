@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('dialog:openFile', options),
   openDirectory: () => ipcRenderer.invoke('dialog:openDirectory'),
   getBackendPort: () => ipcRenderer.invoke('get:backendPort'),
+  getAppVersion: () => ipcRenderer.invoke('get:appVersion'),
   openPath: (filePath: string) => ipcRenderer.invoke('shell:openPath', filePath),
   platform: process.platform,
 

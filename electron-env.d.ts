@@ -15,6 +15,7 @@ interface Window {
     openFile: (options: { filters?: Array<{ name: string; extensions: string[] }> }) => Promise<string | null>
     openDirectory: () => Promise<string | null>
     getBackendPort: () => Promise<number>
+    getAppVersion: () => Promise<string>
     openPath: (path: string) => Promise<void>
     platform: string
     minimize: () => void

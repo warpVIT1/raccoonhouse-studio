@@ -33,6 +33,16 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   const [currentTimeMs, setCurrentTimeMs] = useState(0)
   const [duration, setDuration] = useState(0)
 
+  // Video panel is resizable (by width, against the waveform) since a
+  // fixed-width video felt too wide on most screens — dragged size is
+  // remembered across episodes for the session.
+  const [videoWidthPct, setVideoWidthPct] = useState(() => {
+    const saved = Number(localStorage.getItem('rh_video_width_pct'))
+    return saved >= 20 && saved <= 85 ? saved : 65
+  })
+  const topRowRef = useRef<HTMLDivElement>(null)
+  const resizingRef = useRef(false)
+
   // Separation panel state
   const SEPARATION_MODELS = ['MDX-Net', 'VR Arch', 'Demucs', 'MDX23C', 'BS-RoFormer'] as const
   const [showSeparationPanel, setShowSeparationPanel] = useState(false)
@@ -145,6 +155,27 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [])
+
+  const startVideoResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    resizingRef.current = true
+    let lastPct = videoWidthPct
+    const onMove = (ev: MouseEvent) => {
+      if (!resizingRef.current || !topRowRef.current) return
+      const rect = topRowRef.current.getBoundingClientRect()
+      const pct = ((ev.clientX - rect.left) / rect.width) * 100
+      lastPct = Math.min(85, Math.max(20, pct))
+      setVideoWidthPct(lastPct)
+    }
+    const onUp = () => {
+      resizingRef.current = false
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      localStorage.setItem('rh_video_width_pct', String(lastPct))
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }, [videoWidthPct])
 
   const handleTimeUpdate = useCallback((t: number) => {
     setCurrentTimeMs(Math.round(t * 1000))
@@ -518,10 +549,10 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
 
       {/* Main workspace */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        {/* Top: video + waveform */}
-        <div className="flex gap-2 p-2 flex-shrink-0" style={{ height: '42%' }}>
+        {/* Top: video + waveform — width split between them is resizable */}
+        <div ref={topRowRef} className="flex p-2 flex-shrink-0" style={{ height: '42%' }}>
           {/* Video player */}
-          <div className="flex-1 min-w-0">
+          <div style={{ width: `${videoWidthPct}%` }} className="min-w-0">
             <VideoPlayer
               ref={videoRef}
               src={episode?.original_file_path ?? null}
@@ -532,8 +563,17 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
             />
           </div>
 
+          {/* Drag handle */}
+          <div
+            onMouseDown={startVideoResize}
+            className="w-2 flex-shrink-0 cursor-col-resize group flex items-center justify-center"
+            title="Перетягніть, щоб змінити розмір відео"
+          >
+            <div className="w-1 h-8 rounded-full bg-rh-border group-hover:bg-rh-accent transition-colors" />
+          </div>
+
           {/* Waveform */}
-          <div className="w-64 flex-shrink-0">
+          <div style={{ width: `calc(${100 - videoWidthPct}% - 8px)` }} className="flex-shrink-0">
             <WaveformViewer
               vocalStemPath={episode?.vocal_stem_path ?? null}
               currentTime={currentTimeMs / 1000}

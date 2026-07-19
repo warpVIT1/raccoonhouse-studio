@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { useAppStore } from '../../stores/appStore'
 import { ProfileModal } from '../ProfileModal'
 import logoUrl from '../../assets/logo.png'
@@ -13,6 +13,11 @@ export function Sidebar({ view, onNavigate }: SidebarProps) {
   const activeProfile = useAppStore((s) => s.activeProfile)
   const isLibraryArea = view === 'titles' || view === 'title' || view === 'episode'
   const [showProfileModal, setShowProfileModal] = useState(false)
+  const [appVersion, setAppVersion] = useState('')
+
+  useEffect(() => {
+    window.electronAPI?.getAppVersion().then(setAppVersion).catch(() => {})
+  }, [])
 
   return (
     <aside className="w-14 flex flex-col items-center py-3 bg-rh-bg border-r border-rh-border flex-shrink-0">
@@ -62,6 +67,15 @@ export function Sidebar({ view, onNavigate }: SidebarProps) {
       </button>
 
       {showProfileModal && <ProfileModal onClose={() => setShowProfileModal(false)} />}
+
+      {appVersion && (
+        <div
+          className="mt-2 text-[9px] text-rh-muted/50 select-none no-drag"
+          title={`RaccoonHouse Studio v${appVersion}`}
+        >
+          v{appVersion}
+        </div>
+      )}
     </aside>
   )
 }

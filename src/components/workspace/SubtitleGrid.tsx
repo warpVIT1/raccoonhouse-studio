@@ -20,6 +20,60 @@ function cpsColor(cps: number): string {
   return cps > 20 ? 'text-red-400' : 'text-rh-text-dim'
 }
 
+// Shows the assigned actor as plain text and only opens a picker popover on
+// an explicit click — a native <select> pops its OS menu the instant it's
+// clicked, which gets in the way when you're just scanning/reading the
+// column rather than trying to change it.
+function ActorCell({
+  characterId, characters, onChange,
+}: {
+  characterId: number | null
+  characters: Character[]
+  onChange: (id: number | null) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const current = characters.find((c) => c.id === characterId)
+
+  useEffect(() => {
+    if (!open) return
+    const onDocClick = () => setOpen(false)
+    document.addEventListener('click', onDocClick)
+    return () => document.removeEventListener('click', onDocClick)
+  }, [open])
+
+  return (
+    <div className="relative" onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }}>
+      <button className="text-xs text-rh-text-dim hover:text-rh-text w-full text-left truncate">
+        {current ? current.name : '—'}
+      </button>
+      {open && (
+        <div
+          className="absolute z-20 top-6 left-0 w-40 max-h-52 overflow-y-auto rh-card border border-rh-border shadow-2xl py-1"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            onClick={() => { onChange(null); setOpen(false) }}
+            className="w-full text-left px-2.5 py-1.5 text-xs text-rh-muted hover:bg-white/5 hover:text-rh-text"
+          >
+            — (без актора)
+          </button>
+          {characters.map((c) => (
+            <button
+              key={c.id}
+              onClick={() => { onChange(c.id); setOpen(false) }}
+              className={`w-full text-left px-2.5 py-1.5 text-xs truncate hover:bg-white/5 ${
+                c.id === characterId ? 'text-rh-accent font-semibold' : 'text-rh-text-dim hover:text-rh-text'
+              }`}
+            >
+              {c.name}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 interface SubtitleGridProps {
   lines: SubtitleLine[]
   characters: Character[]
@@ -93,12 +147,6 @@ export function SubtitleGrid({
     [lines, onLineChange]
   )
 
-  const handleCharacterChange = useCallback(
-    (rowIdx: number, charId: string) => {
-      onLineChange(rowIdx, { character_id: charId ? parseInt(charId) : null })
-    },
-    [onLineChange]
-  )
 
   const COLS = [
     { key: '#', width: 'w-10', label: '#' },
@@ -203,19 +251,12 @@ export function SubtitleGrid({
                 </div>
 
                 {/* Actor */}
-                <div className="w-28 px-1 py-1" onClick={(e) => e.stopPropagation()}>
-                  <select
-                    className="text-xs bg-transparent text-rh-text-dim border-none outline-none w-full cursor-pointer"
-                    value={line.character_id ?? ''}
-                    onChange={(e) => handleCharacterChange(i, e.target.value)}
-                  >
-                    <option value="">—</option>
-                    {characters.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name}
-                      </option>
-                    ))}
-                  </select>
+                <div className="w-28 px-1 py-1">
+                  <ActorCell
+                    characterId={line.character_id}
+                    characters={characters}
+                    onChange={(id) => onLineChange(i, { character_id: id })}
+                  />
                 </div>
 
                 {/* Text */}

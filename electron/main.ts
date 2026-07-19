@@ -123,8 +123,19 @@ function sendUpdateStatus(status: string, extra?: Record<string, unknown>) {
   win?.webContents.send('update:status', { status, ...extra })
 }
 
+const AUTO_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000 // 4 hours
+
 function initAutoUpdater() {
   if (!app.isPackaged) return // electron-updater needs a real packaged build + app-update.yml
+
+  // Download as soon as an update is found, and — if the user never clicks
+  // "Перезапустити й встановити" themselves — install it silently the next
+  // time the app closes normally, instead of requiring them to babysit an
+  // installer window. Either path runs the NSIS installer with its silent
+  // flag (see quitAndInstall(true, ...) below), so no installer UI ever
+  // appears either way.
+  autoUpdater.autoDownload = true
+  autoUpdater.autoInstallOnAppQuit = true
 
   autoUpdater.on('checking-for-update', () => sendUpdateStatus('checking'))
   autoUpdater.on('update-available', (info) => sendUpdateStatus('available', { version: info.version }))
@@ -133,7 +144,11 @@ function initAutoUpdater() {
   autoUpdater.on('download-progress', (p) => sendUpdateStatus('downloading', { percent: Math.round(p.percent) }))
   autoUpdater.on('update-downloaded', (info) => sendUpdateStatus('downloaded', { version: info.version }))
 
-  autoUpdater.checkForUpdates().catch((err) => console.error('[updater] check failed', err))
+  const check = () => autoUpdater.checkForUpdates().catch((err) => console.error('[updater] check failed', err))
+  check()
+  // Nobody has to remember to click "Перевірити зараз" — this keeps checking
+  // in the background for as long as the app stays open.
+  setInterval(check, AUTO_CHECK_INTERVAL_MS)
 }
 
 ipcMain.handle('update:check', () => {
@@ -142,7 +157,10 @@ ipcMain.handle('update:check', () => {
 })
 
 ipcMain.handle('update:install', () => {
-  autoUpdater.quitAndInstall()
+  // (isSilent, isForceRunAfter) — isSilent=true skips the NSIS installer's
+  // own wizard UI entirely (runs with the standard silent-install flag), so
+  // clicking this just closes the app, installs invisibly, and reopens it.
+  autoUpdater.quitAndInstall(true, true)
 })
 
 // IPC Handlers
@@ -164,6 +182,7 @@ ipcMain.handle('dialog:openDirectory', async () => {
 })
 
 ipcMain.handle('get:backendPort', () => BACKEND_PORT)
+ipcMain.handle('get:appVersion', () => app.getVersion())
 
 ipcMain.handle('shell:openPath', async (_event, filePath: string) => {
   await shell.openPath(filePath)

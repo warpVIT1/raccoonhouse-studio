@@ -100,6 +100,7 @@ class Marker(Base):
     reaper_name: Mapped[str] = mapped_column(String(128), nullable=False)
     position_seconds: Mapped[float] = mapped_column(Float, nullable=False)
     confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    color: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)  # hex, e.g. "#E52128"
 
     episode: Mapped["Episode"] = relationship("Episode", back_populates="markers")
 

@@ -8,10 +8,32 @@ SQLAlchemy==2.0.31
 alembic==1.13.2
 pydantic==2.8.2
 pydantic-settings==2.3.4
-webrtcvad==2.0.10
 silero-vad==5.1
 
-# audio-separator pulls its own compatible numpy/scipy/librosa/soundfile/torch —
+# audio-separator pulls its own compatible numpy/scipy/librosa/soundfile —
 # do not pin those separately, it causes version conflicts (verified 2026-07-19).
-# [cpu] extra pulls onnxruntime (CPU); swap to [gpu] on a machine with CUDA.
-audio-separator[cpu]==0.44.3
+#
+# GPU acceleration, NVIDIA/CUDA only, via onnxruntime-gpu (used by the
+# ONNX-based MDX-Net models) — on any other GPU vendor, no GPU at all, or a
+# non-NVIDIA machine, this cleanly falls back to CPU with zero errors.
+# torch itself is deliberately the plain CPU build, NOT +cu126: a full
+# CUDA-enabled torch bundles its own ~3.9GB private copy of the CUDA runtime
+# (cublas/cudnn/cufft/cusparse/etc in torch/lib), which pushed the packaged
+# installer to ~3.2GB — GitHub Releases hard-rejects any single asset over
+# 2GB ("size must be less than 2147483648"), and there's no other host set up
+# for a file that size (verified 2026-07-19). Trade-off: the torch-based
+# MDXC-family models run CPU-only (as they always did before GPU support was
+# added); the onnxruntime-based MDX-Net models still get real CUDA
+# acceleration via nvidia-cublas-cu12/nvidia-cudnn-cu12 below, which onnxruntime
+# needs on its own now since there's no CUDA-enabled torch to borrow DLLs from.
+# onnxruntime-gpu pinned to 1.20.1, deliberately NOT the latest (1.27.0) — it
+# targets the CUDA 13 runtime, whose redistributable pip package
+# (nvidia-cublas-cu13) is only a placeholder stub right now, so
+# CUDAExecutionProvider silently fails to load. 1.20.1 targets CUDA 12, which
+# nvidia-cublas-cu12/nvidia-cudnn-cu12 provide directly — confirmed working
+# (no load errors, "enabling acceleration" in the separator log).
+audio-separator==0.44.3
+torch==2.13.0
+onnxruntime-gpu==1.20.1
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

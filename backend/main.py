@@ -18,6 +18,27 @@ from fastapi.middleware.cors import CORSMiddleware
 if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# onnxruntime-gpu's CUDAExecutionProvider dynamically LoadLibrary()s
+# cublas64_12.dll/cudnn64_9.dll at runtime — nothing else in this process ever
+# imports the nvidia-cublas-cu12/nvidia-cudnn-cu12 packages that ship those
+# DLLs (torch here is the plain CPU build, see requirements.txt, so it never
+# registers a CUDA lib directory the way a CUDA-enabled torch build would),
+# so without this, onnxruntime silently falls back to CPU ("No hardware
+# acceleration could be configured" in the separator log) even with both
+# packages installed. Must run before anything imports onnxruntime — done
+# here, at the top of the entrypoint, before any router/service import.
+if sys.platform == "win32":
+    try:
+        import nvidia.cublas
+        import nvidia.cudnn
+        # nvidia.cublas/nvidia.cudnn are native (PEP 420) namespace packages —
+        # they have no __init__.py, so __file__ is None; __path__ is the only
+        # way to find where their DLLs actually live.
+        os.add_dll_directory(os.path.join(list(nvidia.cublas.__path__)[0], "bin"))
+        os.add_dll_directory(os.path.join(list(nvidia.cudnn.__path__)[0], "bin"))
+    except Exception:
+        pass  # no NVIDIA GPU packages installed / not on an NVIDIA machine — CPU fallback is fine
+
 from backend.database import init_db, SessionLocal
 from backend import job_manager
 from backend.routers import titles, episodes, characters, subtitles, markers, jobs, settings, hikka, profiles, power_share

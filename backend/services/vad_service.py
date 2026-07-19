@@ -83,8 +83,6 @@ def _run_marker_detection(
     if duration_sec - prev_end >= min_gap_seconds:
         gaps.append((prev_end, duration_sec))
 
-    reporter.update(80, f"Знайдено {len(gaps)} пауз. Розміщення маркерів…")
-
     # Determine marker names from subtitle context
     subtitle_lines = (
         db.query(SubtitleLine)
@@ -92,6 +90,18 @@ def _run_marker_detection(
         .order_by(SubtitleLine.start_ms)
         .all()
     )
+
+    # A gap already covered by an existing subtitle line (any overlap at all)
+    # doesn't need its own "ЗВУК" marker — that stretch is already annotated,
+    # e.g. a Sign/OP/ED line over an instrumental section with no vocal, which
+    # VAD alone can't tell apart from a real background-sound-only gap.
+    def _overlaps_subtitle(gap_start: float, gap_end: float) -> bool:
+        gap_start_ms, gap_end_ms = gap_start * 1000, gap_end * 1000
+        return any(line.start_ms < gap_end_ms and line.end_ms > gap_start_ms for line in subtitle_lines)
+
+    gaps = [g for g in gaps if not _overlaps_subtitle(*g)]
+
+    reporter.update(80, f"Знайдено {len(gaps)} пауз (поза субтитрами). Розміщення маркерів…")
 
     # Remove old auto-markers for this episode
     db.query(Marker).filter(Marker.episode_id == episode_id, Marker.confirmed == False).delete()

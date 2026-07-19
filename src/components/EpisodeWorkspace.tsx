@@ -433,7 +433,6 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   )
 
   const vocalIsolated = episode?.status === 'vocal_isolated' || episode?.status === 'marked' || episode?.status === 'ready'
-  const allMarkersConfirmed = markers.length > 0 && markers.every((m) => m.confirmed)
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -516,14 +515,14 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
 
           <div className="w-px h-4 bg-rh-border mx-1" />
 
-          {!allMarkersConfirmed && (
-            <span className="text-xs text-rh-muted">Підтвердіть усі маркери, щоб рендерити</span>
+          {!vocalIsolated && (
+            <span className="text-xs text-rh-muted">Виконайте відокремлення вокалу, щоб рендерити</span>
           )}
           <button
             onClick={() => muxInputRef.current?.click()}
-            disabled={!allMarkersConfirmed || rendering}
+            disabled={!vocalIsolated || rendering}
             className={`text-xs font-bold rounded-lg px-4 py-2 transition-all
-              ${allMarkersConfirmed
+              ${vocalIsolated
                 ? 'bg-rh-accent text-white hover:bg-[#F03238] hover:shadow-[0_0_20px_rgba(229,33,40,0.3)]'
                 : 'bg-rh-border text-rh-muted cursor-not-allowed'
               }`}
@@ -593,6 +592,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
             <VideoPlayer
               ref={videoRef}
               src={episode?.original_file_path ?? null}
+              vocalStemPath={episode?.vocal_stem_path ?? null}
               subtitles={subtitles}
               activeSubIndex={activeSubIndex}
               onTimeUpdate={handleTimeUpdate}
@@ -664,6 +664,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
               <MarkersTab
                 markers={markers}
                 characters={characters}
+                currentTimeMs={currentTimeMs}
                 onConfirm={handleMarkerConfirm}
                 onEdit={handleMarkerEdit}
                 onDelete={handleMarkerDelete}

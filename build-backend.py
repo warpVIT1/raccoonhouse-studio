@@ -37,6 +37,18 @@ def main():
         "--hidden-import", "librosa",
         "--collect-all", "audio_separator",
         "--collect-all", "silero_vad",
+        # GPU support: onnxruntime-gpu's CUDA provider DLL and the
+        # nvidia-cublas-cu12/nvidia-cudnn-cu12 runtime DLLs it depends on are
+        # loaded dynamically at runtime (not via a Python import PyInstaller's
+        # static analysis can see), so they need to be forced in explicitly —
+        # otherwise the packaged exe silently falls back to CPU even though
+        # the dev environment (which just has them on disk in site-packages,
+        # not frozen) has GPU acceleration working fine. torch is plain CPU
+        # here (see requirements.txt) so these are the only source of CUDA
+        # runtime DLLs in this build.
+        "--collect-all", "onnxruntime",
+        "--collect-all", "nvidia_cublas_cu12",
+        "--collect-all", "nvidia_cudnn_cu12",
         # Absolute source path: PyInstaller resolves relative --add-data paths against
         # --specpath, not the invocation cwd, so a relative "backend" here would
         # (and did) resolve to build-pyinstaller/backend and fail to be found.

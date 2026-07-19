@@ -1,4 +1,5 @@
 import asyncio
+import mimetypes
 import os
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -193,4 +194,8 @@ async def mux_audio(ep_id: int, request: Request, db: Session = Depends(get_db))
 def stream_video(path: str):
     if not os.path.isfile(path):
         raise HTTPException(404, "File not found")
-    return FileResponse(path, media_type="video/mp4")
+    # Serves both the original video and the isolated vocal stem (for the
+    # original/vocal A-B toggle in the player) — a hardcoded video/mp4 type
+    # was wrong for the latter (a .wav), so guess it from the actual file.
+    guessed, _ = mimetypes.guess_type(path)
+    return FileResponse(path, media_type=guessed or "application/octet-stream")

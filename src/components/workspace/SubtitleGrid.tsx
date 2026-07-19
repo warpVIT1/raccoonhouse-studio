@@ -88,6 +88,14 @@ export function SubtitleGrid({
 }: SubtitleGridProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [editingCell, setEditingCell] = useState<{ row: number; col: string } | null>(null)
+  // Ctrl/Cmd+wheel zooms row text size (like the waveform's own zoom) —
+  // plain wheel keeps scrolling normally.
+  const [fontScale, setFontScale] = useState(1)
+  const handleWheel = useCallback((e: React.WheelEvent) => {
+    if (!e.ctrlKey && !e.metaKey) return
+    e.preventDefault()
+    setFontScale((s) => Math.min(2, Math.max(0.7, s * (e.deltaY < 0 ? 1.08 : 1 / 1.08))))
+  }, [])
   // Ctrl+click toggles individual rows into the selection, Shift+click
   // selects a whole range from the last-clicked row — so an actor can be
   // assigned to many lines at once instead of one at a time.
@@ -128,6 +136,13 @@ export function SubtitleGrid({
   const handleCellClick = useCallback(
     (rowIdx: number, col: string, e: React.MouseEvent) => {
       e.stopPropagation()
+      // A plain click into a cell (to edit/navigate) always clears any
+      // multi-row selection first — otherwise the stale selection from an
+      // earlier Ctrl/Shift click lingers, and assigning an actor here
+      // silently applies to that whole old selection instead of just this
+      // line, which looks like "it picks the wrong lines".
+      setSelectedRows(new Set())
+      lastClickedRowRef.current = rowIdx
       onLineClick(rowIdx)
       if (col === 'text' || col === 'start' || col === 'end' || col === 'actor') {
         setEditingCell({ row: rowIdx, col })
@@ -212,7 +227,15 @@ export function SubtitleGrid({
   ]
 
   return (
-    <div className="flex flex-col h-full overflow-hidden">
+    <div
+      className="flex flex-col h-full overflow-hidden"
+      // `zoom` (not standard CSS, but Chromium-only is fine — this app only
+      // ever runs inside Electron) actually rescales layout+text together;
+      // Tailwind's text-xs etc. are fixed rem values, so plain `fontSize`
+      // here wouldn't touch any of the row cells' own text sizing at all.
+      style={{ zoom: fontScale }}
+      onWheel={handleWheel}
+    >
       {/* Column headers */}
       <div className="flex items-center border-b border-rh-border bg-rh-card2 px-2 flex-shrink-0">
         {COLS.map((col) => (

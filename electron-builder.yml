@@ -54,5 +54,17 @@ nsis:
   installerHeader: resources/installer-header.bmp
   installerSidebar: resources/installer-sidebar.bmp
   runAfterFinish: true
+  # NSISBI (see customNsisBinary below) treats NSIS warnings as fatal errors;
+  # it emits a missing-langstring warning for Korean on every build (harmless
+  # — we don't ship a Korean UI) that would otherwise abort compilation.
+  warningsAsErrors: false
+  # The GPU-enabled backend (bundled torch+CUDA runtime) pushed total app size
+  # past ~3GB, which the standard NSIS binary electron-builder ships (a 32-bit
+  # makensis 3.0.4.1) can't handle — it fails embedding any single archive
+  # over ~2GB with "failed creating mmap". NSISBI is a patched NSIS build with
+  # that limit lifted; verified sha512 checksum against the published asset.
+  customNsisBinary:
+    url: https://github.com/SoundSafari/NSISBI-ElectronBuilder/releases/download/1.0.0/nsisbi-electronbuilder-3.10.3.7z
+    checksum: WRmZUsACjIc2s7bvsFGFRofK31hfS7riPlcfI1V9uFB2Q8s7tidgI/9U16+X0I9X2ZhNxi8N7Z3gKvm6ojvLvg==
 
 compression: maximum

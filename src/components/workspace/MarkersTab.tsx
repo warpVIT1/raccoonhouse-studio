@@ -11,6 +11,7 @@ function formatTime(s: number): string {
 interface MarkersTabProps {
   markers: Marker[]
   characters: Character[]
+  currentTimeMs: number
   onConfirm: (id: number) => void
   onEdit: (id: number, changes: Partial<Marker>) => void
   onDelete: (id: number) => void
@@ -53,7 +54,7 @@ function CharacterPicker({ characters, onPick }: { characters: Character[]; onPi
   )
 }
 
-export function MarkersTab({ markers, characters, onConfirm, onEdit, onDelete, onAdd, onSeek }: MarkersTabProps) {
+export function MarkersTab({ markers, characters, currentTimeMs, onConfirm, onEdit, onDelete, onAdd, onSeek }: MarkersTabProps) {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [editName, setEditName] = useState('')
   const [editPos, setEditPos] = useState('')
@@ -111,15 +112,31 @@ export function MarkersTab({ markers, characters, onConfirm, onEdit, onDelete, o
         <span className="text-xs text-rh-muted">
           {markers.length} маркерів · {markers.filter((m) => m.confirmed).length} підтверджено
         </span>
-        <button
-          onClick={() => setShowAdd(true)}
-          className="rh-btn-ghost text-xs px-2 py-1"
-        >
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-          </svg>
-          Додати
-        </button>
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={() => onAdd(currentTimeMs / 1000, 'ГУРТІВКА - початок')}
+            className="rh-btn-ghost text-xs px-2 py-1"
+            title="Поставити маркер початку гуртівки на поточній позиції"
+          >
+            + Гуртівка ▶
+          </button>
+          <button
+            onClick={() => onAdd(currentTimeMs / 1000, 'ГУРТІВКА - кінець')}
+            className="rh-btn-ghost text-xs px-2 py-1"
+            title="Поставити маркер кінця гуртівки на поточній позиції"
+          >
+            + Гуртівка ◀
+          </button>
+          <button
+            onClick={() => setShowAdd(true)}
+            className="rh-btn-ghost text-xs px-2 py-1"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+            Додати
+          </button>
+        </div>
       </div>
 
       {/* Add form */}
@@ -190,12 +207,26 @@ export function MarkersTab({ markers, characters, onConfirm, onEdit, onDelete, o
                     onClick={() => onSeek(m.position_seconds)}
                     className="flex-1 text-left"
                   >
-                    <span className="text-xs text-rh-text">{m.reaper_name}</span>
+                    <span className="text-xs text-rh-text" style={m.color ? { color: m.color } : undefined}>
+                      {m.reaper_name}
+                    </span>
                   </button>
                   <span className="text-xs font-mono text-rh-muted">{formatTime(m.position_seconds)}</span>
 
                   {/* Actions */}
-                  <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <div className="flex gap-1 items-center opacity-0 group-hover:opacity-100 transition-opacity">
+                    <label
+                      className="w-4 h-4 rounded-full flex-shrink-0 cursor-pointer border border-white/20"
+                      style={{ background: m.color || 'transparent' }}
+                      title="Колір маркера"
+                    >
+                      <input
+                        type="color"
+                        value={m.color || '#E52128'}
+                        onChange={(e) => onEdit(m.id, { color: e.target.value })}
+                        className="w-0 h-0 opacity-0"
+                      />
+                    </label>
                     {!m.confirmed && (
                       <button
                         onClick={() => onConfirm(m.id)}

@@ -128,6 +128,11 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: true,
+      // Chromium throttles timers/rAF hard in minimized/occluded windows by
+      // default — that stalls live job-progress polling, the WebSocket's own
+      // keep-alive, and video/waveform playback while the app sits in the
+      // taskbar. This keeps the renderer running at full speed regardless.
+      backgroundThrottling: false,
     },
     icon: path.join(process.env.VITE_PUBLIC!, 'icon.png'),
   })

@@ -69,6 +69,7 @@ export interface Marker {
   reaper_name: string
   position_seconds: number
   confirmed: boolean
+  color?: string | null
 }
 
 export interface JobStatus {

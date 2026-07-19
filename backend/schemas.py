@@ -141,6 +141,7 @@ class MarkerBase(BaseModel):
     reaper_name: str
     position_seconds: float
     confirmed: bool = False
+    color: Optional[str] = None
 
 
 class MarkerCreate(MarkerBase):
@@ -151,6 +152,7 @@ class MarkerUpdate(BaseModel):
     reaper_name: Optional[str] = None
     position_seconds: Optional[float] = None
     confirmed: Optional[bool] = None
+    color: Optional[str] = None
 
 
 class MarkerOut(MarkerBase):

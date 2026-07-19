@@ -29,6 +29,46 @@ from ..job_manager import ProgressReporter
 
 DATA_DIR = os.environ.get("RH_DATA_DIR", os.path.join(os.path.expanduser("~"), ".raccoonhouse"))
 
+
+def _patch_separator_gpu_detection():
+    """audio-separator's own Separator.setup_torch_device() gates ALL GPU
+    acceleration — including for its ONNX-based models (MDX-Net) — behind
+    torch.cuda.is_available(). torch here is deliberately the plain CPU build
+    (see requirements.txt: a CUDA-enabled torch bundles a ~3.9GB private CUDA
+    runtime that pushes the installer past GitHub Releases' 2GB per-file
+    limit), so without this patch onnxruntime-gpu's CUDAExecutionProvider
+    never gets used even though it's fully installed and working on its own
+    (confirmed live 2026-07-19: onnxruntime reports CUDAExecutionProvider
+    available, but audio-separator logged "No hardware acceleration could be
+    configured" anyway because its check never even looks at onnxruntime's
+    provider list unless torch.cuda.is_available() is already True).
+    This replaces that one method to check onnxruntime's provider list
+    independently: torch-based models (MDXC, Demucs, VR Arch) still run on
+    CPU (no CUDA-enabled torch installed), but the ONNX-based MDX-Net model
+    gets real CUDA acceleration via onnxruntime-gpu +
+    nvidia-cublas-cu12/nvidia-cudnn-cu12."""
+    try:
+        from audio_separator.separator import Separator
+        import torch
+        import onnxruntime as ort
+    except ImportError:
+        return
+
+    def _setup_torch_device(self, system_info):
+        self.torch_device_cpu = torch.device("cpu")
+        self.torch_device = self.torch_device_cpu
+        if "CUDAExecutionProvider" in ort.get_available_providers():
+            self.logger.info("ONNXruntime has CUDAExecutionProvider available, enabling acceleration for ONNX-based models")
+            self.onnx_execution_provider = ["CUDAExecutionProvider"]
+        else:
+            self.logger.info("No hardware acceleration available for ONNX-based models, running in CPU mode")
+            self.onnx_execution_provider = ["CPUExecutionProvider"]
+
+    Separator.setup_torch_device = _setup_torch_device
+
+
+_patch_separator_gpu_detection()
+
 DEFAULT_MODEL = "MDX-Net"
 
 MODEL_MAP = {

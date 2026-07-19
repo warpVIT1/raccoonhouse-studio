@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
-import { spawn, execFile, ChildProcess } from 'node:child_process'
+import { spawn, execFile, execSync, ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -20,7 +20,33 @@ const BACKEND_PORT = 8765
 let backendProcess: ChildProcess | null = null
 let win: BrowserWindow | null = null
 
+// If a previous run's backend was ever orphaned (e.g. the Electron parent
+// was killed via Task Manager, or crashed hard enough to skip both
+// window-all-closed and before-quit), it keeps squatting on BACKEND_PORT
+// forever — every later launch of the app would then silently talk to that
+// stale, possibly much-older process instead of spawning its own, with no
+// visible sign anything is wrong (confirmed live: a backend from hours
+// earlier in the day kept answering requests through several app restarts
+// and even a version upgrade, since the port was never freed). Clear
+// anything already listening there before spawning our own.
+function killAnyoneOnBackendPort() {
+  if (process.platform !== 'win32') return
+  try {
+    const out = execSync(`netstat -ano | findstr :${BACKEND_PORT} | findstr LISTENING`, { encoding: 'utf-8' })
+    const pids = new Set(
+      out.split('\n').map((line) => line.trim().split(/\s+/).pop()).filter((pid): pid is string => !!pid && /^\d+$/.test(pid))
+    )
+    for (const pid of pids) {
+      console.log('[main] Killing stale process on port', BACKEND_PORT, 'pid=', pid)
+      try { execSync(`taskkill /PID ${pid} /T /F`) } catch { /* already gone */ }
+    }
+  } catch {
+    // findstr exits non-zero when nothing matches — nothing to clean up
+  }
+}
+
 function startBackend() {
+  killAnyoneOnBackendPort()
   const isDev = !!VITE_DEV_SERVER_URL
 
   let backendExe: string

@@ -87,7 +87,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       setCurrentTime(t)
     }
 
-    const videoUrl = src ? `http://localhost:8765/stream?path=${encodeURIComponent(src)}` : null
+    const videoUrl = src ? `http://localhost:8765/api/stream?path=${encodeURIComponent(src)}` : null
 
     return (
       <div className="flex flex-col bg-black rounded-lg overflow-hidden h-full">

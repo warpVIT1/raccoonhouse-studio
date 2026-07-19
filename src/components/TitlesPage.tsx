@@ -54,7 +54,7 @@ export function TitlesPage() {
     <div className="flex flex-col h-full">
       {/* Top bar */}
       <div className="flex items-center gap-3 px-6 py-4 border-b border-rh-border flex-shrink-0">
-        <h1 className="text-lg font-semibold text-rh-text">Титли</h1>
+        <h1 className="text-lg font-semibold text-rh-text">Тайтли</h1>
         <span className="text-sm text-rh-muted font-mono">{filtered.length} із {titles.length}</span>
 
         <div className="ml-auto flex items-center gap-3">

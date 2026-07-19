@@ -1,6 +1,5 @@
 import asyncio
 import shutil
-import zipfile
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
@@ -165,10 +164,11 @@ async def run_import_for_peer(
 ):
     """Runs on the RESPONDER machine — receives another instance's ORIGINAL
     video file (streamed straight to disk, not buffered in memory — these can
-    be multiple GB), runs the ffmpeg extraction+proxy pipeline locally, and
-    streams back a zip with both outputs. Meant for a requester whose own PC
-    is too weak to comfortably run ffmpeg itself, so this step happens BEFORE
-    any local processing on the requester's side."""
+    be multiple GB), extracts its audio locally, and streams the FLAC back.
+    Meant for a requester whose own PC is too weak to comfortably run ffmpeg
+    itself, so this step happens BEFORE any local processing on the
+    requester's side. Playback there uses the original file directly (no
+    proxy transcode), so only the audio needs to come back."""
     tmp_dir = tempfile.mkdtemp(prefix="rh_power_import_")
     try:
         input_path = os.path.join(tmp_dir, filename)
@@ -198,12 +198,7 @@ async def run_import_for_peer(
         finally:
             await broadcast_lending(False)
 
-        zip_path = os.path.join(tmp_dir, "result.zip")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(result["audio_path"], "audio_full.flac")
-            zf.write(result["proxy_path"], "proxy_480p.mp4")
-
-        with open(zip_path, "rb") as f:
+        with open(result["audio_path"], "rb") as f:
             data = f.read()
         headers = {
             "X-Duration": str(result["duration"] or 0),
@@ -211,7 +206,7 @@ async def run_import_for_peer(
             "X-Format": result["format_name"] or "",
             "X-File-Size": str(result["file_size"]),
         }
-        return Response(content=data, media_type="application/zip", headers=headers)
+        return Response(content=data, media_type="audio/flac", headers=headers)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

@@ -45,6 +45,7 @@ export function TitlePage({ titleId }: TitlePageProps) {
   const setSelectedTitle = useAppStore((s) => s.setSelectedTitle)
   const activeJobs = useAppStore((s) => s.activeJobs)
   const upsertJob = useAppStore((s) => s.upsertJob)
+  const removeJob = useAppStore((s) => s.removeJob)
 
   const [title, setTitle] = useState<Title | null>(null)
   const [episodes, setEpisodes] = useState<Episode[]>([])
@@ -196,7 +197,14 @@ export function TitlePage({ titleId }: TitlePageProps) {
       }
     }
     setEpisodes((prev) => prev.filter((e) => e.id !== epId))
-  }, [backendReady, del])
+    // Drop any in-flight job for this episode immediately — otherwise its
+    // last-known percent keeps showing (e.g. "28%") until the backend's own
+    // cancellation notice round-trips back over the WebSocket, or forever if
+    // that message is ever missed.
+    for (const job of activeJobs.values()) {
+      if (job.episode_id === epId) removeJob(job.id)
+    }
+  }, [backendReady, del, activeJobs, removeJob])
 
   function onDragOver(e: React.DragEvent) {
     e.preventDefault()

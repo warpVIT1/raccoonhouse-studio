@@ -63,12 +63,20 @@ def update_episode(ep_id: int, body: EpisodeUpdate, db: Session = Depends(get_db
 
 
 @router.delete("/episodes/{ep_id}", status_code=204)
-def delete_episode(ep_id: int, db: Session = Depends(get_db)):
+async def delete_episode(ep_id: int, db: Session = Depends(get_db)):
     ep = db.get(Episode, ep_id)
     if not ep:
         raise HTTPException(404)
     db.delete(ep)
     db.commit()
+
+    # Cancel any job still running for this episode (e.g. an ffmpeg import in
+    # progress) and tell the frontend so it stops showing a stale percent for
+    # a job whose episode no longer exists.
+    cancelled_ids = job_manager.cancel_jobs_for_episode(ep_id)
+    if cancelled_ids and job_manager._ws_broadcast:
+        for job_id in cancelled_ids:
+            await job_manager._ws_broadcast({"type": "error", "job_id": job_id, "error": "Серію видалено"})
 
 
 @router.post("/titles/{title_id}/import-video")

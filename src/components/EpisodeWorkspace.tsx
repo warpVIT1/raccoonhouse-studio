@@ -105,8 +105,13 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
       get<Episode>(`/episodes/${episodeId}`).then(setEpisode).catch(() => {})
       get<SubtitleLine[]>(`/episodes/${episodeId}/subtitle-lines`).then(setSubtitles).catch(() => {})
       get<Marker[]>(`/episodes/${episodeId}/markers`).then(setMarkers).catch(() => {})
+      // ASS import can create new characters — without this, the actor
+      // dropdown for freshly-imported lines shows "—" until you leave and
+      // re-enter the episode, since `characters` was only ever fetched once
+      // on initial mount.
+      get<Character[]>(`/characters?title_id=${titleId}`).then(setCharacters).catch(() => {})
     }
-  }, [activeJobs, backendReady, episodeId, get])
+  }, [activeJobs, backendReady, episodeId, titleId, get])
 
   // Sync active subtitle to playhead
   useEffect(() => {
@@ -116,6 +121,30 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     )
     setActiveSubIndex(idx >= 0 ? idx : null)
   }, [currentTimeMs, subtitles])
+
+  // Keyboard shortcuts: Space play/pause, Left/Right seek ±2s (Shift ±10s).
+  // Ignored while typing in any input/textarea/select so it doesn't hijack
+  // normal text editing (subtitle text, marker names, timecodes...).
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      const tag = (e.target as HTMLElement)?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (e.target as HTMLElement)?.isContentEditable) return
+      const v = videoRef.current
+      if (!v) return
+      if (e.code === 'Space') {
+        e.preventDefault()
+        if (v.isPaused()) v.play(); else v.pause()
+      } else if (e.code === 'ArrowLeft') {
+        e.preventDefault()
+        v.seek(Math.max(0, v.currentTime() - (e.shiftKey ? 10 : 2)))
+      } else if (e.code === 'ArrowRight') {
+        e.preventDefault()
+        v.seek(Math.min(v.duration() || Infinity, v.currentTime() + (e.shiftKey ? 10 : 2)))
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
 
   const handleTimeUpdate = useCallback((t: number) => {
     setCurrentTimeMs(Math.round(t * 1000))
@@ -495,7 +524,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
           <div className="flex-1 min-w-0">
             <VideoPlayer
               ref={videoRef}
-              src={episode?.proxy_480p_path ?? episode?.original_file_path ?? null}
+              src={episode?.original_file_path ?? null}
               subtitles={subtitles}
               activeSubIndex={activeSubIndex}
               onTimeUpdate={handleTimeUpdate}
@@ -547,6 +576,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
             ) : (
               <MarkersTab
                 markers={markers}
+                characters={characters}
                 onConfirm={handleMarkerConfirm}
                 onEdit={handleMarkerEdit}
                 onDelete={handleMarkerDelete}

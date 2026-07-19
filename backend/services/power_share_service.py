@@ -20,7 +20,6 @@ import socket
 import threading
 import uuid
 import logging
-import zipfile
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -406,7 +405,7 @@ def request_remote_import(episode_id: int, file_path: str, reporter=None) -> dic
     """Requester side for a full remote import: negotiates a peer, uploads the
     ORIGINAL video file (before any local ffmpeg work happens at all — meant
     for a PC too weak to comfortably run ffmpeg itself), and stores back the
-    audio track + 480p proxy the peer produced.
+    extracted audio track the peer produced.
 
     Opens its own DB session — see request_remote_power's docstring for why."""
     db = SessionLocal()
@@ -459,22 +458,15 @@ def _request_remote_import(episode_id: int, file_path: str, db: Session, reporte
 
     ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
     ep_dir.mkdir(parents=True, exist_ok=True)
-    zip_path = ep_dir / "_remote_import.zip"
-    with open(zip_path, "wb") as f:
-        f.write(resp.content)
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(ep_dir)
-    zip_path.unlink(missing_ok=True)
-
     audio_out = str(ep_dir / "audio_full.flac")
-    proxy_out = str(ep_dir / "proxy_480p.mp4")
+    with open(audio_out, "wb") as f:
+        f.write(resp.content)
 
     duration_hdr = resp.headers.get("X-Duration", "0")
     bitrate_hdr = resp.headers.get("X-Bitrate", "0")
 
     ep.original_file_path = file_path
     ep.audio_stem_path = audio_out
-    ep.proxy_480p_path = proxy_out
     ep.original_size = int(resp.headers.get("X-File-Size", str(file_size)))
     ep.original_bitrate = int(bitrate_hdr) if bitrate_hdr.isdigit() and int(bitrate_hdr) > 0 else None
     ep.original_format = resp.headers.get("X-Format") or None
@@ -484,8 +476,8 @@ def _request_remote_import(episode_id: int, file_path: str, db: Session, reporte
 
     power_logger.info("DONE-IMPORT peer=%s title=%s ep=%s", chosen["host"], title.name_ua, ep.number)
     if reporter:
-        reporter.update(100, f"Готово — аудіо й проксі отримано з {chosen['name']}")
-    return {"audio_path": audio_out, "proxy_path": proxy_out, "peer": chosen["name"]}
+        reporter.update(100, f"Готово — аудіо отримано з {chosen['name']}")
+    return {"audio_path": audio_out, "peer": chosen["name"]}
 
 
 def _is_positive_float(s: str) -> bool:

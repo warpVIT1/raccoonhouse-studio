@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import type { Marker } from '../../types'
+import type { Character, Marker } from '../../types'
 
 function formatTime(s: number): string {
   const h = Math.floor(s / 3600)
@@ -10,6 +10,7 @@ function formatTime(s: number): string {
 
 interface MarkersTabProps {
   markers: Marker[]
+  characters: Character[]
   onConfirm: (id: number) => void
   onEdit: (id: number, changes: Partial<Marker>) => void
   onDelete: (id: number) => void
@@ -17,13 +18,55 @@ interface MarkersTabProps {
   onSeek: (t: number) => void
 }
 
-export function MarkersTab({ markers, onConfirm, onEdit, onDelete, onAdd, onSeek }: MarkersTabProps) {
+// Picks a character's code (or a short fallback from their name) and inserts
+// it into a reaper_name being typed/edited — a button next to the free-text
+// field instead of requiring the exact code to be typed out by hand every
+// time, which is easy to typo and drifts from the actual Character records.
+function CharacterPicker({ characters, onPick }: { characters: Character[]; onPick: (code: string) => void }) {
+  const [open, setOpen] = useState(false)
+  if (characters.length === 0) return null
+  return (
+    <div className="relative flex-shrink-0" onClick={(e) => e.stopPropagation()}>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-6 h-6 flex items-center justify-center rounded text-rh-muted hover:text-rh-text hover:bg-white/5"
+        title="Обрати персонажа"
+      >
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-7 8-7s8 2.6 8 7"/>
+        </svg>
+      </button>
+      {open && (
+        <div className="absolute z-20 top-7 left-0 w-40 max-h-52 overflow-y-auto rh-card border border-rh-border shadow-2xl py-1">
+          {characters.map((c) => (
+            <button
+              key={c.id}
+              onClick={() => { onPick(c.code || c.name.slice(0, 2).toUpperCase()); setOpen(false) }}
+              className="w-full text-left px-2.5 py-1.5 text-xs text-rh-text-dim hover:bg-white/5 hover:text-rh-text truncate"
+            >
+              {c.code ? `${c.code} — ${c.name}` : c.name}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export function MarkersTab({ markers, characters, onConfirm, onEdit, onDelete, onAdd, onSeek }: MarkersTabProps) {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [editName, setEditName] = useState('')
   const [editPos, setEditPos] = useState('')
   const [showAdd, setShowAdd] = useState(false)
   const [newName, setNewName] = useState('')
   const [newPos, setNewPos] = useState('')
+
+  function appendCode(current: string, code: string): string {
+    const base = current.replace(/\s*-\s*ЗВУК\s*$/i, '').trim()
+    const codes = base ? base.split(',').map((s) => s.trim()).filter(Boolean) : []
+    if (!codes.includes(code)) codes.push(code)
+    return `${codes.join(',')} - ЗВУК`
+  }
 
   function startEdit(m: Marker) {
     setEditingId(m.id)
@@ -89,6 +132,7 @@ export function MarkersTab({ markers, onConfirm, onEdit, onDelete, onAdd, onSeek
             onChange={(e) => setNewName(e.target.value)}
             autoFocus
           />
+          <CharacterPicker characters={characters} onPick={(code) => setNewName((n) => appendCode(n, code))} />
           <input
             className="rh-input text-xs w-36 font-mono"
             placeholder="00:00:00.000"
@@ -131,6 +175,7 @@ export function MarkersTab({ markers, onConfirm, onEdit, onDelete, onAdd, onSeek
                     onChange={(e) => setEditName(e.target.value)}
                     autoFocus
                   />
+                  <CharacterPicker characters={characters} onPick={(code) => setEditName((n) => appendCode(n, code))} />
                   <input
                     className="rh-input text-xs w-36 font-mono py-0.5"
                     value={editPos}

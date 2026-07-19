@@ -47,6 +47,22 @@ def cancel_job(job_id: str):
         job.status = "cancelled"
 
 
+def cancel_jobs_for_episode(episode_id: int) -> list[str]:
+    """Cancels every still-running job tied to this episode — used when the
+    episode itself is deleted, so a stale progress percent doesn't keep
+    showing in the title bar / episode tile for a job whose target no longer
+    exists. Cancellation is cooperative (see ProgressReporter.update), so an
+    in-flight ffmpeg/audio-separator subprocess still runs to completion, but
+    the UI stops reflecting it as this episode's job."""
+    ids = []
+    for job in _jobs.values():
+        if job.episode_id == episode_id and job.status in ("pending", "running"):
+            job.cancel_flag = True
+            job.status = "cancelled"
+            ids.append(job.id)
+    return ids
+
+
 async def _broadcast(data: dict):
     if _ws_broadcast:
         await _ws_broadcast(data)

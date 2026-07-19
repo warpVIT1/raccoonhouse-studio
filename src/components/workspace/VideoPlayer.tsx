@@ -7,6 +7,7 @@ export interface VideoPlayerHandle {
   play: () => void
   pause: () => void
   duration: () => number
+  isPaused: () => boolean
 }
 
 interface VideoPlayerProps {
@@ -31,6 +32,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       play: () => videoRef.current?.play(),
       pause: () => videoRef.current?.pause(),
       duration: () => videoRef.current?.duration ?? 0,
+      isPaused: () => videoRef.current?.paused ?? true,
     }))
 
     useEffect(() => {

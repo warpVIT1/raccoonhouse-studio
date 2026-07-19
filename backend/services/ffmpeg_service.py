@@ -1,6 +1,9 @@
 """
 ffmpeg pipeline:
-  - import: extract full lossless audio, generate 480p proxy
+  - import: extract full lossless audio only — playback in the workspace uses
+    the original video file directly (streamed as-is), not a transcoded proxy,
+    so editing (subtitles, markers) is available the moment audio extraction
+    finishes rather than waiting on a second, slower re-encode step.
   - mux: final mux with rendered audio against original video container
 """
 import os
@@ -90,7 +93,10 @@ def run_import_ffmpeg_only(
 
     progress(10, "ffmpeg: витягую лосслес-аудіо (FLAC)…")
 
-    # --- Extract lossless audio (FLAC) ---
+    # --- Extract lossless audio (FLAC) — the only ffmpeg step on import now.
+    # Playback uses the original file directly (see /stream + VideoPlayer),
+    # so subtitles/markers/actors are editable as soon as THIS finishes,
+    # without also waiting on a 480p transcode that isn't needed for editing.
     audio_out = str(Path(out_dir) / "audio_full.flac")
     if not os.path.isfile(audio_out):
         cmd_audio = [
@@ -112,7 +118,7 @@ def run_import_ffmpeg_only(
             if "time=" in line and duration:
                 try:
                     t = _parse_time(line)
-                    pct = min(40, int(10 + 30 * t / duration))
+                    pct = min(95, int(10 + 85 * t / duration))
                     progress(pct, "ffmpeg: витягую лосслес-аудіо (FLAC)…")
                 except Exception:
                     pass
@@ -120,44 +126,9 @@ def run_import_ffmpeg_only(
         if proc.returncode != 0:
             raise RuntimeError("ffmpeg audio extraction failed")
 
-    progress(45, "ffmpeg: генерую 480p проксі для перегляду…")
-
-    # --- 480p proxy ---
-    proxy_out = str(Path(out_dir) / "proxy_480p.mp4")
-    if not os.path.isfile(proxy_out):
-        cmd_proxy = [
-            _ffmpeg_bin(), "-y",
-            "-i", file_path,
-            "-vf", "scale=-2:480",
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "28",
-            "-c:a", "aac", "-b:a", "128k",
-            proxy_out,
-        ]
-        proc = subprocess.Popen(
-            cmd_proxy, stderr=subprocess.PIPE, text=True,
-            encoding="utf-8", errors="replace",
-        )
-        for line in proc.stderr:
-            if is_cancelled and is_cancelled():
-                proc.kill()
-                raise RuntimeError("Скасовано")
-            if "time=" in line and duration:
-                try:
-                    t = _parse_time(line)
-                    pct = min(90, int(45 + 45 * t / duration))
-                    progress(pct, "ffmpeg: генерую 480p проксі для перегляду…")
-                except Exception:
-                    pass
-        proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError("ffmpeg proxy generation failed")
-
-    progress(100, "ffmpeg: аудіо й проксі готові")
+    progress(100, "ffmpeg: аудіо готове")
     return {
         "audio_path": audio_out,
-        "proxy_path": proxy_out,
         "file_size": file_size,
         "duration": duration,
         "bit_rate": bit_rate,
@@ -170,10 +141,12 @@ def run_import_pipeline(
     file_path: str,
     reporter: ProgressReporter,
 ) -> dict:
-    """Extract audio + generate 480p proxy. Separation (local or remote) is a
-    deliberate next step the user triggers explicitly via a button — not
-    auto-chained here — so they can choose to run it locally or request it
-    from a peer over power-sharing before any processing actually starts.
+    """Extract audio. Separation (local or remote) is a deliberate next step
+    the user triggers explicitly via a button — not auto-chained here — so
+    they can choose to run it locally or request it from a peer over
+    power-sharing before any processing actually starts. Playback in the
+    workspace uses the original file directly (no proxy transcode), so
+    subtitles/markers are editable the moment this one ffmpeg step finishes.
 
     Opens its own DB session rather than reusing the request's — this runs in
     a background thread pool that outlives the HTTP request, and a request-
@@ -199,7 +172,6 @@ def run_import_pipeline(
 
         ep.original_file_path = file_path
         ep.audio_stem_path = result["audio_path"]
-        ep.proxy_480p_path = result["proxy_path"]
         ep.original_size = result["file_size"]
         ep.original_bitrate = result["bit_rate"]
         ep.original_format = result["format_name"]
@@ -208,7 +180,7 @@ def run_import_pipeline(
         db.commit()
 
         reporter.update(100, "Аудіо готове")
-        return {"audio_path": result["audio_path"], "proxy_path": result["proxy_path"]}
+        return {"audio_path": result["audio_path"]}
     finally:
         db.close()
 

@@ -20,19 +20,11 @@ function cpsColor(cps: number): string {
   return cps > 20 ? 'text-red-400' : 'text-rh-text-dim'
 }
 
-// Shows the assigned actor as plain text and only opens a picker popover on
-// an explicit click — a native <select> pops its OS menu the instant it's
-// clicked, which gets in the way when you're just scanning/reading the
-// column rather than trying to change it.
-function ActorCell({
-  characterId, characters, onChange,
-}: {
-  characterId: number | null
-  characters: Character[]
-  onChange: (id: number | null) => void
-}) {
+// Small button next to the actor name — opens a plain list of already-used
+// characters so a repeated actor can be assigned in one click instead of
+// retyping the name every single line.
+function QuickPickButton({ characters, onPick }: { characters: Character[]; onPick: (id: number) => void }) {
   const [open, setOpen] = useState(false)
-  const current = characters.find((c) => c.id === characterId)
 
   useEffect(() => {
     if (!open) return
@@ -41,29 +33,25 @@ function ActorCell({
     return () => document.removeEventListener('click', onDocClick)
   }, [open])
 
+  if (characters.length === 0) return null
+
   return (
-    <div className="relative" onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }}>
-      <button className="text-xs text-rh-text-dim hover:text-rh-text w-full text-left truncate">
-        {current ? current.name : '—'}
+    <div className="relative flex-shrink-0" onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }}>
+      <button className="w-4 h-4 flex items-center justify-center text-rh-muted hover:text-rh-text" title="Обрати з наявних">
+        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+          <polyline points="6 9 12 15 18 9"/>
+        </svg>
       </button>
       {open && (
         <div
-          className="absolute z-20 top-6 left-0 w-40 max-h-52 overflow-y-auto rh-card border border-rh-border shadow-2xl py-1"
+          className="absolute z-20 top-5 right-0 w-40 max-h-56 overflow-y-auto rh-card border border-rh-border shadow-2xl py-1"
           onClick={(e) => e.stopPropagation()}
         >
-          <button
-            onClick={() => { onChange(null); setOpen(false) }}
-            className="w-full text-left px-2.5 py-1.5 text-xs text-rh-muted hover:bg-white/5 hover:text-rh-text"
-          >
-            — (без актора)
-          </button>
           {characters.map((c) => (
             <button
               key={c.id}
-              onClick={() => { onChange(c.id); setOpen(false) }}
-              className={`w-full text-left px-2.5 py-1.5 text-xs truncate hover:bg-white/5 ${
-                c.id === characterId ? 'text-rh-accent font-semibold' : 'text-rh-text-dim hover:text-rh-text'
-              }`}
+              onClick={() => { onPick(c.id); setOpen(false) }}
+              className="w-full text-left px-2.5 py-1.5 text-xs text-rh-text-dim truncate hover:bg-white/5 hover:text-rh-text"
             >
               {c.name}
             </button>
@@ -74,6 +62,7 @@ function ActorCell({
   )
 }
 
+
 interface SubtitleGridProps {
   lines: SubtitleLine[]
   characters: Character[]
@@ -83,6 +72,7 @@ interface SubtitleGridProps {
   onLineChange: (index: number, changes: Partial<SubtitleLine>) => void
   onAddLine: () => void
   onDeleteLine: (index: number) => void
+  onCreateCharacter: (name: string) => Promise<Character | null>
 }
 
 export function SubtitleGrid({
@@ -94,9 +84,39 @@ export function SubtitleGrid({
   onLineChange,
   onAddLine,
   onDeleteLine,
+  onCreateCharacter,
 }: SubtitleGridProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [editingCell, setEditingCell] = useState<{ row: number; col: string } | null>(null)
+  // Ctrl+click toggles individual rows into the selection, Shift+click
+  // selects a whole range from the last-clicked row — so an actor can be
+  // assigned to many lines at once instead of one at a time.
+  const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set())
+  const lastClickedRowRef = useRef<number | null>(null)
+
+  const handleRowClick = useCallback((i: number, e: React.MouseEvent) => {
+    if (e.ctrlKey || e.metaKey) {
+      setSelectedRows((prev) => {
+        const next = new Set(prev)
+        if (next.has(i)) next.delete(i)
+        else next.add(i)
+        return next
+      })
+      lastClickedRowRef.current = i
+      return
+    }
+    if (e.shiftKey && lastClickedRowRef.current != null) {
+      const from = Math.min(lastClickedRowRef.current, i)
+      const to = Math.max(lastClickedRowRef.current, i)
+      const range = new Set<number>()
+      for (let r = from; r <= to; r++) range.add(r)
+      setSelectedRows(range)
+      return
+    }
+    setSelectedRows(new Set())
+    lastClickedRowRef.current = i
+    onLineClick(i)
+  }, [onLineClick])
 
   // Auto-scroll to active line
   useEffect(() => {
@@ -109,7 +129,7 @@ export function SubtitleGrid({
     (rowIdx: number, col: string, e: React.MouseEvent) => {
       e.stopPropagation()
       onLineClick(rowIdx)
-      if (col === 'text' || col === 'start' || col === 'end') {
+      if (col === 'text' || col === 'start' || col === 'end' || col === 'actor') {
         setEditingCell({ row: rowIdx, col })
       }
     },
@@ -145,6 +165,39 @@ export function SubtitleGrid({
       }
     },
     [lines, onLineChange]
+  )
+
+  // If the row being edited is part of a multi-row selection (Ctrl/Shift
+  // click), apply the same actor to every selected row at once instead of
+  // just this one.
+  const applyActorId = useCallback(
+    (rowIdx: number, characterId: number | null) => {
+      const targets = selectedRows.size > 1 && selectedRows.has(rowIdx) ? selectedRows : new Set([rowIdx])
+      for (const r of targets) onLineChange(r, { character_id: characterId })
+    },
+    [selectedRows, onLineChange]
+  )
+
+  // Actor is plain text just like the "Текст" column — type a name and it
+  // either matches an existing character (case-insensitive) or creates a
+  // brand new one on the fly, instead of forcing a pick-from-list-only menu.
+  const commitActor = useCallback(
+    async (rowIdx: number, value: string) => {
+      setEditingCell(null)
+      const name = value.trim()
+      if (!name) {
+        applyActorId(rowIdx, null)
+        return
+      }
+      const existing = characters.find((c) => c.name.toLowerCase() === name.toLowerCase())
+      if (existing) {
+        applyActorId(rowIdx, existing.id)
+        return
+      }
+      const created = await onCreateCharacter(name)
+      if (created) applyActorId(rowIdx, created.id)
+    },
+    [characters, onCreateCharacter, applyActorId]
   )
 
 
@@ -185,16 +238,18 @@ export function SubtitleGrid({
             const isActive = i === activeIndex
             const isCurrent =
               currentTimeMs >= line.start_ms && currentTimeMs <= line.end_ms
+            const isSelected = selectedRows.has(i)
 
             return (
               <div
                 key={line.id}
                 data-row={i}
-                onClick={() => onLineClick(i)}
+                onClick={(e) => handleRowClick(i, e)}
                 className={`flex items-center border-b border-rh-border/50 px-2 cursor-pointer sub-row
                   ${isActive ? 'active' : ''}
                   ${isCurrent && !isActive ? 'bg-white/[0.02]' : ''}
                   ${line.is_overlap ? 'border-l-2 border-l-violet-500' : ''}
+                  ${isSelected ? 'bg-rh-accent/10 ring-1 ring-inset ring-rh-accent/40' : ''}
                 `}
               >
                 {/* # */}
@@ -251,12 +306,27 @@ export function SubtitleGrid({
                 </div>
 
                 {/* Actor */}
-                <div className="w-28 px-1 py-1">
-                  <ActorCell
-                    characterId={line.character_id}
-                    characters={characters}
-                    onChange={(id) => onLineChange(i, { character_id: id })}
-                  />
+                <div
+                  className="w-28 px-1 py-1 flex items-center gap-1"
+                  onClick={(e) => handleCellClick(i, 'actor', e)}
+                >
+                  {editingCell?.row === i && editingCell.col === 'actor' ? (
+                    <input
+                      autoFocus
+                      className="rh-input w-full text-xs py-0"
+                      defaultValue={characters.find((c) => c.id === line.character_id)?.name ?? ''}
+                      onBlur={(e) => commitActor(i, e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === 'Tab') commitActor(i, (e.target as HTMLInputElement).value) }}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  ) : (
+                    <>
+                      <span className="text-xs text-rh-text-dim truncate flex-1">
+                        {characters.find((c) => c.id === line.character_id)?.name ?? '—'}
+                      </span>
+                      <QuickPickButton characters={characters} onPick={(id) => applyActorId(i, id)} />
+                    </>
+                  )}
                 </div>
 
                 {/* Text */}

@@ -15,8 +15,11 @@ NOTE: audio_separator.Separator.load_model() requires the *exact* filename
 (including extension) from its model registry (Separator().list_supported_model_files()),
 not the bare display name — verified 2026-07-19 against audio-separator 0.44.3.
 """
+import math
 import os
 import shutil
+import threading
+import time
 from pathlib import Path
 from sqlalchemy.orm import Session
 
@@ -79,7 +82,33 @@ def separate_file(
 
         progress(base_pct + 15, f"нейромережа: ізоляція вокалу ({mdl})…")
 
-        output_files = sep.separate(audio_path)
+        # audio-separator has no progress callback API of its own (only tqdm
+        # bars printed straight to stdout/stderr, not capturable cleanly) — so
+        # a real multi-minute separation on a real (not a few seconds long)
+        # episode would otherwise sit at one fixed percent the entire time,
+        # which is indistinguishable from actually being frozen. Tick a
+        # slowly-asymptoting estimate in the background so the number is
+        # always visibly moving, without ever reaching the post-completion
+        # value below (60s time constant: ~60% of the way there after a
+        # minute, ~95% after three).
+        heartbeat_stop = threading.Event()
+
+        def _heartbeat(start_pct: int, cap_pct: int):
+            t0 = time.monotonic()
+            while not heartbeat_stop.wait(2):
+                elapsed = time.monotonic() - t0
+                frac = 1 - math.exp(-elapsed / 60)
+                progress(int(start_pct + (cap_pct - start_pct) * frac), f"нейромережа: ізоляція вокалу ({mdl})…")
+
+        hb_thread = threading.Thread(
+            target=_heartbeat, args=(base_pct + 15, base_pct + int(80 / len(models_to_run)) - 2), daemon=True,
+        )
+        hb_thread.start()
+        try:
+            output_files = sep.separate(audio_path)
+        finally:
+            heartbeat_stop.set()
+            hb_thread.join(timeout=3)
         # audio-separator returns bare filenames relative to output_dir, NOT
         # full/absolute paths — joining is required, otherwise os.path.isfile
         # below checks the process's CWD instead and silently "finds nothing"

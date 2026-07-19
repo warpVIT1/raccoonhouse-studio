@@ -35,6 +35,8 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       isPaused: () => videoRef.current?.paused ?? true,
     }))
 
+    const videoUrl = src ? `http://localhost:8765/api/stream?path=${encodeURIComponent(src)}` : null
+
     useEffect(() => {
       const v = videoRef.current
       if (!v) return
@@ -58,7 +60,15 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
         v.removeEventListener('play', onPlay)
         v.removeEventListener('pause', onPause)
       }
-    }, [onTimeUpdate, onDurationChange])
+      // videoUrl is required here — the <video> element only renders once
+      // the episode has actually loaded and videoUrl goes from null to a
+      // real URL (episode data is fetched async, so this is the *normal*
+      // case, not an edge case). Without it in the deps, this effect only
+      // ever ran once on mount, while videoRef.current was still null (the
+      // element hadn't rendered yet), attached zero listeners, and never
+      // ran again — timeupdate/durationchange silently never fired at all,
+      // which is exactly why duration/currentTime stayed frozen at 0.
+    }, [onTimeUpdate, onDurationChange, videoUrl])
 
     useEffect(() => {
       if (videoRef.current) videoRef.current.volume = volume
@@ -86,8 +96,6 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       if (videoRef.current) videoRef.current.currentTime = t
       setCurrentTime(t)
     }
-
-    const videoUrl = src ? `http://localhost:8765/api/stream?path=${encodeURIComponent(src)}` : null
 
     return (
       <div className="flex flex-col bg-black rounded-lg overflow-hidden h-full">

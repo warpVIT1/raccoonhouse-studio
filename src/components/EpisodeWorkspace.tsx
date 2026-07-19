@@ -215,6 +215,17 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     }
   }, [subtitles])
 
+  const handleCreateCharacter = useCallback(async (name: string): Promise<Character | null> => {
+    if (!backendReady) return null
+    try {
+      const created = await post<Character>('/characters', { title_id: titleId, name })
+      setCharacters((prev) => [...prev, created])
+      return created
+    } catch {
+      return null
+    }
+  }, [backendReady, post, titleId])
+
   const handleSubLineChange = useCallback(async (idx: number, changes: Partial<SubtitleLine>) => {
     const line = subtitles[idx]
     if (!line) return
@@ -647,6 +658,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
                 onLineChange={handleSubLineChange}
                 onAddLine={handleAddSubLine}
                 onDeleteLine={handleDeleteSubLine}
+                onCreateCharacter={handleCreateCharacter}
               />
             ) : (
               <MarkersTab

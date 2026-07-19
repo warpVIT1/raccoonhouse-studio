@@ -11,29 +11,35 @@ interface UpdateState {
 
 // Shown automatically the moment a check (on launch, then every 4h) finds a
 // newer version — separate from UpdatePanel in Settings (which is for a
-// manual, on-demand check). Downloading is a deliberate click here, not
-// silent, so the changelog is seen before committing to anything.
+// manual, on-demand check). Clicking "Оновити" is the only click needed —
+// it downloads and then installs itself the moment the download finishes,
+// no second "are you sure, install now?" prompt.
 export function UpdateDialog() {
   const [state, setState] = useState<UpdateState>({ status: 'idle' })
   const [dismissed, setDismissed] = useState(false)
+  const [autoInstall, setAutoInstall] = useState(false)
 
   useEffect(() => {
     if (!window.electronAPI?.onUpdateStatus) return
     return window.electronAPI.onUpdateStatus((s) => {
       const next = s as unknown as UpdateState
       setState(next)
-      if (next.status === 'available') setDismissed(false)
+      if (next.status === 'available') {
+        setDismissed(false)
+        setAutoInstall(false)
+      }
+      if (next.status === 'downloaded' && autoInstall) {
+        window.electronAPI?.installUpdate()
+      }
     })
-  }, [])
+  }, [autoInstall])
 
   if (dismissed) return null
   if (!['available', 'downloading', 'downloaded'].includes(state.status)) return null
 
-  function download() {
+  function updateNow() {
+    setAutoInstall(true)
     window.electronAPI?.downloadUpdate()
-  }
-  function install() {
-    window.electronAPI?.installUpdate()
   }
 
   return (
@@ -62,18 +68,18 @@ export function UpdateDialog() {
             Пізніше
           </button>
           {state.status === 'available' && (
-            <button onClick={download} className="rh-btn-primary">
-              Завантажити оновлення
+            <button onClick={updateNow} className="rh-btn-primary">
+              Оновити
             </button>
           )}
-          {state.status === 'downloading' && (
+          {(state.status === 'downloading' || (state.status === 'downloaded' && autoInstall)) && (
             <button className="rh-btn-primary" disabled>
               <Spinner size={14} />
-              Завантаження…
+              {state.status === 'downloading' ? 'Завантаження…' : 'Встановлення…'}
             </button>
           )}
-          {state.status === 'downloaded' && (
-            <button onClick={install} className="rh-btn-primary">
+          {state.status === 'downloaded' && !autoInstall && (
+            <button onClick={() => window.electronAPI?.installUpdate()} className="rh-btn-primary">
               Перезапустити й встановити
             </button>
           )}

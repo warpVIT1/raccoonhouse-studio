@@ -66,9 +66,6 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   const [importingAss, setImportingAss] = useState(false)
   const [assDragOver, setAssDragOver] = useState(false)
 
-  // Mux import
-  const muxInputRef = useRef<HTMLInputElement>(null)
-
   const videoRef = useRef<VideoPlayerHandle>(null)
 
   // Load episode data
@@ -414,17 +411,13 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     window.open(url, '_blank')
   }
 
-  // Final render: import the studio's finished Reaper mix and mux it against the original video
-  async function handleRenderFile(files: FileList) {
-    const file = files[0]
-    if (!file || !backendReady) return
-    const mixedAudioPath = (file as File & { path?: string }).path
-    if (!mixedAudioPath) return
+  // Final render: mux the episode's own instrumental (vocal already removed
+  // by separation) against the original video — one click, no external file.
+  async function handleRender() {
+    if (!backendReady) return
     setRendering(true)
     try {
-      const result = await post<{ job_id: string }>(`/episodes/${episodeId}/mux-audio`, {
-        mixed_audio_path: mixedAudioPath,
-      })
+      const result = await post<{ job_id: string }>(`/episodes/${episodeId}/mux-audio`)
       upsertJob({
         id: result.job_id,
         type: 'mux_audio',
@@ -531,7 +524,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
             <span className="text-xs text-rh-muted">Виконайте відокремлення вокалу, щоб рендерити</span>
           )}
           <button
-            onClick={() => muxInputRef.current?.click()}
+            onClick={handleRender}
             disabled={!vocalIsolated || rendering}
             className={`text-xs font-bold rounded-lg px-4 py-2 transition-all
               ${vocalIsolated
@@ -542,13 +535,6 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
             {rendering ? <Spinner size={12} /> : null}
             Рендерити фінальну доріжку
           </button>
-          <input
-            ref={muxInputRef}
-            type="file"
-            accept=".wav,.flac,.aac,.mp3,.m4a"
-            className="hidden"
-            onChange={(e) => { if (e.target.files) handleRenderFile(e.target.files) }}
-          />
         </div>
       </div>
 

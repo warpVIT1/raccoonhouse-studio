@@ -192,14 +192,17 @@ async def detect_markers(ep_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/episodes/{ep_id}/mux-audio")
-async def mux_audio(ep_id: int, request: Request, db: Session = Depends(get_db)):
+async def mux_audio(ep_id: int, db: Session = Depends(get_db)):
     ep = db.get(Episode, ep_id)
     if not ep:
         raise HTTPException(404)
-    body = await request.json()
-    mixed_audio_path = body.get("mixed_audio_path")
+    # Renders straight from the episode's own instrumental (vocal_stem_path —
+    # original vocal already removed by separation) muxed against the
+    # original video — no external Reaper-mixed file needed or accepted
+    # anymore, this is now a one-click render of what's already there.
+    mixed_audio_path = ep.vocal_stem_path
     if not mixed_audio_path or not os.path.isfile(mixed_audio_path):
-        raise HTTPException(400, "mixed_audio_path not found")
+        raise HTTPException(400, "Інструментал не знайдено — виконайте ізоляцію вокалу спочатку")
 
     job = job_manager.create_job("mux_audio", episode_id=ep_id)
 

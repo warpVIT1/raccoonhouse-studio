@@ -126,6 +126,26 @@ export function SubtitleGrid({
     onLineClick(i)
   }, [onLineClick])
 
+  // Delete key removes every multi-selected row without needing the per-row
+  // trash button — ignored while typing (editing a cell, the actor
+  // dropdown...) so it doesn't hijack normal text editing. Indices are read
+  // from the same `lines` snapshot this closure already has, so deleting
+  // several at once composes correctly (see handleDeleteSubLine in
+  // EpisodeWorkspace.tsx — each call resolves its own line by the ORIGINAL
+  // index before any of the batched removals have actually re-rendered).
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== 'Delete' || selectedRows.size === 0) return
+      const tag = (e.target as HTMLElement)?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
+      e.preventDefault()
+      for (const idx of selectedRows) onDeleteLine(idx)
+      setSelectedRows(new Set())
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [selectedRows, onDeleteLine])
+
   // Auto-scroll to active line
   useEffect(() => {
     if (activeIndex == null) return

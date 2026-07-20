@@ -57,17 +57,26 @@ function startBackend() {
   let resourcesDir: string
 
   if (isDev) {
-    // In dev: use python directly
+    // In dev: use the project's own .venv, not whatever bare "python"/
+    // "python3" resolves to on PATH — a bare name silently picked up
+    // whichever Python happened to be first on PATH, which may have none of
+    // this project's dependencies installed (confirmed live: backend exited
+    // immediately with "No module named 'uvicorn'").
     const backendDir = path.join(APP_ROOT, 'backend')
-    const pythonExe = process.platform === 'win32' ? 'python' : 'python3'
-    backendExe = pythonExe
+    const venvPython = process.platform === 'win32'
+      ? path.join(APP_ROOT, '.venv', 'Scripts', 'python.exe')
+      : path.join(APP_ROOT, '.venv', 'bin', 'python3')
+    backendExe = fs.existsSync(venvPython) ? venvPython : (process.platform === 'win32' ? 'python' : 'python3')
     backendArgs = [path.join(backendDir, 'run.py'), '--port', String(BACKEND_PORT)]
     resourcesDir = path.join(APP_ROOT, 'resources', 'bin')
   } else {
-    // In packaged app: use bundled PyInstaller exe
+    // In packaged app: use the bundled PyInstaller exe. --onedir (not
+    // --onefile, see build-backend.py) puts it one level deeper, inside its
+    // own app-name folder, alongside the _internal/ dir GPU runtime files
+    // get downloaded into.
     const resourcesPath = process.resourcesPath
     const exeName = process.platform === 'win32' ? 'raccoonhouse-backend.exe' : 'raccoonhouse-backend'
-    backendExe = path.join(resourcesPath, 'backend', exeName)
+    backendExe = path.join(resourcesPath, 'backend', 'raccoonhouse-backend', exeName)
     backendArgs = ['--port', String(BACKEND_PORT)]
     resourcesDir = path.join(resourcesPath, 'bin')
   }
@@ -139,6 +148,18 @@ function createWindow() {
 
   win.webContents.on('did-finish-load', () => {
     win?.webContents.send('main-process-message', new Date().toISOString())
+  })
+
+  // The renderer opens export URLs (SRT/Reaper CSV — both Content-Disposition:
+  // attachment) via window.open(url, '_blank'). With no handler, Electron's
+  // default behavior is to create a real new BrowserWindow and navigate it to
+  // that URL — the navigation resolves as a download instead of a page load,
+  // so the window never gets any content and just sits there blank forever
+  // (confirmed live: reported as "a white window opens and doesn't close").
+  // Deny the new window and drive the download on the existing session instead.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    win?.webContents.downloadURL(url)
+    return { action: 'deny' }
   })
 
   if (VITE_DEV_SERVER_URL) {

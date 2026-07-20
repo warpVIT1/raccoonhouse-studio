@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { useApi } from '../hooks/useApi'
+import { useAppStore } from '../stores/appStore'
 import { PowerSharePanel } from './PowerSharePanel'
 import { UpdatePanel } from './UpdatePanel'
 import type { AppSettings } from '../types'
@@ -16,17 +17,55 @@ const EMPTY_SETTINGS: AppSettings = {
   power_share_enabled: false,
   manual_peer_host: null,
   manual_peer_port: 8765,
+  gpu_enabled: false,
+  gpu_available: false,
+  gpu_runtime_installed: false,
 }
 
 export function SettingsPage() {
-  const { get, put } = useApi()
+  const { get, put, post } = useApi()
   const [settings, setSettings] = useState<AppSettings>(EMPTY_SETTINGS)
   const [editingModel, setEditingModel] = useState(false)
   const [editingReaper, setEditingReaper] = useState(false)
+  const [gpuError, setGpuError] = useState<string | null>(null)
+  const activeJobs = useAppStore((s) => s.activeJobs)
+  const upsertJob = useAppStore((s) => s.upsertJob)
+
+  const gpuInstallJob = [...activeJobs.values()].find(
+    (j) => j.type === 'install_gpu_runtime' && j.status === 'running'
+  )
 
   useEffect(() => {
     get<AppSettings>('/settings').then(setSettings).catch(() => {})
   }, [get])
+
+  // Once the install job completes, the backend has already flipped
+  // gpu_enabled on its own (see settings.py) — refetch so the toggle
+  // reflects that without the user having to do anything else.
+  useEffect(() => {
+    const justFinished = [...activeJobs.values()].find(
+      (j) => j.type === 'install_gpu_runtime' && j.status === 'complete'
+    )
+    if (justFinished) {
+      get<AppSettings>('/settings').then(setSettings).catch(() => {})
+    }
+  }, [activeJobs, get])
+
+  const installGpuRuntime = async () => {
+    setGpuError(null)
+    try {
+      const result = await post<{ job_id: string }>('/settings/install-gpu-runtime')
+      upsertJob({
+        id: result.job_id,
+        type: 'install_gpu_runtime',
+        status: 'running',
+        percent: 0,
+        message: 'Завантаження бібліотек CUDA…',
+      })
+    } catch (e) {
+      setGpuError(e instanceof Error ? e.message : 'Не вдалося запустити встановлення')
+    }
+  }
 
   const save = async (patch: Partial<AppSettings>) => {
     const next = { ...settings, ...patch }
@@ -75,7 +114,7 @@ export function SettingsPage() {
         {/* Separation model */}
         <Row
           label="Модель вокал-розділення"
-          value={`${settings.separation_model}${settings.ensemble_default ? ' · Ensemble' : ''} · GPU`}
+          value={`${settings.separation_model}${settings.ensemble_default ? ' · Ensemble' : ''}`}
           action={editingModel ? undefined : 'Обрати'}
           onAction={() => setEditingModel(true)}
         >
@@ -114,6 +153,58 @@ export function SettingsPage() {
             </div>
           )}
         </Row>
+
+        {/* GPU acceleration — off by default, opt-in because enabling it
+            downloads a one-time ~2.5GB CUDA runtime (see gpu_runtime_service.py) */}
+        <div className="flex items-center gap-3 py-3.5 px-4 border-b border-rh-border/70">
+          <div className="flex-1 min-w-0">
+            <div className="text-[12.5px] font-bold">GPU-прискорення (усі моделі)</div>
+            <div className="font-mono text-[11px] text-rh-text-dim mt-0.5">
+              {!settings.gpu_available
+                ? 'NVIDIA GPU не знайдено на цьому комп\'ютері'
+                : gpuInstallJob
+                  ? gpuInstallJob.message || 'Встановлення…'
+                  : settings.gpu_enabled
+                    ? 'Увімкнено — CUDA-бібліотеки встановлені'
+                    : settings.gpu_runtime_installed
+                      ? 'Бібліотеки вже завантажені, прискорення вимкнено'
+                      : 'Вимкнено — розділення йде на CPU'}
+            </div>
+            {gpuInstallJob && (
+              <div className="mt-1.5 h-1 w-full max-w-[220px] rounded-full bg-rh-border overflow-hidden">
+                <div
+                  className="h-full bg-rh-accent transition-all"
+                  style={{ width: `${gpuInstallJob.percent}%` }}
+                />
+              </div>
+            )}
+            {gpuError && <div className="text-[11px] text-[#FF6B70] mt-1">{gpuError}</div>}
+          </div>
+          {settings.gpu_available && !gpuInstallJob && (
+            settings.gpu_enabled ? (
+              <button
+                onClick={() => save({ gpu_enabled: false })}
+                className="flex-none bg-transparent border border-rh-border rounded-lg px-3 py-1.5 text-[11px] font-semibold text-rh-muted hover:border-rh-accent/50 hover:text-[#FF6B70] transition-colors"
+              >
+                Вимкнути
+              </button>
+            ) : settings.gpu_runtime_installed ? (
+              <button
+                onClick={() => save({ gpu_enabled: true })}
+                className="flex-none bg-transparent border border-rh-border rounded-lg px-3 py-1.5 text-[11px] font-semibold text-rh-muted hover:border-rh-accent/40 hover:text-white transition-colors"
+              >
+                Увімкнути
+              </button>
+            ) : (
+              <button
+                onClick={installGpuRuntime}
+                className="flex-none bg-transparent border border-rh-border rounded-lg px-3 py-1.5 text-[11px] font-semibold text-rh-muted hover:border-rh-accent/40 hover:text-white transition-colors"
+              >
+                Завантажити й увімкнути
+              </button>
+            )
+          )}
+        </div>
 
         {/* Reaper marker position format */}
         <div className="flex items-center gap-3 py-3.5 px-4 border-b border-rh-border/70">

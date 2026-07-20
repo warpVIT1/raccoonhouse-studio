@@ -64,6 +64,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   // ASS import
   const assInputRef = useRef<HTMLInputElement>(null)
   const [importingAss, setImportingAss] = useState(false)
+  const [assDragOver, setAssDragOver] = useState(false)
 
   // Mux import
   const muxInputRef = useRef<HTMLInputElement>(null)
@@ -316,6 +317,17 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     } finally {
       setImportingAss(false)
     }
+  }
+
+  function handleAssDragOver(e: React.DragEvent) {
+    e.preventDefault()
+    setAssDragOver(true)
+  }
+  function handleAssDragLeave() { setAssDragOver(false) }
+  function handleAssDrop(e: React.DragEvent) {
+    e.preventDefault()
+    setAssDragOver(false)
+    if (e.dataTransfer.files.length) handleAssImport(e.dataTransfer.files)
   }
 
   // Export SRT
@@ -647,7 +659,17 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
           </div>
 
           {/* Tab content */}
-          <div className="flex-1 overflow-hidden">
+          <div
+            className="flex-1 overflow-hidden relative"
+            onDragOver={activeTab === 'subtitles' ? handleAssDragOver : undefined}
+            onDragLeave={activeTab === 'subtitles' ? handleAssDragLeave : undefined}
+            onDrop={activeTab === 'subtitles' ? handleAssDrop : undefined}
+          >
+            {assDragOver && (
+              <div className="absolute inset-0 z-10 flex items-center justify-center bg-rh-bg/90 border-2 border-dashed border-rh-accent pointer-events-none">
+                <span className="text-sm font-semibold text-rh-accent">Відпустіть, щоб імпортувати ASS-файл</span>
+              </div>
+            )}
             {activeTab === 'subtitles' ? (
               <SubtitleGrid
                 lines={subtitles}

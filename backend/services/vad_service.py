@@ -6,6 +6,7 @@ auto-places Reaper markers at each gap's start.
 Uses silero-vad (PyTorch-based) as the primary VAD engine.
 Falls back to simple RMS-energy thresholding if silero is unavailable.
 """
+import logging
 import os
 import numpy as np
 from pathlib import Path
@@ -17,9 +18,20 @@ from ..database import SessionLocal
 from ..job_manager import ProgressReporter
 
 DATA_DIR = os.environ.get("RH_DATA_DIR", os.path.join(os.path.expanduser("~"), ".raccoonhouse"))
+logger = logging.getLogger(__name__)
 
 # Gap must be at least this long (seconds) to place a marker
 DEFAULT_MIN_GAP_SECONDS = 1.0
+
+# Minimum length (seconds) for a гуртівка (background crowd babble) region to
+# get its own початок/кінець marker pair — shorter blips are more likely a
+# brief noise spike than sustained crowd chatter.
+GURTIVKA_MIN_DURATION_SECONDS = 2.0
+GURTIVKA_COLOR = "#4ADE80"
+# The "початок" marker sits slightly ahead of the detected onset — markers
+# mark the moment to prepare for a sound, not the moment it's already
+# started (matches the "перед звуком, не після" requirement).
+GURTIVKA_LEAD_SECONDS = 0.3
 
 
 def run_marker_detection(
@@ -62,6 +74,7 @@ def _run_marker_detection(
     try:
         speech_timestamps = _silero_vad(mono, sr, reporter)
     except Exception:
+        logger.exception("Silero VAD failed, falling back to energy-threshold VAD")
         speech_timestamps = _energy_vad(mono, sr, min_gap_seconds)
 
     reporter.update(70, "Виявлення пауз…")
@@ -142,6 +155,22 @@ def _run_marker_detection(
         db.add(marker)
         new_markers.append(marker)
 
+    reporter.update(85, "Пошук гуртівки…")
+    gurtivka_regions = _detect_gurtivka(mono, sr)
+    for g_start, g_end in gurtivka_regions:
+        start_marker = Marker(
+            episode_id=episode_id, reaper_name="ГУРТІВКА - початок",
+            position_seconds=max(0.0, g_start - GURTIVKA_LEAD_SECONDS), confirmed=False, color=GURTIVKA_COLOR,
+        )
+        end_marker = Marker(
+            episode_id=episode_id, reaper_name="ГУРТІВКА - кінець",
+            position_seconds=g_end, confirmed=False, color=GURTIVKA_COLOR,
+        )
+        db.add(start_marker)
+        db.add(end_marker)
+        new_markers.append(start_marker)
+        new_markers.append(end_marker)
+
     ep.status = "marked"
     db.commit()
 
@@ -149,9 +178,112 @@ def _run_marker_detection(
     return {"marker_count": len(new_markers)}
 
 
+def _detect_gurtivka(mono: np.ndarray, sr: int) -> list[tuple[float, float]]:
+    """Heuristic detection of гуртівка (many people talking in the
+    background at once) — deliberately independent of silero's speech/gap
+    split above, and NOT suppressed by subtitle overlap, since gуртівка can
+    happen either under dialogue or in a silent stretch just the same.
+
+    There's no trained classifier for this and no labeled гуртівка audio to
+    validate against, so this is a heuristic, not ground truth: many
+    overlapping voices don't share one clean spectral shape the way a
+    single speaker does, so a frame is flagged when it has real acoustic
+    energy, a noise-like (flat) spectrum, and wide spectral bandwidth —
+    all signs of several simultaneous sound sources rather than one clear
+    voice. Expect to tune GURTIVKA_MIN_DURATION_SECONDS and the percentile
+    thresholds below against real episodes rather than trusting these
+    defaults blindly.
+
+    Deliberately NOT using pitch-tracking (librosa.pyin) here even though
+    it's a more direct signal for "one voice vs many" — pyin's per-frame
+    search doesn't release the GIL in any meaningful way, so it blocks the
+    ENTIRE backend process (not just this job) for its whole runtime, which
+    for a full episode at any sample rate was still unfinished after several
+    minutes (confirmed live 2026-07-19, including downsampled to 8kHz — the
+    frame count drops but the per-frame cost dominates). The features below
+    are all plain FFT-based and fully vectorized, so they run in seconds."""
+    import librosa
+
+    hop_length = 512
+    flatness = librosa.feature.spectral_flatness(y=mono, hop_length=hop_length)[0]
+    bandwidth = librosa.feature.spectral_bandwidth(y=mono, sr=sr, hop_length=hop_length)[0]
+    rms = librosa.feature.rms(y=mono, hop_length=hop_length)[0]
+
+    n = min(len(flatness), len(bandwidth), len(rms))
+    if n == 0:
+        return []
+    flatness = flatness[:n]
+    bandwidth = bandwidth[:n]
+    rms = rms[:n]
+    times = librosa.frames_to_time(np.arange(n), sr=sr, hop_length=hop_length)
+
+    # Thresholds relative to THIS episode's own loudness/spectrum rather than
+    # fixed absolute numbers — mix loudness varies a lot episode to episode.
+    energy_threshold = np.percentile(rms, 40)
+    flatness_threshold = np.percentile(flatness, 60)
+    bandwidth_threshold = np.percentile(bandwidth, 60)
+    is_crowdish = (rms > energy_threshold) & (flatness > flatness_threshold) & (bandwidth > bandwidth_threshold)
+
+    # Raw per-frame flags flicker frame-to-frame even within a genuine
+    # gуртівка stretch (a brief dip in one feature breaks the run) — confirmed
+    # live 2026-07-19: ~11% of frames flagged episode-wide, but the longest
+    # RAW contiguous run was ~1.1s even though clearly-sustained stretches
+    # should exist. Smooth with a 1-second rolling average and threshold
+    # THAT instead of requiring every single frame in a row to pass.
+    smooth_window_frames = max(1, int(1.0 * sr / hop_length))
+    kernel = np.ones(smooth_window_frames) / smooth_window_frames
+    crowdish_fraction = np.convolve(is_crowdish.astype(float), kernel, mode="same")
+    is_crowdish = crowdish_fraction > 0.5
+
+    regions: list[tuple[float, float]] = []
+    start_idx: Optional[int] = None
+    for i, flag in enumerate(is_crowdish):
+        if flag and start_idx is None:
+            start_idx = i
+        elif not flag and start_idx is not None:
+            if times[i] - times[start_idx] >= GURTIVKA_MIN_DURATION_SECONDS:
+                regions.append((float(times[start_idx]), float(times[i])))
+            start_idx = None
+    if start_idx is not None and times[n - 1] - times[start_idx] >= GURTIVKA_MIN_DURATION_SECONDS:
+        regions.append((float(times[start_idx]), float(times[n - 1])))
+
+    logger.info("Гуртівка heuristic found %d region(s): %s", len(regions), regions)
+    return regions
+
+
+def _stub_torchaudio_if_broken() -> None:
+    """silero_vad's utils_vad.py unconditionally imports torchaudio at
+    module level — but only to support its own read_audio()/save_audio()
+    file-I/O helpers, which this app never calls (audio loading here goes
+    through soundfile + librosa instead, see _run_marker_detection above).
+    torchaudio's release train froze at 2.11.0 (project deprecated) while
+    torch here is 2.13.0 — its compiled extension no longer loads against
+    that torch build at all (confirmed live 2026-07-19:
+    "OSError: Could not load this library: .../torchaudio/lib/libtorchaudio.pyd"),
+    which without this would make _silero_vad() throw immediately on import
+    and silently fall back to the much cruder energy-threshold VAD below —
+    every single run, with no visible error anywhere. Rather than downgrade
+    torch project-wide for a dependency our own code path never exercises,
+    swap in a bare stand-in module before silero_vad ever imports the real
+    one — safe only because nothing here calls torchaudio.load/save/transforms."""
+    import sys
+    if "torchaudio" in sys.modules:
+        return
+    try:
+        import torchaudio  # noqa: F401 — works fine, nothing to stub
+        return
+    except Exception:
+        pass
+    import types
+    stub = types.ModuleType("torchaudio")
+    stub.__version__ = "0.0.0"
+    sys.modules["torchaudio"] = stub
+
+
 def _silero_vad(mono: np.ndarray, sr: int, reporter: ProgressReporter) -> list[dict]:
     """Run silero-vad. Returns list of {start, end} sample indices."""
     import torch
+    _stub_torchaudio_if_broken()
     from silero_vad import load_silero_vad, get_speech_timestamps
 
     reporter.update(30, "Завантаження Silero VAD…")

@@ -27,10 +27,11 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     const [currentTime, setCurrentTime] = useState(0)
     const [duration, setDuration] = useState(0)
     const [volume, setVolume] = useState(0.8)
-    // A-B toggle between the video's own mixed audio and the isolated vocal
-    // stem, for reviewing separation quality — the stem plays through a
-    // second, hidden <audio> element kept in lockstep with the video rather
-    // than swapping the video's own audio track (different file entirely).
+    // A-B toggle between the video's own mixed audio and the instrumental
+    // (vocal_stem_path — original vocal removed, the dubbing base track), for
+    // reviewing separation quality — the stem plays through a second, hidden
+    // <audio> element kept in lockstep with the video rather than swapping
+    // the video's own audio track (different file entirely).
     const [audioSource, setAudioSource] = useState<'original' | 'vocal'>('original')
 
     useImperativeHandle(ref, () => ({
@@ -48,7 +49,6 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     useEffect(() => {
       const v = videoRef.current
       if (!v) return
-      const a = vocalAudioRef.current
       const onTime = () => {
         setCurrentTime(v.currentTime)
         onTimeUpdate(v.currentTime)
@@ -57,11 +57,17 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
         setDuration(v.duration)
         onDurationChange(v.duration)
       }
-      const onPlay = () => { setIsPlaying(true); a?.play().catch(() => {}) }
-      const onPause = () => { setIsPlaying(false); a?.pause() }
+      // Read vocalAudioRef.current fresh on every event rather than closing
+      // over it once — the vocal stem (and its <audio> element) only exists
+      // once separation finishes, which is always *after* this effect's
+      // first run (videoUrl becomes non-null as soon as the episode loads,
+      // well before vocalUrl does), so a closed-over reference would stay
+      // null forever and the vocal track would silently never play.
+      const onPlay = () => { setIsPlaying(true); vocalAudioRef.current?.play().catch(() => {}) }
+      const onPause = () => { setIsPlaying(false); vocalAudioRef.current?.pause() }
       // Hard-resync the vocal track on every seek — letting both elements
       // free-run independently drifts them apart within a few seconds.
-      const onSeeked = () => { if (a) a.currentTime = v.currentTime }
+      const onSeeked = () => { if (vocalAudioRef.current) vocalAudioRef.current.currentTime = v.currentTime }
       v.addEventListener('timeupdate', onTime)
       v.addEventListener('durationchange', onDur)
       v.addEventListener('play', onPlay)
@@ -211,11 +217,12 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
                 </button>
                 <button
                   onClick={() => setAudioSource('vocal')}
+                  title="Інструментал — оригінальний вокал видалено"
                   className={`px-2 py-0.5 text-[10.5px] font-semibold transition-colors ${
                     audioSource === 'vocal' ? 'bg-rh-accent text-white' : 'text-rh-muted hover:text-white'
                   }`}
                 >
-                  Вокал
+                  Інструментал
                 </button>
               </div>
             )}

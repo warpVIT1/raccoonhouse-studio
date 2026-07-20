@@ -428,16 +428,24 @@ function ImportReviewModal({ items, remotePeersAvailable, onCancel, onConfirm }:
               <input
                 type="number"
                 min={1}
-                value={row.season}
-                onChange={(e) => update(idx, { season: Math.max(1, Number(e.target.value) || 1) })}
+                // Falling back to 1 on every keystroke (the old behavior)
+                // made the field impossible to actually clear and retype —
+                // backspacing to empty instantly snapped back to "1" before
+                // a new digit could go in. Let it sit at a transient 0
+                // (rendered as empty) while typing; onBlur clamps back to a
+                // real episode number.
+                value={row.season || ''}
+                onChange={(e) => update(idx, { season: e.target.value === '' ? 0 : Math.max(1, Number(e.target.value) || 0) })}
+                onBlur={() => { if (!row.season) update(idx, { season: 1 }) }}
                 className="rh-input w-14 text-center px-1"
               />
               <label className="text-[10.5px] text-rh-muted">Серія</label>
               <input
                 type="number"
                 min={1}
-                value={row.number}
-                onChange={(e) => update(idx, { number: Math.max(1, Number(e.target.value) || 1) })}
+                value={row.number || ''}
+                onChange={(e) => update(idx, { number: e.target.value === '' ? 0 : Math.max(1, Number(e.target.value) || 0) })}
+                onBlur={() => { if (!row.number) update(idx, { number: 1 }) }}
                 className="rh-input w-16 text-center px-1"
               />
             </div>
@@ -513,8 +521,12 @@ function EpisodeTile({ episode, job, onClick, onRenumber, onStatusChange, onDele
                 type="number"
                 min={1}
                 autoFocus
-                value={seasonInput}
-                onChange={(e) => setSeasonInput(Math.max(1, Number(e.target.value) || 1))}
+                // See the same-shaped fix in ImportReviewModal above — a
+                // forced "|| 1" fallback on every keystroke made this field
+                // impossible to clear and retype.
+                value={seasonInput || ''}
+                onChange={(e) => setSeasonInput(e.target.value === '' ? 0 : Math.max(1, Number(e.target.value) || 0))}
+                onBlur={() => { if (!seasonInput) setSeasonInput(1) }}
                 className="rh-input w-12 px-1 py-0.5 text-sm"
               />
             </div>
@@ -523,8 +535,9 @@ function EpisodeTile({ episode, job, onClick, onRenumber, onStatusChange, onDele
               <input
                 type="number"
                 min={1}
-                value={numberInput}
-                onChange={(e) => setNumberInput(Math.max(1, Number(e.target.value) || 1))}
+                value={numberInput || ''}
+                onChange={(e) => setNumberInput(e.target.value === '' ? 0 : Math.max(1, Number(e.target.value) || 0))}
+                onBlur={() => { if (!numberInput) setNumberInput(1) }}
                 className="rh-input w-14 px-1 py-0.5 text-sm"
               />
             </div>

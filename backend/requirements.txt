@@ -29,11 +29,22 @@ silero-vad==5.1
 # onnxruntime-gpu pinned to 1.20.1, deliberately NOT the latest (1.27.0) — it
 # targets the CUDA 13 runtime, whose redistributable pip package
 # (nvidia-cublas-cu13) is only a placeholder stub right now, so
-# CUDAExecutionProvider silently fails to load. 1.20.1 targets CUDA 12, which
-# nvidia-cublas-cu12/nvidia-cudnn-cu12 provide directly — confirmed working
-# (no load errors, "enabling acceleration" in the separator log).
+# CUDAExecutionProvider silently fails to load. 1.20.1 targets CUDA 12.
+# onnxruntime_providers_cuda.dll dynamically loads cudart64_12.dll,
+# cublas64_12.dll, cudnn64_9.dll AND cufft64_11.dll — all four are required,
+# not just cublas/cudnn: without nvidia-cuda-runtime-cu12/nvidia-cufft-cu12,
+# CUDAExecutionProvider creation fails with "LoadLibrary error 126" and
+# onnxruntime silently falls back to CPU (confirmed live 2026-07-19 — this
+# is why GPU sat idle at 0% while CPU pegged at 80% despite
+# ort.get_available_providers() listing CUDAExecutionProvider throughout;
+# that check only reflects the onnxruntime build, not whether the DLLs
+# actually load). separator_service.py's _add_nvidia_dll_dirs() puts these
+# packages' bin/ dirs on PATH at runtime — required in addition to having
+# them installed, since nothing else does this for a CPU-only torch.
 audio-separator==0.44.3
 torch==2.13.0
 onnxruntime-gpu==1.20.1
 nvidia-cublas-cu12
 nvidia-cudnn-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cufft-cu12

@@ -74,7 +74,7 @@ export interface Marker {
 
 export interface JobStatus {
   id: string
-  type: 'import_video' | 'import_video_remote' | 'separate_vocals' | 'request_remote_separation' | 'detect_markers' | 'export_srt' | 'mux_audio'
+  type: 'import_video' | 'import_video_remote' | 'separate_vocals' | 'request_remote_separation' | 'detect_markers' | 'export_srt' | 'mux_audio' | 'install_gpu_runtime'
   status: 'pending' | 'running' | 'complete' | 'error' | 'cancelled'
   percent: number
   message: string
@@ -113,6 +113,9 @@ export interface AppSettings {
   power_share_enabled: boolean
   manual_peer_host: string | null
   manual_peer_port: number
+  gpu_enabled: boolean
+  gpu_available: boolean
+  gpu_runtime_installed: boolean
 }
 
 export interface Profile {

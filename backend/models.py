@@ -30,7 +30,13 @@ class Episode(Base):
     duration: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     original_file_path: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     audio_stem_path: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
+    # Despite the name, this is the INSTRUMENTAL (original vocal removed) —
+    # the track dubbing actually needs as a base to lay new voice over. Kept
+    # the established column/API name to avoid rippling a rename through the
+    # frontend; vocal_only_stem_path below holds the actual isolated-voice
+    # stem, used internally for VAD-based marker detection only.
     vocal_stem_path: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
+    vocal_only_stem_path: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     original_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     original_bitrate: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     original_format: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
@@ -127,6 +133,11 @@ class AppSettings(Base):
     default_bpm: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     active_profile_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("profiles.id"), nullable=True)
     power_share_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # GPU acceleration is opt-in and off by default — enabling it triggers a
+    # one-time ~2.5GB CUDA runtime download (see gpu_runtime_service.py). Off
+    # by default so a fresh install never silently starts a large background
+    # download nobody asked for.
+    gpu_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Manual fallback for when both PCs aren't on the same LAN (auto-discovery via
     # UDP broadcast can't cross the internet, or doesn't reliably cross a VPN mesh
     # like Hamachi/Radmin) — one pinned "connect directly to this PC" address.

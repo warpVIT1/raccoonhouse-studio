@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import type { Character, Marker } from '../../types'
 
 function formatTime(s: number): string {
@@ -105,6 +105,53 @@ export function MarkersTab({ markers, characters, currentTimeMs, onConfirm, onEd
 
   const sorted = [...markers].sort((a, b) => a.position_seconds - b.position_seconds)
 
+  // Ctrl/Cmd+click toggles a marker into the selection, Shift+click selects
+  // a whole range from the last-clicked marker — same interaction as
+  // SubtitleGrid's row multi-select. A plain click still just seeks and
+  // clears the selection, so this doesn't change the existing click-to-seek
+  // behavior at all.
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  const lastClickedIdxRef = useRef<number | null>(null)
+
+  const handleMarkerClick = useCallback((m: Marker, idx: number, e: React.MouseEvent) => {
+    if (e.ctrlKey || e.metaKey) {
+      setSelectedIds((prev) => {
+        const next = new Set(prev)
+        if (next.has(m.id)) next.delete(m.id)
+        else next.add(m.id)
+        return next
+      })
+      lastClickedIdxRef.current = idx
+      return
+    }
+    if (e.shiftKey && lastClickedIdxRef.current != null) {
+      const from = Math.min(lastClickedIdxRef.current, idx)
+      const to = Math.max(lastClickedIdxRef.current, idx)
+      setSelectedIds(new Set(sorted.slice(from, to + 1).map((x) => x.id)))
+      return
+    }
+    setSelectedIds(new Set())
+    lastClickedIdxRef.current = idx
+    onSeek(m.position_seconds)
+  }, [sorted, onSeek])
+
+  // Delete key removes every selected marker without needing the per-row
+  // trash button — ignored while typing in any input (editing a marker's
+  // name/position, the add-marker form...) so it doesn't hijack normal
+  // text editing.
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== 'Delete' || selectedIds.size === 0) return
+      const tag = (e.target as HTMLElement)?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
+      e.preventDefault()
+      for (const id of selectedIds) onDelete(id)
+      setSelectedIds(new Set())
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [selectedIds, onDelete])
+
   return (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Header */}
@@ -172,11 +219,12 @@ export function MarkersTab({ markers, characters, currentTimeMs, onConfirm, onEd
             <span className="text-xs">Маркерів немає. Запустіть авто-виявлення.</span>
           </div>
         ) : (
-          sorted.map((m) => (
+          sorted.map((m, idx) => (
             <div
               key={m.id}
               className={`flex items-center gap-2 px-3 py-2 border-b border-rh-border/50 hover:bg-white/[0.02] group
-                ${m.confirmed ? '' : 'border-l-2 border-l-amber-500'}`}
+                ${m.confirmed ? '' : 'border-l-2 border-l-amber-500'}
+                ${selectedIds.has(m.id) ? 'bg-rh-accent/10 ring-1 ring-inset ring-rh-accent/40' : ''}`}
             >
               {/* Position indicator */}
               <div
@@ -204,7 +252,7 @@ export function MarkersTab({ markers, characters, currentTimeMs, onConfirm, onEd
               ) : (
                 <>
                   <button
-                    onClick={() => onSeek(m.position_seconds)}
+                    onClick={(e) => handleMarkerClick(m, idx, e)}
                     className="flex-1 text-left"
                   >
                     <span className="text-xs text-rh-text" style={m.color ? { color: m.color } : undefined}>

@@ -189,7 +189,7 @@ export function WaveformViewer({
     <div ref={containerRef} className="flex flex-col h-full bg-[#0A0A0C] rounded-lg overflow-hidden">
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b border-rh-border flex-shrink-0">
-        <span className="text-xs text-rh-muted font-medium">Вокал (ізольований)</span>
+        <span className="text-xs text-rh-muted font-medium">Інструментал (без вокалу)</span>
         <div className="flex items-center gap-2">
           {loading && <span className="text-xs text-rh-text-dim">Завантаження…</span>}
           {!vocalStemPath && !loading && <span className="text-xs text-rh-muted">Стем не готовий</span>}

@@ -15,9 +15,11 @@ NOTE: audio_separator.Separator.load_model() requires the *exact* filename
 (including extension) from its model registry (Separator().list_supported_model_files()),
 not the bare display name — verified 2026-07-19 against audio-separator 0.44.3.
 """
+import glob
 import math
 import os
 import shutil
+import sys
 import threading
 import time
 from pathlib import Path
@@ -28,6 +30,35 @@ from ..database import SessionLocal
 from ..job_manager import ProgressReporter
 
 DATA_DIR = os.environ.get("RH_DATA_DIR", os.path.join(os.path.expanduser("~"), ".raccoonhouse"))
+
+
+def _add_nvidia_dll_dirs():
+    """onnxruntime-gpu's onnxruntime_providers_cuda.dll dynamically loads
+    cudart64_12.dll, cublas64_12.dll, cudnn64_9.dll and cufft64_11.dll — it
+    does NOT declare them as Python imports, so nothing puts them on the
+    DLL search path by default. A CUDA-enabled torch normally does this
+    itself at import time, but torch here is deliberately the plain CPU
+    build (see requirements.txt), so the nvidia-*-cu12 pip packages that
+    provide these DLLs are on their own.
+    Without this, CUDAExecutionProvider creation fails with "LoadLibrary
+    failed with error 126" and onnxruntime silently falls back to
+    CPUExecutionProvider — logged only as a warning, easy to miss, and
+    ort.get_available_providers() still lists CUDAExecutionProvider as
+    "available" throughout (it only reflects what onnxruntime was built
+    with, not whether the DLLs actually load) — confirmed live 2026-07-19
+    that this is exactly what was happening: GPU idle, CPU pegged.
+    os.add_dll_directory() does NOT fix this for onnxruntime's own loader
+    (confirmed live); only prepending PATH does."""
+    if getattr(sys, "frozen", False):
+        bases = [os.path.join(sys._MEIPASS, "nvidia")]
+    else:
+        import importlib.util
+        spec = importlib.util.find_spec("nvidia")
+        bases = list(spec.submodule_search_locations) if spec and spec.submodule_search_locations else []
+
+    dll_dirs = [d for base in bases for d in glob.glob(os.path.join(base, "*", "bin"))]
+    if dll_dirs:
+        os.environ["PATH"] = os.pathsep.join(dll_dirs) + os.pathsep + os.environ.get("PATH", "")
 
 
 def _patch_separator_gpu_detection():
@@ -43,20 +74,57 @@ def _patch_separator_gpu_detection():
     configured" anyway because its check never even looks at onnxruntime's
     provider list unless torch.cuda.is_available() is already True).
     This replaces that one method to check onnxruntime's provider list
-    independently: torch-based models (MDXC, Demucs, VR Arch) still run on
-    CPU (no CUDA-enabled torch installed), but the ONNX-based MDX-Net model
-    gets real CUDA acceleration via onnxruntime-gpu +
-    nvidia-cublas-cu12/nvidia-cudnn-cu12."""
+    independently, and (below) torch.cuda.is_available() directly — so the
+    ONNX-based MDX-Net gets acceleration via onnxruntime-gpu regardless of
+    torch's own CUDA status, and the torch-based models (VR Arch, Demucs,
+    MDX23C, BS-RoFormer) get it too whenever the CUDA torch build has been
+    swapped in (see gpu_runtime_service.py).
+
+    GPU is opt-in via Settings (AppSettings.gpu_enabled, default False) — the
+    CUDA runtime isn't bundled at all (see build-backend.py /
+    gpu_runtime_service.py), so even checking onnxruntime's provider list is
+    pointless until the user has actually opted in and the one-time download
+    has run."""
     try:
         from audio_separator.separator import Separator
         import torch
-        import onnxruntime as ort
     except ImportError:
         return
 
     def _setup_torch_device(self, system_info):
         self.torch_device_cpu = torch.device("cpu")
         self.torch_device = self.torch_device_cpu
+
+        from ..models import AppSettings
+        db = SessionLocal()
+        try:
+            row = db.get(AppSettings, 1)
+            gpu_enabled = bool(row and row.gpu_enabled)
+        finally:
+            db.close()
+
+        if not gpu_enabled:
+            self.logger.info("GPU acceleration disabled in settings, running in CPU mode")
+            self.onnx_execution_provider = ["CPUExecutionProvider"]
+            return
+
+        # torch's CUDA build gets swapped in via sys.path at process startup,
+        # ahead of any import of torch anywhere (see backend/main.py and
+        # gpu_runtime_service.py's torch_cuda_sys_path()) — if that swap
+        # happened, torch.cuda.is_available() here already reflects it, so
+        # the torch-based models (VR Arch, Demucs, MDX23C, BS-RoFormer) get
+        # real GPU acceleration too, not just the ONNX-based MDX-Net below.
+        if torch.cuda.is_available():
+            self.logger.info("CUDA available in torch, enabling acceleration for torch-based models")
+            self.torch_device = torch.device("cuda")
+
+        if getattr(sys, "frozen", False):
+            from .gpu_runtime_service import ensure_gpu_provider_placed
+            ensure_gpu_provider_placed()
+        else:
+            _add_nvidia_dll_dirs()
+
+        import onnxruntime as ort
         if "CUDAExecutionProvider" in ort.get_available_providers():
             self.logger.info("ONNXruntime has CUDAExecutionProvider available, enabling acceleration for ONNX-based models")
             self.onnx_execution_provider = ["CUDAExecutionProvider"]
@@ -99,6 +167,7 @@ def separate_file(
     os.makedirs(output_dir, exist_ok=True)
     models_to_run = list(MODEL_MAP.keys()) if ensemble else [model_name]
     vocal_stems: list[str] = []
+    instrumental_stems: list[str] = []
 
     def progress(pct, msg):
         if on_progress:
@@ -160,32 +229,62 @@ def separate_file(
             for f in output_files
         ]
 
-        # audio-separator names output files like: {stem}_(Vocals)_model.wav
+        # audio-separator names output files like: {stem}_(Vocals)_model.wav /
+        # {stem}_(Instrumental)_model.wav. Match by name for both; whichever
+        # output isn't the matched vocal file is assumed to be the
+        # instrumental counterpart if no name match is found (covers models
+        # with unfamiliar naming, as long as they still produce exactly a
+        # vocal/non-vocal pair — not guaranteed for 4-stem architectures like
+        # Demucs, but that's an existing ensemble-mode rough edge, not
+        # something this fixes).
         vocal_file = None
+        instrumental_file = None
         for f in output_paths:
-            if "Vocals" in f or "vocals" in f or "vocal" in f.lower():
+            if "vocal" in f.lower():
                 vocal_file = f
+                break
+        for f in output_paths:
+            if "instrumental" in f.lower():
+                instrumental_file = f
                 break
         if not vocal_file and output_paths:
             vocal_file = output_paths[0]
+        if not instrumental_file:
+            remaining = [f for f in output_paths if f != vocal_file]
+            instrumental_file = remaining[0] if remaining else None
 
         if vocal_file and os.path.isfile(vocal_file):
             vocal_stems.append(vocal_file)
+        if instrumental_file and os.path.isfile(instrumental_file):
+            instrumental_stems.append(instrumental_file)
 
         progress(base_pct + int(80 / len(models_to_run)), f"нейромережа: готово {mdl}")
 
-    if not vocal_stems:
-        raise RuntimeError("Не вдалося отримати вокальний стем")
+    if not instrumental_stems:
+        raise RuntimeError("Не вдалося отримати інструментальний стем")
 
-    final_vocal = str(Path(output_dir) / "vocal_isolated.wav")
-    if len(vocal_stems) == 1:
-        shutil.copy2(vocal_stems[0], final_vocal)
+    # The instrumental (original vocal removed) is the actual deliverable —
+    # dubbing needs a clean base to lay new voice over, not the isolated
+    # voice itself. The pure-vocal stem is kept separately only because
+    # VAD-based marker detection needs an actual voice signal to find speech
+    # gaps in — it has no use for the instrumental.
+    final_instrumental = str(Path(output_dir) / "vocal_isolated.wav")
+    if len(instrumental_stems) == 1:
+        shutil.copy2(instrumental_stems[0], final_instrumental)
     else:
         progress(85, "нейромережа: об'єднання стемів (ensemble)…")
-        _average_stems(vocal_stems, final_vocal)
+        _average_stems(instrumental_stems, final_instrumental)
+
+    final_vocal_only = None
+    if vocal_stems:
+        final_vocal_only = str(Path(output_dir) / "vocal_only.wav")
+        if len(vocal_stems) == 1:
+            shutil.copy2(vocal_stems[0], final_vocal_only)
+        else:
+            _average_stems(vocal_stems, final_vocal_only)
 
     progress(100, "нейромережа: вокал відокремлено")
-    return final_vocal
+    return {"vocal_stem_path": final_instrumental, "vocal_only_stem_path": final_vocal_only}
 
 
 def run_separation(
@@ -208,17 +307,18 @@ def run_separation(
         ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
         output_dir = ep_dir / "stems"
 
-        final_vocal = separate_file(
+        stems = separate_file(
             audio_path, str(output_dir), model_name, ensemble,
             on_progress=reporter.update, is_cancelled=lambda: reporter.cancelled,
         )
 
         reporter.update(95, "Оновлення БД…")
-        ep.vocal_stem_path = final_vocal
+        ep.vocal_stem_path = stems["vocal_stem_path"]
+        ep.vocal_only_stem_path = stems["vocal_only_stem_path"]
         ep.status = "vocal_isolated"
         db.commit()
 
-        return {"vocal_stem_path": final_vocal}
+        return stems
     finally:
         db.close()
 

@@ -6,6 +6,7 @@ from typing import List
 from ..database import get_db
 from ..models import Title, Episode, Character, SignStyle
 from ..schemas import TitleCreate, TitleUpdate, TitleOut, SignStylesUpdate
+from .episodes import delete_episode_files
 
 router = APIRouter(prefix="/titles", tags=["titles"])
 
@@ -70,8 +71,11 @@ def delete_title(title_id: int, db: Session = Depends(get_db)):
     title = db.get(Title, title_id)
     if not title:
         raise HTTPException(404, "Title not found")
+    episode_ids = [row[0] for row in db.query(Episode.id).filter(Episode.title_id == title_id).all()]
     db.delete(title)
     db.commit()
+    for ep_id in episode_ids:
+        delete_episode_files(ep_id)
 
 
 @router.get("/{title_id}/sign-styles")

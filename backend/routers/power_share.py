@@ -136,9 +136,16 @@ async def run_separation_for_peer(
         await broadcast_lending(True)
         try:
             output_dir = os.path.join(tmp_dir, "out")
-            final_vocal = await loop.run_in_executor(
+            stems = await loop.run_in_executor(
                 None, separate_file, input_path, output_dir, model, ensemble.lower() == "true",
             )
+            # Only the instrumental crosses the wire — the pure-vocal stem
+            # (VAD marker detection input) stays local to whichever machine
+            # actually runs detect-markers, which for a power-shared
+            # separation is the requester, not this responder. A remotely
+            # separated episode simply has no vocal_only_stem_path, same as
+            # any other episode that hasn't had markers detected yet.
+            final_vocal = stems["vocal_stem_path"]
             pss.power_logger.info("RUN-SEPARATION-DONE final_vocal=%s", final_vocal)
         finally:
             await broadcast_lending(False)

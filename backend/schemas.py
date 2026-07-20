@@ -60,6 +60,7 @@ class EpisodeOut(EpisodeBase):
     original_file_path: Optional[str] = None
     audio_stem_path: Optional[str] = None
     vocal_stem_path: Optional[str] = None
+    vocal_only_stem_path: Optional[str] = None
     original_size: Optional[int] = None
     original_bitrate: Optional[int] = None
     original_format: Optional[str] = None
@@ -209,6 +210,13 @@ class AppSettingsOut(BaseModel):
     power_share_enabled: bool = False
     manual_peer_host: Optional[str] = None
     manual_peer_port: int = 8765
+    gpu_enabled: bool = False
+    # Read-only, computed — not stored, just reported for the Settings UI to
+    # decide what to show (hide the toggle entirely with no NVIDIA GPU;
+    # switch "Enable" to "Download" vs. just "Enable" depending on whether
+    # the runtime is already cached from a previous install).
+    gpu_available: bool = False
+    gpu_runtime_installed: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -223,6 +231,7 @@ class AppSettingsUpdate(BaseModel):
     power_share_enabled: Optional[bool] = None
     manual_peer_host: Optional[str] = None
     manual_peer_port: Optional[int] = None
+    gpu_enabled: Optional[bool] = None
 
 
 class ProfileBase(BaseModel):

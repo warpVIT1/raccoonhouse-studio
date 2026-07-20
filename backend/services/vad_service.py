@@ -13,7 +13,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 from typing import Optional
 
-from ..models import Episode, Marker, SubtitleLine, Character
+from ..models import Episode, Marker, SubtitleLine, Character, SignStyle
 from ..database import SessionLocal
 from ..job_manager import ProgressReporter
 
@@ -104,13 +104,24 @@ def _run_marker_detection(
         .all()
     )
 
-    # A gap already covered by an existing subtitle line (any overlap at all)
-    # doesn't need its own "ЗВУК" marker — that stretch is already annotated,
-    # e.g. a Sign/OP/ED line over an instrumental section with no vocal, which
-    # VAD alone can't tell apart from a real background-sound-only gap.
+    # A gap covered by a Sign/OP/ED-style line doesn't need its own "ЗВУК"
+    # marker — that stretch is already annotated (an on-screen text/karaoke
+    # line over an instrumental section with no vocal, which VAD alone can't
+    # tell apart from a real background-sound-only gap). This must NOT
+    # include regular dialogue lines (ass_style "Default") — confirmed live
+    # 2026-07-20: checking against ALL subtitle lines regardless of style
+    # suppressed 90 of 91 real gaps on a normally-subtitled episode (every
+    # dialogue-dense line happened to graze a gap's edge), when none of
+    # those 282 lines were Sign/OP/ED at all.
+    sign_style_names = {
+        s.style_name for s in
+        db.query(SignStyle).filter(SignStyle.title_id == ep.title_id).all()
+    }
+    sign_lines = [l for l in subtitle_lines if l.ass_style in sign_style_names]
+
     def _overlaps_subtitle(gap_start: float, gap_end: float) -> bool:
         gap_start_ms, gap_end_ms = gap_start * 1000, gap_end * 1000
-        return any(line.start_ms < gap_end_ms and line.end_ms > gap_start_ms for line in subtitle_lines)
+        return any(line.start_ms < gap_end_ms and line.end_ms > gap_start_ms for line in sign_lines)
 
     gaps = [g for g in gaps if not _overlaps_subtitle(*g)]
 

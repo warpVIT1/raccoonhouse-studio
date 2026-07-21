@@ -15,6 +15,7 @@ interface MarkersTabProps {
   onConfirm: (id: number) => void
   onEdit: (id: number, changes: Partial<Marker>) => void
   onDelete: (id: number) => void
+  onDeleteAll: () => void
   onAdd: (positionSeconds: number, name: string) => void
   onSeek: (t: number) => void
 }
@@ -54,7 +55,7 @@ function CharacterPicker({ characters, onPick }: { characters: Character[]; onPi
   )
 }
 
-export function MarkersTab({ markers, characters, currentTimeMs, onConfirm, onEdit, onDelete, onAdd, onSeek }: MarkersTabProps) {
+export function MarkersTab({ markers, characters, currentTimeMs, onConfirm, onEdit, onDelete, onDeleteAll, onAdd, onSeek }: MarkersTabProps) {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [editName, setEditName] = useState('')
   const [editPos, setEditPos] = useState('')
@@ -141,16 +142,28 @@ export function MarkersTab({ markers, characters, currentTimeMs, onConfirm, onEd
   // text editing.
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      if (e.key !== 'Delete' || selectedIds.size === 0) return
+      if (e.key !== 'Delete') return
       const tag = (e.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
-      e.preventDefault()
-      for (const id of selectedIds) onDelete(id)
-      setSelectedIds(new Set())
+      if (selectedIds.size > 0) {
+        e.preventDefault()
+        for (const id of selectedIds) onDelete(id)
+        setSelectedIds(new Set())
+        return
+      }
+      // No multi-selection — fall back to whichever single marker was last
+      // clicked (a plain click, no Ctrl/Shift needed).
+      if (lastClickedIdxRef.current != null) {
+        const marker = sorted[lastClickedIdxRef.current]
+        if (marker) {
+          e.preventDefault()
+          onDelete(marker.id)
+        }
+      }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [selectedIds, onDelete])
+  }, [selectedIds, onDelete, sorted])
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -183,6 +196,17 @@ export function MarkersTab({ markers, characters, currentTimeMs, onConfirm, onEd
             </svg>
             Додати
           </button>
+          {markers.length > 0 && (
+            <button
+              onClick={onDeleteAll}
+              className="rh-btn-ghost text-xs px-2 py-1 hover:text-red-400"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/>
+              </svg>
+              Видалити все
+            </button>
+          )}
         </div>
       </div>
 

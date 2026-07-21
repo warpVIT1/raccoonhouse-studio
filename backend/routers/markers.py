@@ -53,6 +53,12 @@ def delete_marker(marker_id: int, db: Session = Depends(get_db)):
     db.commit()
 
 
+@router.delete("/episodes/{ep_id}/markers", status_code=204)
+def delete_all_markers(ep_id: int, db: Session = Depends(get_db)):
+    db.query(Marker).filter(Marker.episode_id == ep_id).delete()
+    db.commit()
+
+
 @router.get("/episodes/{ep_id}/export-reaper-csv")
 def export_reaper_csv(ep_id: int, db: Session = Depends(get_db)):
     ep = db.get(Episode, ep_id)

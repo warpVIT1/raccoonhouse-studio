@@ -72,6 +72,7 @@ interface SubtitleGridProps {
   onLineChange: (index: number, changes: Partial<SubtitleLine>) => void
   onAddLine: () => void
   onDeleteLine: (index: number) => void
+  onDeleteAll: () => void
   onCreateCharacter: (name: string) => Promise<Character | null>
 }
 
@@ -84,6 +85,7 @@ export function SubtitleGrid({
   onLineChange,
   onAddLine,
   onDeleteLine,
+  onDeleteAll,
   onCreateCharacter,
 }: SubtitleGridProps) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -135,12 +137,22 @@ export function SubtitleGrid({
   // index before any of the batched removals have actually re-rendered).
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      if (e.key !== 'Delete' || selectedRows.size === 0) return
+      if (e.key !== 'Delete') return
       const tag = (e.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
-      e.preventDefault()
-      for (const idx of selectedRows) onDeleteLine(idx)
-      setSelectedRows(new Set())
+      if (selectedRows.size > 0) {
+        e.preventDefault()
+        for (const idx of selectedRows) onDeleteLine(idx)
+        setSelectedRows(new Set())
+        return
+      }
+      // No multi-selection — fall back to whichever single row was last
+      // clicked (a plain click, no Ctrl/Shift, needed), so Del works right
+      // after just clicking a line instead of requiring Ctrl+click first.
+      if (lastClickedRowRef.current != null) {
+        e.preventDefault()
+        onDeleteLine(lastClickedRowRef.current)
+      }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
@@ -420,6 +432,14 @@ export function SubtitleGrid({
           </svg>
           Додати рядок
         </button>
+        {lines.length > 0 && (
+          <button onClick={onDeleteAll} className="rh-btn-ghost text-xs px-2 py-1 hover:text-red-400">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/>
+            </svg>
+            Видалити все
+          </button>
+        )}
         <span className="text-xs text-rh-muted">{lines.length} реплік</span>
         <span className="text-xs text-rh-muted">Оригінальний бітрейт та формат збережено</span>
         <span className="text-xs text-rh-muted ml-auto">автозбереження ✓</span>

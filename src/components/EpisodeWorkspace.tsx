@@ -271,6 +271,15 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     }
   }, [subtitles, backendReady, del])
 
+  const handleDeleteAllSubLines = useCallback(async () => {
+    if (subtitles.length === 0) return
+    if (!window.confirm(`Видалити всі ${subtitles.length} реплік? Це незворотньо.`)) return
+    setSubtitles([])
+    if (backendReady) {
+      await del(`/episodes/${episodeId}/subtitle-lines`).catch(() => {})
+    }
+  }, [subtitles.length, backendReady, del, episodeId])
+
   // Marker handlers
   const handleMarkerConfirm = useCallback(async (id: number) => {
     setMarkers((prev) => prev.map((m) => m.id === id ? { ...m, confirmed: true } : m))
@@ -286,6 +295,15 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     setMarkers((prev) => prev.filter((m) => m.id !== id))
     if (backendReady) await del(`/markers/${id}`).catch(() => {})
   }, [backendReady, del])
+
+  const handleDeleteAllMarkers = useCallback(async () => {
+    if (markers.length === 0) return
+    if (!window.confirm(`Видалити всі ${markers.length} маркерів? Це незворотньо.`)) return
+    setMarkers([])
+    if (backendReady) {
+      await del(`/episodes/${episodeId}/markers`).catch(() => {})
+    }
+  }, [markers.length, backendReady, del, episodeId])
 
   const handleMarkerAdd = useCallback(async (positionSeconds: number, name: string) => {
     const newMarker: Marker = { id: Date.now(), episode_id: episodeId, reaper_name: name, position_seconds: positionSeconds, confirmed: true }
@@ -678,6 +696,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
                 onLineChange={handleSubLineChange}
                 onAddLine={handleAddSubLine}
                 onDeleteLine={handleDeleteSubLine}
+                onDeleteAll={handleDeleteAllSubLines}
                 onCreateCharacter={handleCreateCharacter}
               />
             ) : (
@@ -688,6 +707,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
                 onConfirm={handleMarkerConfirm}
                 onEdit={handleMarkerEdit}
                 onDelete={handleMarkerDelete}
+                onDeleteAll={handleDeleteAllMarkers}
                 onAdd={handleMarkerAdd}
                 onSeek={(t) => videoRef.current?.seek(t)}
               />

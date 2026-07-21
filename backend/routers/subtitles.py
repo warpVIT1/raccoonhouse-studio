@@ -67,6 +67,12 @@ def delete_subtitle_line(line_id: int, db: Session = Depends(get_db)):
     db.commit()
 
 
+@router.delete("/episodes/{ep_id}/subtitle-lines", status_code=204)
+def delete_all_subtitle_lines(ep_id: int, db: Session = Depends(get_db)):
+    db.query(SubtitleLine).filter(SubtitleLine.episode_id == ep_id).delete()
+    db.commit()
+
+
 @router.post("/episodes/{ep_id}/import-ass")
 async def import_ass(ep_id: int, body: AssImportRequest, db: Session = Depends(get_db)):
     ep = db.get(Episode, ep_id)

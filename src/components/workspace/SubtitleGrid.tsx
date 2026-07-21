@@ -73,6 +73,11 @@ interface SubtitleGridProps {
   onAddLine: () => void
   onDeleteLine: (index: number) => void
   onDeleteAll: () => void
+  onUndo: () => void
+  onPasteLines: (
+    items: Array<Pick<SubtitleLine, 'start_ms' | 'end_ms' | 'text' | 'ass_style' | 'character_id' | 'is_overlap'>>,
+    atMs: number
+  ) => void
   onCreateCharacter: (name: string) => Promise<Character | null>
 }
 
@@ -86,6 +91,8 @@ export function SubtitleGrid({
   onAddLine,
   onDeleteLine,
   onDeleteAll,
+  onUndo,
+  onPasteLines,
   onCreateCharacter,
 }: SubtitleGridProps) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -103,6 +110,10 @@ export function SubtitleGrid({
   // assigned to many lines at once instead of one at a time.
   const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set())
   const lastClickedRowRef = useRef<number | null>(null)
+  // Ctrl+C snapshots the selected (or last-clicked) rows' content here;
+  // Ctrl+V re-creates them starting at the current playhead. Kept as a
+  // plain ref (not state) since copying shouldn't trigger a re-render.
+  const clipboardRef = useRef<Array<Pick<SubtitleLine, 'start_ms' | 'end_ms' | 'text' | 'ass_style' | 'character_id' | 'is_overlap'>>>([])
 
   const handleRowClick = useCallback((i: number, e: React.MouseEvent) => {
     if (e.ctrlKey || e.metaKey) {
@@ -137,9 +148,48 @@ export function SubtitleGrid({
   // index before any of the batched removals have actually re-rendered).
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      if (e.key !== 'Delete') return
       const tag = (e.target as HTMLElement)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
+      const isTyping = tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable
+      const ctrl = e.ctrlKey || e.metaKey
+
+      if (ctrl && !isTyping && e.key.toLowerCase() === 'z') {
+        e.preventDefault()
+        onUndo()
+        return
+      }
+
+      if (ctrl && !isTyping && e.key.toLowerCase() === 'c') {
+        const indices = selectedRows.size > 0
+          ? [...selectedRows]
+          : (lastClickedRowRef.current != null ? [lastClickedRowRef.current] : [])
+        if (indices.length > 0) {
+          e.preventDefault()
+          clipboardRef.current = indices
+            .map((i) => lines[i])
+            .filter((l): l is SubtitleLine => !!l)
+            .sort((a, b) => a.start_ms - b.start_ms)
+            .map((l) => ({
+              start_ms: l.start_ms,
+              end_ms: l.end_ms,
+              text: l.text,
+              ass_style: l.ass_style,
+              character_id: l.character_id,
+              is_overlap: l.is_overlap,
+            }))
+        }
+        return
+      }
+
+      if (ctrl && !isTyping && e.key.toLowerCase() === 'v') {
+        if (clipboardRef.current.length > 0) {
+          e.preventDefault()
+          onPasteLines(clipboardRef.current, currentTimeMs)
+        }
+        return
+      }
+
+      if (e.key !== 'Delete') return
+      if (isTyping) return
       if (selectedRows.size > 0) {
         e.preventDefault()
         for (const idx of selectedRows) onDeleteLine(idx)
@@ -156,7 +206,7 @@ export function SubtitleGrid({
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [selectedRows, onDeleteLine])
+  }, [selectedRows, onDeleteLine, onUndo, onPasteLines, currentTimeMs, lines])
 
   // Auto-scroll to active line
   useEffect(() => {

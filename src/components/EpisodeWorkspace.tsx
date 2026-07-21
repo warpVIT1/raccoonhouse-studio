@@ -32,6 +32,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   const [activeSubIndex, setActiveSubIndex] = useState<number | null>(null)
   const [currentTimeMs, setCurrentTimeMs] = useState(0)
   const [duration, setDuration] = useState(0)
+  const subtitlesUndoStackRef = useRef<SubtitleLine[][]>([])
 
   // Video panel is resizable both by width (against the waveform) and by
   // height (against the subtitles/markers grid below) — a fixed size felt
@@ -227,6 +228,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   const handleSubLineChange = useCallback(async (idx: number, changes: Partial<SubtitleLine>) => {
     const line = subtitles[idx]
     if (!line) return
+    subtitlesUndoStackRef.current.push(subtitles)
     const updated = { ...line, ...changes }
     setSubtitles((prev) => {
       const next = [...prev]
@@ -239,6 +241,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   }, [subtitles, backendReady, put])
 
   const handleAddSubLine = useCallback(async () => {
+    subtitlesUndoStackRef.current.push(subtitles)
     const newLine: SubtitleLine = {
       id: Date.now(),
       episode_id: episodeId,
@@ -260,11 +263,12 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     } else {
       setSubtitles((prev) => [...prev, newLine].sort((a, b) => a.start_ms - b.start_ms))
     }
-  }, [episodeId, currentTimeMs, backendReady, post])
+  }, [episodeId, currentTimeMs, backendReady, post, subtitles])
 
   const handleDeleteSubLine = useCallback(async (idx: number) => {
     const line = subtitles[idx]
     if (!line) return
+    subtitlesUndoStackRef.current.push(subtitles)
     setSubtitles((prev) => prev.filter((_, i) => i !== idx))
     if (backendReady) {
       await del(`/subtitle-lines/${line.id}`).catch(() => {})
@@ -274,11 +278,64 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   const handleDeleteAllSubLines = useCallback(async () => {
     if (subtitles.length === 0) return
     if (!window.confirm(`Видалити всі ${subtitles.length} реплік? Це незворотньо.`)) return
+    subtitlesUndoStackRef.current.push(subtitles)
     setSubtitles([])
     if (backendReady) {
       await del(`/episodes/${episodeId}/subtitle-lines`).catch(() => {})
     }
-  }, [subtitles.length, backendReady, del, episodeId])
+  }, [subtitles, backendReady, del, episodeId])
+
+  const handleUndoSubLines = useCallback(async () => {
+    const prev = subtitlesUndoStackRef.current.pop()
+    if (!prev) return
+    setSubtitles(prev)
+    if (backendReady) {
+      const payload = prev.map((l) => ({
+        start_ms: l.start_ms,
+        end_ms: l.end_ms,
+        text: l.text,
+        character_id: l.character_id,
+        ass_style: l.ass_style,
+        is_overlap: l.is_overlap,
+      }))
+      const synced = await put<SubtitleLine[]>(`/episodes/${episodeId}/subtitle-lines`, payload).catch(() => null)
+      if (synced) setSubtitles([...synced].sort((a, b) => a.start_ms - b.start_ms))
+    }
+  }, [backendReady, put, episodeId])
+
+  // Ctrl+V inserts copies of the clipboard lines starting at the current
+  // playhead, preserving whatever time gaps existed between them in the
+  // original copy so multi-line pastes don't collapse onto one timestamp.
+  const handlePasteSubLines = useCallback(async (
+    items: Array<Pick<SubtitleLine, 'start_ms' | 'end_ms' | 'text' | 'ass_style' | 'character_id' | 'is_overlap'>>,
+    atMs: number
+  ) => {
+    if (items.length === 0) return
+    subtitlesUndoStackRef.current.push(subtitles)
+    const baseStart = items[0].start_ms
+    const created: SubtitleLine[] = []
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i]
+      const newStart = atMs + (it.start_ms - baseStart)
+      const body = {
+        start_ms: newStart,
+        end_ms: newStart + (it.end_ms - it.start_ms),
+        text: it.text,
+        ass_style: it.ass_style,
+        character_id: it.character_id,
+        is_overlap: it.is_overlap,
+      }
+      if (backendReady) {
+        const line = await post<SubtitleLine>(`/episodes/${episodeId}/subtitle-lines`, body).catch(
+          () => ({ id: Date.now() + i, episode_id: episodeId, ...body }) as SubtitleLine
+        )
+        created.push(line)
+      } else {
+        created.push({ id: Date.now() + i, episode_id: episodeId, ...body } as SubtitleLine)
+      }
+    }
+    setSubtitles((prev) => [...prev, ...created].sort((a, b) => a.start_ms - b.start_ms))
+  }, [subtitles, backendReady, post, episodeId])
 
   // Marker handlers
   const handleMarkerConfirm = useCallback(async (id: number) => {
@@ -697,6 +754,8 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
                 onAddLine={handleAddSubLine}
                 onDeleteLine={handleDeleteSubLine}
                 onDeleteAll={handleDeleteAllSubLines}
+                onUndo={handleUndoSubLines}
+                onPasteLines={handlePasteSubLines}
                 onCreateCharacter={handleCreateCharacter}
               />
             ) : (

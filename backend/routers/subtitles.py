@@ -73,6 +73,28 @@ def delete_all_subtitle_lines(ep_id: int, db: Session = Depends(get_db)):
     db.commit()
 
 
+@router.put("/episodes/{ep_id}/subtitle-lines", response_model=List[SubtitleLineOut])
+def replace_all_subtitle_lines(ep_id: int, body: List[SubtitleLineCreate], db: Session = Depends(get_db)):
+    """Wholesale-replaces an episode's subtitle lines — used to persist an undo (Ctrl+Z)
+    snapshot restore, since undo doesn't track which individual rows changed."""
+    ep = db.get(Episode, ep_id)
+    if not ep:
+        raise HTTPException(404)
+    db.query(SubtitleLine).filter(SubtitleLine.episode_id == ep_id).delete()
+    db.flush()
+    lines = [SubtitleLine(episode_id=ep_id, **item.model_dump()) for item in body]
+    db.add_all(lines)
+    db.commit()
+    result = []
+    for line in lines:
+        db.refresh(line)
+        out = SubtitleLineOut.model_validate(line)
+        if line.character:
+            out.character_name = line.character.name
+        result.append(out)
+    return result
+
+
 @router.post("/episodes/{ep_id}/import-ass")
 async def import_ass(ep_id: int, body: AssImportRequest, db: Session = Depends(get_db)):
     ep = db.get(Episode, ep_id)

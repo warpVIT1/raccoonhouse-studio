@@ -233,21 +233,21 @@ export function SubtitleGrid({
       setSelectedRows(new Set())
       lastClickedRowRef.current = rowIdx
       onLineClick(rowIdx)
-      // Text is excluded here — a single click just selects/seeks like any
-      // other cell, matching how the rest of the row behaves. Otherwise
-      // clicking a line to select it (which usually lands on the wide text
-      // column) always yanked open the textarea too. Editing text needs an
-      // explicit double-click instead (see onDoubleClick below).
-      if (col === 'start' || col === 'end' || col === 'actor') {
+      // Text and actor edit right away on a single click. Start/end (timing)
+      // are excluded here — a single click there just selects/seeks, so a
+      // quick click doesn't risk nudging a line's timing by accident;
+      // editing timing needs a deliberate double-click instead (see
+      // onDoubleClick below).
+      if (col === 'text' || col === 'actor') {
         setEditingCell({ row: rowIdx, col })
       }
     },
     [onLineClick]
   )
 
-  const handleTextDoubleClick = useCallback((rowIdx: number, e: React.MouseEvent) => {
+  const handleTimeDoubleClick = useCallback((rowIdx: number, col: 'start' | 'end', e: React.MouseEvent) => {
     e.stopPropagation()
-    setEditingCell({ row: rowIdx, col: 'text' })
+    setEditingCell({ row: rowIdx, col })
   }, [])
 
   const commitEdit = useCallback(
@@ -381,6 +381,7 @@ export function SubtitleGrid({
                 <div
                   className="w-28 px-1 py-1"
                   onClick={(e) => handleCellClick(i, 'start', e)}
+                  onDoubleClick={(e) => handleTimeDoubleClick(i, 'start', e)}
                 >
                   {editingCell?.row === i && editingCell.col === 'start' ? (
                     <input
@@ -400,6 +401,7 @@ export function SubtitleGrid({
                 <div
                   className="w-28 px-1 py-1"
                   onClick={(e) => handleCellClick(i, 'end', e)}
+                  onDoubleClick={(e) => handleTimeDoubleClick(i, 'end', e)}
                 >
                   {editingCell?.row === i && editingCell.col === 'end' ? (
                     <input
@@ -455,7 +457,6 @@ export function SubtitleGrid({
                 <div
                   className="flex-1 min-w-0 px-1 py-1"
                   onClick={(e) => handleCellClick(i, 'text', e)}
-                  onDoubleClick={(e) => handleTextDoubleClick(i, e)}
                 >
                   {editingCell?.row === i && editingCell.col === 'text' ? (
                     <textarea

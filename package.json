@@ -1,6 +1,6 @@
 {
   "name": "raccoonhouse-studio",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "RaccoonHouse Anime Dubbing Studio",
   "main": "dist-electron/main.js",
   "scripts": {
@@ -10,7 +10,7 @@
     "publish": "python build-backend.py && npm run build && electron-builder --win --publish always",
     "preview": "vite preview",
     "electron:dev": "concurrently -k \"vite\" \"wait-on tcp:5173 && electron .\"",
-    "dev:full": "concurrently -k -n BACKEND,APP --prefix-colors cyan,green \".venv/Scripts/python backend/run.py\" \"wait-on tcp:8765 && npm run electron:dev\""
+    "dev:full": "concurrently -k -n BACKEND,APP --prefix-colors cyan,green \".venv\\Scripts\\python.exe backend/run.py\" \"wait-on tcp:8765 && npm run electron:dev\""
   },
   "dependencies": {
     "electron-updater": "^6.8.9",

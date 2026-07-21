@@ -84,19 +84,37 @@ def main():
         print("Build failed!", file=sys.stderr)
         sys.exit(1)
 
-    # onnxruntime's CUDA provider DLL got pulled in by --collect-all
-    # onnxruntime (it ships inside the onnxruntime-gpu package alongside the
-    # CPU pieces we DO want) — strip it back out so the installer doesn't
-    # silently balloon back up to the size this whole on-demand-download
-    # scheme exists to avoid. gpu_runtime_service.py downloads this exact
-    # file back into the same location when the user opts into GPU mode.
-    cuda_provider_dll = os.path.join(
+    # onnxruntime-gpu ships its CUDA provider DLL AND a pile of cuBLAS/cuDNN/
+    # cuFFT/cudart/nvrtc/nvJitLink DLLs directly inside onnxruntime/capi/
+    # alongside the CPU pieces we DO want — --collect-all onnxruntime pulls
+    # in all of it. Strip every NVIDIA-runtime DLL back out so the installer
+    # doesn't silently balloon back up to ~2GB (confirmed live 2026-07-21:
+    # deleting only onnxruntime_providers_cuda.dll left cublasLt/cudnn/cufft/
+    # nvrtc etc. behind, still ~2.4GB). gpu_runtime_service.py's
+    # ensure_gpu_provider_placed() hardlinks this exact same set of files
+    # back into this directory when the user opts into GPU mode — match its
+    # file set here, not just the one provider DLL, and match by pattern
+    # (not a fixed filename list) since exact cuDNN/CUDA version suffixes in
+    # these names shift with onnxruntime-gpu version bumps.
+    capi_dir = os.path.join(
         project_root, "backend-dist", "raccoonhouse-backend", "_internal",
-        "onnxruntime", "capi", "onnxruntime_providers_cuda.dll",
+        "onnxruntime", "capi",
     )
-    if os.path.isfile(cuda_provider_dll):
-        os.remove(cuda_provider_dll)
-        print(f"Stripped bundled CUDA provider DLL: {cuda_provider_dll}")
+    NVIDIA_RUNTIME_PATTERNS = (
+        "cublas", "cudnn", "cufft", "cudart", "nvrtc", "nvjitlink", "nvblas",
+        "providers_cuda", "providers_tensorrt",
+    )
+    if os.path.isdir(capi_dir):
+        freed = 0
+        stripped = []
+        for name in os.listdir(capi_dir):
+            if any(p in name.lower() for p in NVIDIA_RUNTIME_PATTERNS):
+                path = os.path.join(capi_dir, name)
+                freed += os.path.getsize(path)
+                os.remove(path)
+                stripped.append(name)
+        if stripped:
+            print(f"Stripped {len(stripped)} bundled NVIDIA runtime DLLs ({freed / 1e9:.2f} GB): {', '.join(stripped)}")
 
     print("Backend built successfully: backend-dist/raccoonhouse-backend/raccoonhouse-backend.exe")
 

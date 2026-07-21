@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, shell, Menu } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
@@ -278,6 +278,12 @@ app.on('activate', () => {
 })
 
 app.whenReady().then(() => {
+  // The app has its own custom title bar (frame: false) and no menu bar is
+  // ever shown — but Electron's default application menu is still created
+  // otherwise, and its Edit role (Undo/Copy/Paste bound to Ctrl+Z/C/V) eats
+  // those accelerators before they reach the renderer's own keydown
+  // handlers, silently breaking the subtitle grid's undo/copy/paste.
+  Menu.setApplicationMenu(null)
   startBackend()
   createWindow()
   initAutoUpdater()

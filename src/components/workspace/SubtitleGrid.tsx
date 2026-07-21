@@ -71,7 +71,7 @@ interface SubtitleGridProps {
   onLineClick: (index: number) => void
   onLineChange: (index: number, changes: Partial<SubtitleLine>) => void
   onAddLine: () => void
-  onDeleteLine: (index: number) => void
+  onDeleteLine: (id: number) => void
   onDeleteAll: () => void
   onUndo: () => void
   onPasteLines: (
@@ -141,11 +141,10 @@ export function SubtitleGrid({
 
   // Delete key removes every multi-selected row without needing the per-row
   // trash button — ignored while typing (editing a cell, the actor
-  // dropdown...) so it doesn't hijack normal text editing. Indices are read
-  // from the same `lines` snapshot this closure already has, so deleting
-  // several at once composes correctly (see handleDeleteSubLine in
-  // EpisodeWorkspace.tsx — each call resolves its own line by the ORIGINAL
-  // index before any of the batched removals have actually re-rendered).
+  // dropdown...) so it doesn't hijack normal text editing. Deletion is
+  // dispatched by line id (resolved from the current `lines` snapshot),
+  // not array index — index-based batched removal drifts as each earlier
+  // deletion shifts everyone after it.
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       const tag = (e.target as HTMLElement)?.tagName
@@ -192,7 +191,12 @@ export function SubtitleGrid({
       if (isTyping) return
       if (selectedRows.size > 0) {
         e.preventDefault()
-        for (const idx of selectedRows) onDeleteLine(idx)
+        // Delete by id, not index — deleting several rows in one batch must
+        // not drift as earlier removals shift everyone after them.
+        for (const idx of selectedRows) {
+          const line = lines[idx]
+          if (line) onDeleteLine(line.id)
+        }
         setSelectedRows(new Set())
         return
       }
@@ -200,8 +204,11 @@ export function SubtitleGrid({
       // clicked (a plain click, no Ctrl/Shift, needed), so Del works right
       // after just clicking a line instead of requiring Ctrl+click first.
       if (lastClickedRowRef.current != null) {
-        e.preventDefault()
-        onDeleteLine(lastClickedRowRef.current)
+        const line = lines[lastClickedRowRef.current]
+        if (line) {
+          e.preventDefault()
+          onDeleteLine(line.id)
+        }
       }
     }
     window.addEventListener('keydown', onKeyDown)
@@ -226,12 +233,22 @@ export function SubtitleGrid({
       setSelectedRows(new Set())
       lastClickedRowRef.current = rowIdx
       onLineClick(rowIdx)
-      if (col === 'text' || col === 'start' || col === 'end' || col === 'actor') {
+      // Text is excluded here — a single click just selects/seeks like any
+      // other cell, matching how the rest of the row behaves. Otherwise
+      // clicking a line to select it (which usually lands on the wide text
+      // column) always yanked open the textarea too. Editing text needs an
+      // explicit double-click instead (see onDoubleClick below).
+      if (col === 'start' || col === 'end' || col === 'actor') {
         setEditingCell({ row: rowIdx, col })
       }
     },
     [onLineClick]
   )
+
+  const handleTextDoubleClick = useCallback((rowIdx: number, e: React.MouseEvent) => {
+    e.stopPropagation()
+    setEditingCell({ row: rowIdx, col: 'text' })
+  }, [])
 
   const commitEdit = useCallback(
     (rowIdx: number, col: string, value: string) => {
@@ -350,7 +367,7 @@ export function SubtitleGrid({
                 key={line.id}
                 data-row={i}
                 onClick={(e) => handleRowClick(i, e)}
-                className={`flex items-center border-b border-rh-border/50 px-2 cursor-pointer sub-row
+                className={`group flex items-center border-b border-rh-border/50 px-2 cursor-pointer sub-row
                   ${isActive ? 'active' : ''}
                   ${isCurrent && !isActive ? 'bg-white/[0.02]' : ''}
                   ${line.is_overlap ? 'border-l-2 border-l-violet-500' : ''}
@@ -438,6 +455,7 @@ export function SubtitleGrid({
                 <div
                   className="flex-1 min-w-0 px-1 py-1"
                   onClick={(e) => handleCellClick(i, 'text', e)}
+                  onDoubleClick={(e) => handleTextDoubleClick(i, e)}
                 >
                   {editingCell?.row === i && editingCell.col === 'text' ? (
                     <textarea
@@ -459,7 +477,7 @@ export function SubtitleGrid({
                 {/* Delete */}
                 <div className="w-8 flex-shrink-0 flex justify-center" onClick={(e) => e.stopPropagation()}>
                   <button
-                    onClick={() => onDeleteLine(i)}
+                    onClick={() => onDeleteLine(line.id)}
                     className="w-6 h-6 flex items-center justify-center rounded text-rh-muted hover:text-red-400 hover:bg-red-400/10 opacity-0 group-hover:opacity-100 transition-all"
                     title="Видалити"
                   >

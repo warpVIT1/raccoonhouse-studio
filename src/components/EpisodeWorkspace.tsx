@@ -265,13 +265,17 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     }
   }, [episodeId, currentTimeMs, backendReady, post, subtitles])
 
-  const handleDeleteSubLine = useCallback(async (idx: number) => {
-    const line = subtitles[idx]
+  const handleDeleteSubLine = useCallback(async (id: number) => {
+    const line = subtitles.find((l) => l.id === id)
     if (!line) return
     subtitlesUndoStackRef.current.push(subtitles)
-    setSubtitles((prev) => prev.filter((_, i) => i !== idx))
+    // Filtering by id (not array index) so deleting several lines in one
+    // batch — e.g. multi-select + Del — can't drift: each call here is
+    // independent of how many others already ran, unlike index-based
+    // filtering where every prior removal shifts everyone after it.
+    setSubtitles((prev) => prev.filter((l) => l.id !== id))
     if (backendReady) {
-      await del(`/subtitle-lines/${line.id}`).catch(() => {})
+      await del(`/subtitle-lines/${id}`).catch(() => {})
     }
   }, [subtitles, backendReady, del])
 

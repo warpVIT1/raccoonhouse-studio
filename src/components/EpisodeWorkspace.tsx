@@ -412,12 +412,24 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   }
 
   // Final render: mux the episode's own instrumental (vocal already removed
-  // by separation) against the original video — one click, no external file.
+  // by separation) against the original video — asks where to save first
+  // (native folder dialog), then renders there; falls back to the episode's
+  // own data-dir folder if the dialog isn't available (dev/non-Electron) or
+  // the user just confirms without picking a different one isn't offered —
+  // cancelling the dialog aborts the render entirely rather than silently
+  // falling back, so a cancel reads as "changed my mind", not "render here".
   async function handleRender() {
     if (!backendReady) return
+    let outputDir: string | null = null
+    if (window.electronAPI?.openDirectory) {
+      outputDir = await window.electronAPI.openDirectory()
+      if (!outputDir) return
+    }
     setRendering(true)
     try {
-      const result = await post<{ job_id: string }>(`/episodes/${episodeId}/mux-audio`)
+      const result = await post<{ job_id: string }>(`/episodes/${episodeId}/mux-audio`, {
+        output_dir: outputDir,
+      })
       upsertJob({
         id: result.job_id,
         type: 'mux_audio',

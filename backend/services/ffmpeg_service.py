@@ -10,6 +10,7 @@ import os
 import subprocess
 import json
 import shutil
+from typing import Optional
 from pathlib import Path
 from sqlalchemy.orm import Session
 
@@ -190,12 +191,13 @@ def run_mux_pipeline(
     original_video_path: str,
     mixed_audio_path: str,
     reporter: ProgressReporter,
+    output_dir: Optional[str] = None,
 ) -> dict:
     """Mux rendered audio against original video, keeping video stream untouched.
     Opens its own DB session — see run_import_pipeline's docstring for why."""
     db = SessionLocal()
     try:
-        return _run_mux_pipeline(episode_id, original_video_path, mixed_audio_path, reporter, db)
+        return _run_mux_pipeline(episode_id, original_video_path, mixed_audio_path, reporter, db, output_dir)
     finally:
         db.close()
 
@@ -206,13 +208,16 @@ def _run_mux_pipeline(
     mixed_audio_path: str,
     reporter: ProgressReporter,
     db: Session,
+    output_dir: Optional[str] = None,
 ) -> dict:
     ep = db.get(Episode, episode_id)
     if not ep:
         raise ValueError(f"Episode {episode_id} not found")
 
-    ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
-    ep_dir.mkdir(parents=True, exist_ok=True)
+    # User-picked destination (native folder dialog) if given, otherwise the
+    # episode's own data-dir folder as before.
+    out_dir = Path(output_dir) if output_dir else Path(DATA_DIR) / "episodes" / str(episode_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     reporter.update(5, "ffmpeg: аналіз оригінального відео…")
     probe = _probe(original_video_path)
@@ -225,7 +230,7 @@ def _run_mux_pipeline(
     reporter.update(15, "ffmpeg: мультиплексую фінальне відео…")
 
     out_name = Path(original_video_path).stem + "_dub" + Path(original_video_path).suffix
-    out_path = str(ep_dir / out_name)
+    out_path = str(out_dir / out_name)
 
     cmd = [
         _ffmpeg_bin(), "-y",

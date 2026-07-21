@@ -192,7 +192,7 @@ async def detect_markers(ep_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/episodes/{ep_id}/mux-audio")
-async def mux_audio(ep_id: int, db: Session = Depends(get_db)):
+async def mux_audio(ep_id: int, request: Request, db: Session = Depends(get_db)):
     ep = db.get(Episode, ep_id)
     if not ep:
         raise HTTPException(404)
@@ -204,13 +204,22 @@ async def mux_audio(ep_id: int, db: Session = Depends(get_db)):
     if not mixed_audio_path or not os.path.isfile(mixed_audio_path):
         raise HTTPException(400, "Інструментал не знайдено — виконайте ізоляцію вокалу спочатку")
 
+    # Optional output_dir (user-picked via the native folder dialog) — falls
+    # back to the episode's own data-dir folder if omitted, same as before.
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    output_dir = body.get("output_dir")
+
     job = job_manager.create_job("mux_audio", episode_id=ep_id)
 
     from ..services.ffmpeg_service import run_mux_pipeline
     loop = asyncio.get_event_loop()
     original_file_path = ep.original_file_path
     asyncio.create_task(
-        job_manager.run_job(loop, job, lambda r: run_mux_pipeline(ep_id, original_file_path, mixed_audio_path, r))
+        job_manager.run_job(loop, job, lambda r: run_mux_pipeline(ep_id, original_file_path, mixed_audio_path, r, output_dir))
     )
 
     return {"job_id": job.id}

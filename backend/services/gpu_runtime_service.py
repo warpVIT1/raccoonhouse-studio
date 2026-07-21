@@ -30,16 +30,22 @@ DATA_DIR = os.environ.get("RH_DATA_DIR", os.path.join(os.path.expanduser("~"), "
 GPU_RUNTIME_DIR = Path(DATA_DIR) / "gpu-runtime"
 GPU_RUNTIME_MARKER = GPU_RUNTIME_DIR / ".installed"
 
-# The archive holding onnxruntime_providers_cuda.dll + cublas/cudnn/cufft/
+# The archives holding onnxruntime_providers_cuda.dll + cublas/cudnn/cufft/
 # cudart DLLs, flat (no subfolders) — built from the same nvidia-*-cu12 pip
-# packages + onnxruntime-gpu used in dev (see requirements.txt). Needs to
-# actually be uploaded somewhere (e.g. a GitHub Release asset — a separate
-# asset isn't subject to the 2GB per-*installer* constraint the way a single
-# bundled exe would be) before this URL resolves to anything real.
-GPU_RUNTIME_URL = os.environ.get(
-    "RH_GPU_RUNTIME_URL",
-    "https://github.com/warpVIT1/raccoonhouse-studio/releases/download/gpu-runtime-v1/cuda-runtime-win64.zip",
-)
+# packages + onnxruntime-gpu used in dev (see requirements.txt). Hosted as a
+# dedicated pre-release (tag gpu-runtime-v1, NOT an app version — see its own
+# release notes) rather than bundled anywhere. Split into two parts: the
+# combined raw size (~3.0GB) exceeds GitHub's 2GiB *per-asset* limit — that
+# limit applies to every individual release asset, not just a packaged
+# installer, so one zip wouldn't have worked regardless of which release
+# it was attached to. Re-verify these are still the current URLs if the
+# libraries are ever rebuilt/re-uploaded (e.g. a version bump makes the old
+# tag's assets stale).
+GPU_RUNTIME_URLS = os.environ.get(
+    "RH_GPU_RUNTIME_URLS",
+    "https://github.com/warpVIT1/raccoonhouse-studio/releases/download/gpu-runtime-v1/cuda-runtime-part1.zip,"
+    "https://github.com/warpVIT1/raccoonhouse-studio/releases/download/gpu-runtime-v1/cuda-runtime-part2.zip",
+).split(",")
 
 
 def has_nvidia_gpu() -> bool:
@@ -92,32 +98,36 @@ def install_gpu_runtime(on_progress=None) -> None:
             on_progress(pct, msg)
 
     GPU_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    zip_path = GPU_RUNTIME_DIR / "cuda-runtime.zip"
+    n = len(GPU_RUNTIME_URLS)
+    for i, url in enumerate(GPU_RUNTIME_URLS):
+        base = int(i / n * 78)
+        span = 78 // n
+        zip_path = GPU_RUNTIME_DIR / os.path.basename(url)
 
-    progress(2, "Завантаження бібліотек CUDA…")
-    request = Request(GPU_RUNTIME_URL, headers={"User-Agent": "RaccoonHouse-Studio"})
-    with urlopen(request, timeout=30) as resp:
-        total = int(resp.headers.get("Content-Length", 0)) or 1
-        downloaded = 0
-        with open(zip_path, "wb") as f:
-            while True:
-                chunk = resp.read(4 * 1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                progress(2 + int(downloaded / total * 78), "Завантаження бібліотек CUDA…")
+        progress(base + 2, "Завантаження бібліотек CUDA…")
+        request = Request(url, headers={"User-Agent": "RaccoonHouse-Studio"})
+        with urlopen(request, timeout=30) as resp:
+            total = int(resp.headers.get("Content-Length", 0)) or 1
+            downloaded = 0
+            with open(zip_path, "wb") as f:
+                while True:
+                    chunk = resp.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    progress(base + 2 + int(downloaded / total * span), "Завантаження бібліотек CUDA…")
 
-    progress(82, "Розпакування…")
-    with zipfile.ZipFile(zip_path) as zf:
-        for name in zf.namelist():
-            filename = os.path.basename(name)
-            if not filename:  # directory entry
-                continue
-            with zf.open(name) as src, open(GPU_RUNTIME_DIR / filename, "wb") as dst:
-                shutil.copyfileobj(src, dst)
+        progress(base + span, "Розпакування…")
+        with zipfile.ZipFile(zip_path) as zf:
+            for name in zf.namelist():
+                filename = os.path.basename(name)
+                if not filename:  # directory entry
+                    continue
+                with zf.open(name) as src, open(GPU_RUNTIME_DIR / filename, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+        zip_path.unlink(missing_ok=True)
 
-    zip_path.unlink(missing_ok=True)
     GPU_RUNTIME_MARKER.write_text("ok")
 
     progress(95, "Підключення бібліотек…")

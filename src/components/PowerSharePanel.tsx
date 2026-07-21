@@ -34,10 +34,14 @@ interface PowerSharePanelProps {
   manualPeerHost: string | null
   manualPeerPort: number
   onSaveManualPeer: (host: string | null, port: number) => void
+  onlineSignalingEnabled: boolean
+  onlineSignalingUrl: string | null
+  onSaveOnlineSignaling: (enabled: boolean, url: string | null) => void
 }
 
 export function PowerSharePanel({
   powerShareEnabled, onToggle, manualPeerHost, manualPeerPort, onSaveManualPeer,
+  onlineSignalingEnabled, onlineSignalingUrl, onSaveOnlineSignaling,
 }: PowerSharePanelProps) {
   const { get } = useApi()
   const [tab, setTab] = useState<'devices' | 'overview'>('devices')
@@ -109,6 +113,9 @@ export function PowerSharePanel({
           manualPeerHost={manualPeerHost}
           manualPeerPort={manualPeerPort}
           onSaveManualPeer={onSaveManualPeer}
+          onlineSignalingEnabled={onlineSignalingEnabled}
+          onlineSignalingUrl={onlineSignalingUrl}
+          onSaveOnlineSignaling={onSaveOnlineSignaling}
         />
       ) : (
         <PowerChart overview={overview} />
@@ -122,11 +129,19 @@ interface DevicesListProps {
   manualPeerHost: string | null
   manualPeerPort: number
   onSaveManualPeer: (host: string | null, port: number) => void
+  onlineSignalingEnabled: boolean
+  onlineSignalingUrl: string | null
+  onSaveOnlineSignaling: (enabled: boolean, url: string | null) => void
 }
-function DevicesList({ overview, manualPeerHost, manualPeerPort, onSaveManualPeer }: DevicesListProps) {
+function DevicesList({
+  overview, manualPeerHost, manualPeerPort, onSaveManualPeer,
+  onlineSignalingEnabled, onlineSignalingUrl, onSaveOnlineSignaling,
+}: DevicesListProps) {
   const [editingManual, setEditingManual] = useState(false)
   const [host, setHost] = useState(manualPeerHost ?? '')
   const [port, setPort] = useState(manualPeerPort)
+  const [editingOnline, setEditingOnline] = useState(false)
+  const [onlineUrl, setOnlineUrl] = useState(onlineSignalingUrl ?? '')
 
   return (
     <div className="p-4 flex flex-col gap-2.5">
@@ -201,6 +216,54 @@ function DevicesList({ overview, manualPeerHost, manualPeerPort, onSaveManualPee
         ) : (
           <button onClick={() => setEditingManual(true)} className="rh-btn-outline w-full">
             + Підключитися напряму за IP
+          </button>
+        )}
+      </div>
+
+      <div className="border-t border-rh-border pt-3 mt-1">
+        {editingOnline ? (
+          <div className="flex flex-col gap-2">
+            <p className="text-[10.5px] text-rh-text-dim">
+              Адреса сервера сигналізації (wss://) — див. cloudflare-signaling/README.md
+              для розгортання власного.
+            </p>
+            <input
+              className="rh-input"
+              placeholder="wss://raccoonhouse-signaling.your-subdomain.workers.dev/"
+              value={onlineUrl}
+              onChange={(e) => setOnlineUrl(e.target.value)}
+              autoFocus
+            />
+            <div className="flex gap-2 justify-end">
+              <button onClick={() => setEditingOnline(false)} className="rh-btn-ghost">Скасувати</button>
+              <button
+                onClick={() => {
+                  const trimmed = onlineUrl.trim() || null
+                  onSaveOnlineSignaling(!!trimmed, trimmed)
+                  setEditingOnline(false)
+                }}
+                className="rh-btn-primary"
+              >
+                Зберегти
+              </button>
+            </div>
+          </div>
+        ) : onlineSignalingUrl ? (
+          <div className="flex items-center gap-2.5 rounded-lg border border-rh-border px-3 py-2">
+            <span className={`w-2 h-2 rounded-full flex-shrink-0 ${onlineSignalingEnabled ? 'bg-emerald-400' : 'bg-zinc-600'}`} />
+            <span className="text-xs font-medium flex-1 truncate">Онлайн: {onlineSignalingUrl}</span>
+            <button
+              onClick={() => onSaveOnlineSignaling(!onlineSignalingEnabled, onlineSignalingUrl)}
+              className="rh-btn-ghost text-[11px] px-2 py-1"
+            >
+              {onlineSignalingEnabled ? 'Вимкнути' : 'Увімкнути'}
+            </button>
+            <button onClick={() => setEditingOnline(true)} className="rh-btn-ghost text-[11px] px-2 py-1">Змінити</button>
+            <button onClick={() => onSaveOnlineSignaling(false, null)} className="text-rh-muted hover:text-red-400 text-xs px-1">✕</button>
+          </div>
+        ) : (
+          <button onClick={() => setEditingOnline(true)} className="rh-btn-outline w-full">
+            + Підключити онлайн (через інтернет)
           </button>
         )}
       </div>

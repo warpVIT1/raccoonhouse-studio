@@ -210,6 +210,8 @@ class AppSettingsOut(BaseModel):
     power_share_enabled: bool = False
     manual_peer_host: Optional[str] = None
     manual_peer_port: int = 8765
+    online_signaling_enabled: bool = False
+    online_signaling_url: Optional[str] = None
     gpu_enabled: bool = False
     # Read-only, computed — not stored, just reported for the Settings UI to
     # decide what to show (hide the toggle entirely with no NVIDIA GPU;
@@ -231,6 +233,8 @@ class AppSettingsUpdate(BaseModel):
     power_share_enabled: Optional[bool] = None
     manual_peer_host: Optional[str] = None
     manual_peer_port: Optional[int] = None
+    online_signaling_enabled: Optional[bool] = None
+    online_signaling_url: Optional[str] = None
     gpu_enabled: Optional[bool] = None
 
 

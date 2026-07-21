@@ -1,5 +1,5 @@
 """
-Peer discovery for power-sharing, two ways:
+Peer discovery for power-sharing, three ways:
   1. Automatic LAN discovery — every instance periodically broadcasts a UDP
      announcement and listens for others'. Works out of the box on a real LAN.
   2. Manual direct-connect fallback — for two PCs that AREN'T on the same LAN
@@ -8,6 +8,13 @@ Peer discovery for power-sharing, two ways:
      the way a real LAN switch does. One side pins the other's address in
      Settings; a plain HTTP poll (not UDP) merges it into the same registry
      as if it had been broadcast-discovered.
+  3. Online signaling — for two PCs with no LAN/VPN-mesh path between them at
+     all. A small Cloudflare Worker (see cloudflare-signaling/) tracks who's
+     currently connected and each one's public IP (which it learns from the
+     connection itself — no self-IP-detection needed client-side) and pushes
+     the live peer list over a persistent WebSocket. The actual separation
+     job's file upload still goes directly PC-to-PC over plain HTTP; the
+     Worker only ever sees "who's online" plus tiny consent messages.
 """
 import json
 import socket
@@ -16,11 +23,15 @@ import time
 import uuid
 
 import requests
+from websockets.sync.client import connect as ws_connect
+from websockets.exceptions import WebSocketException
 
 from .gpu_service import get_gpu_info
 from .power_share_service import power_logger, peer_base_url
 
 MANUAL_POLL_INTERVAL_SECONDS = 3
+ONLINE_SIGNALING_HEARTBEAT_SECONDS = 5
+ONLINE_SIGNALING_RECONNECT_SECONDS = 5
 
 DISCOVERY_PORT = 48765
 BROADCAST_INTERVAL_SECONDS = 3
@@ -40,6 +51,7 @@ _started = False
 
 _state_provider = None  # callable returning current (name, power_share_enabled, logged_in)
 _manual_peer_provider = None  # callable returning current (host, port) or (None, None)
+_online_signaling_provider = None  # callable returning current (enabled, url)
 
 
 def set_state_provider(fn):
@@ -53,6 +65,13 @@ def set_manual_peer_provider(fn):
     configured in Settings, or (None, _) if none is set."""
     global _manual_peer_provider
     _manual_peer_provider = fn
+
+
+def set_online_signaling_provider(fn):
+    """fn() -> (enabled: bool, url: str | None) — the signaling Worker's
+    wss:// URL configured in Settings, or (False, None) if not set up."""
+    global _online_signaling_provider
+    _online_signaling_provider = fn
 
 
 def get_discovered_peers() -> list[dict]:
@@ -73,6 +92,7 @@ def start(backend_port: int):
     threading.Thread(target=_broadcast_loop, args=(backend_port, gpu), daemon=True).start()
     threading.Thread(target=_listen_loop, args=(backend_port,), daemon=True).start()
     threading.Thread(target=_manual_peer_poll_loop, daemon=True).start()
+    threading.Thread(target=_online_signaling_loop, args=(backend_port, gpu), daemon=True).start()
     power_logger.info("Discovery started id=%s (gpu=%s, %.1f GB)", _instance_id[:8], gpu["name"], gpu["vram_gb"])
 
 
@@ -171,3 +191,92 @@ def _listen_loop(backend_port: int):
                 power_logger.info("Discovered peer host=%s port=%s name=%s", host, port, msg.get("name"))
         except Exception:
             pass
+
+
+def _online_signaling_loop(backend_port: int, gpu: dict):
+    """Keeps one persistent WebSocket open to the signaling Worker (if
+    configured), re-sending "hello" on a short interval — both a keepalive
+    and what makes the Worker rebroadcast the full peer list on a schedule,
+    since without SOME periodic refresh, an online peer with nothing new to
+    report would never touch every other client's `last_seen` for it and
+    would incorrectly age out via STALE_AFTER_SECONDS despite still being
+    connected. Runs forever in its own thread; reconnects on any drop."""
+    own_id: str | None = None
+    while True:
+        enabled, url = _online_signaling_provider() if _online_signaling_provider else (False, None)
+        if not enabled or not url:
+            _prune_online_peers()
+            time.sleep(ONLINE_SIGNALING_RECONNECT_SECONDS)
+            continue
+
+        try:
+            with ws_connect(url, open_timeout=10) as ws:
+                power_logger.info("Online signaling connected url=%s", url)
+
+                def send_hello():
+                    name, power_share_enabled, logged_in = (
+                        _state_provider() if _state_provider else ("?", False, False)
+                    )
+                    ws.send(json.dumps({
+                        "type": "hello",
+                        "port": backend_port,
+                        "name": name,
+                        "power_share_enabled": power_share_enabled,
+                        "logged_in": logged_in,
+                        "gpu_name": gpu["name"],
+                        "vram_gb": gpu["vram_gb"],
+                    }))
+
+                send_hello()
+                last_heartbeat = time.monotonic()
+                while True:
+                    if time.monotonic() - last_heartbeat >= ONLINE_SIGNALING_HEARTBEAT_SECONDS:
+                        send_hello()
+                        last_heartbeat = time.monotonic()
+                    try:
+                        raw = ws.recv(timeout=ONLINE_SIGNALING_HEARTBEAT_SECONDS)
+                    except TimeoutError:
+                        continue
+                    msg = json.loads(raw)
+
+                    if msg.get("type") == "welcome":
+                        own_id = msg.get("your_id")
+                        continue
+
+                    if msg.get("type") == "peers":
+                        now = time.time()
+                        with _registry_lock:
+                            for peer in msg.get("peers", []):
+                                if peer.get("id") == own_id:
+                                    continue
+                                _registry[f"online:{peer['id']}"] = {
+                                    "host": peer["host"],
+                                    "port": peer["port"],
+                                    "name": peer.get("name", "?"),
+                                    "power_share_enabled": bool(peer.get("power_share_enabled")),
+                                    "logged_in": bool(peer.get("logged_in")),
+                                    "gpu_name": peer.get("gpu_name", "Невідома відеокарта"),
+                                    "vram_gb": peer.get("vram_gb", 0.0),
+                                    "last_seen": now,
+                                }
+                            # An "online:" entry not in THIS broadcast means
+                            # that peer disconnected — drop it immediately
+                            # rather than waiting out STALE_AFTER_SECONDS.
+                            current_ids = {f"online:{p['id']}" for p in msg.get("peers", []) if p.get("id") != own_id}
+                            for key in [k for k in _registry if k.startswith("online:") and k not in current_ids]:
+                                del _registry[key]
+                        continue
+        except (WebSocketException, OSError, TimeoutError) as exc:
+            power_logger.info("Online signaling disconnected url=%s error=%s", url, exc)
+            _prune_online_peers()
+        except Exception:
+            power_logger.exception("Online signaling loop crashed unexpectedly")
+            _prune_online_peers()
+
+        time.sleep(ONLINE_SIGNALING_RECONNECT_SECONDS)
+
+
+def _prune_online_peers():
+    with _registry_lock:
+        for key in [k for k in _registry if k.startswith("online:")]:
+            del _registry[key]

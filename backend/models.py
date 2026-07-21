@@ -143,6 +143,14 @@ class AppSettings(Base):
     # like Hamachi/Radmin) — one pinned "connect directly to this PC" address.
     manual_peer_host: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     manual_peer_port: Mapped[int] = mapped_column(Integer, nullable=False, default=8765)
+    # Third discovery channel, for two PCs with no LAN/VPN-mesh path between
+    # them at all — a small Cloudflare Worker (cloudflare-signaling/) that
+    # only ever sees "who's online and at what public IP" plus tiny consent
+    # messages; the actual separation job's file upload still goes directly
+    # PC-to-PC over plain HTTP (see power_share_service.py). Off by default —
+    # empty URL means nobody has deployed/configured a signaling server yet.
+    online_signaling_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    online_signaling_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
 
 
 class Profile(Base):

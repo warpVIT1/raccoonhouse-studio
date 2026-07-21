@@ -1,0 +1,19 @@
+{
+  "name": "raccoonhouse-signaling",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PEER_REGISTRY",
+        "class_name": "PeerRegistry"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["PeerRegistry"]
+    }
+  ]
+}

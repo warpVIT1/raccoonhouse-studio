@@ -84,12 +84,24 @@ def _manual_peer_config():
         db.close()
 
 
+def _online_signaling_config():
+    db = SessionLocal()
+    try:
+        s = db.get(AppSettings, 1)
+        if not s or not s.online_signaling_enabled or not s.online_signaling_url:
+            return False, None
+        return True, s.online_signaling_url
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     job_manager.set_broadcast(broadcast)
     discovery_service.set_state_provider(_discovery_state)
     discovery_service.set_manual_peer_provider(_manual_peer_config)
+    discovery_service.set_online_signaling_provider(_online_signaling_config)
     discovery_service.start(int(os.environ.get("RH_BACKEND_PORT", "8765")))
     yield
 

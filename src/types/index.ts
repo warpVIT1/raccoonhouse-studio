@@ -113,6 +113,8 @@ export interface AppSettings {
   power_share_enabled: boolean
   manual_peer_host: string | null
   manual_peer_port: number
+  online_signaling_enabled: boolean
+  online_signaling_url: string | null
   gpu_enabled: boolean
   gpu_available: boolean
   gpu_runtime_installed: boolean

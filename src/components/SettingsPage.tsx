@@ -17,6 +17,8 @@ const EMPTY_SETTINGS: AppSettings = {
   power_share_enabled: false,
   manual_peer_host: null,
   manual_peer_port: 8765,
+  online_signaling_enabled: false,
+  online_signaling_url: null,
   gpu_enabled: false,
   gpu_available: false,
   gpu_runtime_installed: false,
@@ -248,6 +250,9 @@ export function SettingsPage() {
         manualPeerHost={settings.manual_peer_host}
         manualPeerPort={settings.manual_peer_port}
         onSaveManualPeer={(host, port) => save({ manual_peer_host: host, manual_peer_port: port })}
+        onlineSignalingEnabled={settings.online_signaling_enabled}
+        onlineSignalingUrl={settings.online_signaling_url}
+        onSaveOnlineSignaling={(enabled, url) => save({ online_signaling_enabled: enabled, online_signaling_url: url })}
       />
       <UpdatePanel />
     </main>

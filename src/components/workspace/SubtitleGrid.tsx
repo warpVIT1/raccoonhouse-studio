@@ -115,7 +115,12 @@ export function SubtitleGrid({
   // plain ref (not state) since copying shouldn't trigger a re-render.
   const clipboardRef = useRef<Array<Pick<SubtitleLine, 'start_ms' | 'end_ms' | 'text' | 'ass_style' | 'character_id' | 'is_overlap'>>>([])
 
-  const handleRowClick = useCallback((i: number, e: React.MouseEvent) => {
+  // Shared by both the row's own onClick AND each cell's onClick (start/end/
+  // actor/text) — Ctrl/Shift+click needs to toggle/range-select no matter
+  // which part of the row was actually clicked, since the Text column alone
+  // covers most of a row's width. Returns true when the click was consumed
+  // as a selection modifier (so the caller shouldn't also open an editor).
+  const handleSelectionClick = useCallback((i: number, e: React.MouseEvent): boolean => {
     if (e.ctrlKey || e.metaKey) {
       setSelectedRows((prev) => {
         const next = new Set(prev)
@@ -124,7 +129,7 @@ export function SubtitleGrid({
         return next
       })
       lastClickedRowRef.current = i
-      return
+      return true
     }
     if (e.shiftKey && lastClickedRowRef.current != null) {
       const from = Math.min(lastClickedRowRef.current, i)
@@ -132,12 +137,17 @@ export function SubtitleGrid({
       const range = new Set<number>()
       for (let r = from; r <= to; r++) range.add(r)
       setSelectedRows(range)
-      return
+      return true
     }
     setSelectedRows(new Set())
     lastClickedRowRef.current = i
     onLineClick(i)
+    return false
   }, [onLineClick])
+
+  const handleRowClick = useCallback((i: number, e: React.MouseEvent) => {
+    handleSelectionClick(i, e)
+  }, [handleSelectionClick])
 
   // Delete key removes every multi-selected row without needing the per-row
   // trash button — ignored while typing (editing a cell, the actor
@@ -225,14 +235,12 @@ export function SubtitleGrid({
   const handleCellClick = useCallback(
     (rowIdx: number, col: string, e: React.MouseEvent) => {
       e.stopPropagation()
-      // A plain click into a cell (to edit/navigate) always clears any
-      // multi-row selection first — otherwise the stale selection from an
-      // earlier Ctrl/Shift click lingers, and assigning an actor here
-      // silently applies to that whole old selection instead of just this
-      // line, which looks like "it picks the wrong lines".
-      setSelectedRows(new Set())
-      lastClickedRowRef.current = rowIdx
-      onLineClick(rowIdx)
+      // Ctrl/Shift+click here must behave exactly like clicking the row's
+      // background — toggle/range-select — instead of opening an editor.
+      // A plain click still clears selection, seeks, and (for text/actor)
+      // opens the editor right away.
+      const wasModifierClick = handleSelectionClick(rowIdx, e)
+      if (wasModifierClick) return
       // Text and actor edit right away on a single click. Start/end (timing)
       // are excluded here — a single click there just selects/seeks, so a
       // quick click doesn't risk nudging a line's timing by accident;
@@ -242,7 +250,7 @@ export function SubtitleGrid({
         setEditingCell({ row: rowIdx, col })
       }
     },
-    [onLineClick]
+    [handleSelectionClick]
   )
 
   const handleTimeDoubleClick = useCallback((rowIdx: number, col: 'start' | 'end', e: React.MouseEvent) => {

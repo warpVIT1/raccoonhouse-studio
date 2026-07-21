@@ -132,7 +132,12 @@ class AppSettings(Base):
     position_format: Mapped[str] = mapped_column(String(16), nullable=False, default="time")  # time | bars_beats
     default_bpm: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     active_profile_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("profiles.id"), nullable=True)
-    power_share_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # This is a private app for a closed group, not a public release — the
+    # whole point of Power Share is that everyone who has it is already
+    # part of the same trusted circle, so both this and online_signaling_*
+    # below default to already-connected rather than requiring an opt-in
+    # step per machine.
+    power_share_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     # GPU acceleration is opt-in and off by default — enabling it triggers a
     # one-time ~2.5GB CUDA runtime download (see gpu_runtime_service.py). Off
     # by default so a fresh install never silently starts a large background
@@ -147,10 +152,15 @@ class AppSettings(Base):
     # them at all — a small Cloudflare Worker (cloudflare-signaling/) that
     # only ever sees "who's online and at what public IP" plus tiny consent
     # messages; the actual separation job's file upload still goes directly
-    # PC-to-PC over plain HTTP (see power_share_service.py). Off by default —
-    # empty URL means nobody has deployed/configured a signaling server yet.
-    online_signaling_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    online_signaling_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    # PC-to-PC over plain HTTP (see power_share_service.py). On by default,
+    # pointed at the group's own deployed Worker — see power_share_enabled's
+    # comment above for why. Redeploying cloudflare-signaling/ to a
+    # different URL means updating this default (existing installs keep
+    # whatever they already have — this only affects fresh app_settings rows).
+    online_signaling_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    online_signaling_url: Mapped[Optional[str]] = mapped_column(
+        String(512), nullable=True, default="wss://raccoonhouse-signaling.raccoonhause.workers.dev/"
+    )
 
 
 class Profile(Base):

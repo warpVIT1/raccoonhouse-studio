@@ -207,10 +207,10 @@ class AppSettingsOut(BaseModel):
     available_models: List[str] = []
     active_profile_id: Optional[int] = None
     active_profile: Optional["ProfileOut"] = None
-    power_share_enabled: bool = False
+    power_share_enabled: bool = True
     manual_peer_host: Optional[str] = None
     manual_peer_port: int = 8765
-    online_signaling_enabled: bool = False
+    online_signaling_enabled: bool = True
     online_signaling_url: Optional[str] = None
     gpu_enabled: bool = False
     # Read-only, computed — not stored, just reported for the Settings UI to

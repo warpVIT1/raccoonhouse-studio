@@ -208,6 +208,7 @@ class AppSettingsOut(BaseModel):
     active_profile_id: Optional[int] = None
     active_profile: Optional["ProfileOut"] = None
     power_share_enabled: bool = True
+    power_share_auto_approve: bool = False
     manual_peer_host: Optional[str] = None
     manual_peer_port: int = 8765
     online_signaling_enabled: bool = True
@@ -231,6 +232,7 @@ class AppSettingsUpdate(BaseModel):
     default_bpm: Optional[float] = None
     active_profile_id: Optional[int] = None
     power_share_enabled: Optional[bool] = None
+    power_share_auto_approve: Optional[bool] = None
     manual_peer_host: Optional[str] = None
     manual_peer_port: Optional[int] = None
     online_signaling_enabled: Optional[bool] = None

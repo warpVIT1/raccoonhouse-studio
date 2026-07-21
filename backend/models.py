@@ -138,6 +138,13 @@ class AppSettings(Base):
     # below default to already-connected rather than requiring an opt-in
     # step per machine.
     power_share_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Every incoming power-share request still prompts this machine's own UI
+    # for a Так/Ні click by default (per-title consent still gets remembered
+    # after the first Так either way, see PowerShareConsent) — this is an
+    # explicit opt-in to skip that prompt entirely and approve everyone
+    # automatically, for someone who's fine lending their PC to anyone in the
+    # group without being asked each time.
+    power_share_auto_approve: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # GPU acceleration is opt-in and off by default — enabling it triggers a
     # one-time ~2.5GB CUDA runtime download (see gpu_runtime_service.py). Off
     # by default so a fresh install never silently starts a large background

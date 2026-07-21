@@ -111,6 +111,7 @@ export interface AppSettings {
   active_profile_id: number | null
   active_profile: Profile | null
   power_share_enabled: boolean
+  power_share_auto_approve: boolean
   manual_peer_host: string | null
   manual_peer_port: number
   online_signaling_enabled: boolean

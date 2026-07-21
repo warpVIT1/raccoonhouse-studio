@@ -31,6 +31,8 @@ const PEER_COLORS = ['#008300', '#d55181', '#c98500', '#199e70', '#d95926', '#90
 interface PowerSharePanelProps {
   powerShareEnabled: boolean
   onToggle: (enabled: boolean) => void
+  powerShareAutoApprove: boolean
+  onToggleAutoApprove: (enabled: boolean) => void
   manualPeerHost: string | null
   manualPeerPort: number
   onSaveManualPeer: (host: string | null, port: number) => void
@@ -40,7 +42,8 @@ interface PowerSharePanelProps {
 }
 
 export function PowerSharePanel({
-  powerShareEnabled, onToggle, manualPeerHost, manualPeerPort, onSaveManualPeer,
+  powerShareEnabled, onToggle, powerShareAutoApprove, onToggleAutoApprove,
+  manualPeerHost, manualPeerPort, onSaveManualPeer,
   onlineSignalingEnabled, onlineSignalingUrl, onSaveOnlineSignaling,
 }: PowerSharePanelProps) {
   const { get } = useApi()
@@ -72,7 +75,7 @@ export function PowerSharePanel({
         <div className="flex-1">
           <div className="text-[12.5px] font-bold">Розподілена обробка потужності</div>
           <div className="font-mono text-[11px] text-rh-text-dim mt-0.5">
-            Вимкнено за замовчуванням — дозволяє надсилати запит на відокремлення вокалу на потужніший ПК студії
+            Дозволяє іншим у групі надсилати запит на відокремлення вокалу на цей ПК
           </div>
         </div>
         <label className="relative inline-flex items-center cursor-pointer flex-shrink-0">
@@ -80,6 +83,27 @@ export function PowerSharePanel({
             type="checkbox"
             checked={powerShareEnabled}
             onChange={(e) => onToggle(e.target.checked)}
+            className="sr-only peer"
+          />
+          <div className="w-9 h-5 bg-rh-border rounded-full peer-checked:bg-rh-accent transition-colors" />
+          <div className="absolute left-0.5 top-0.5 w-4 h-4 bg-white rounded-full transition-transform peer-checked:translate-x-4" />
+        </label>
+      </div>
+
+      {/* Auto-approve toggle — every request still prompts this machine's
+          UI for a Так/Ні click by default; this skips that entirely. */}
+      <div className="flex items-center gap-3 py-3.5 px-4 border-b border-rh-border/70">
+        <div className="flex-1">
+          <div className="text-[12.5px] font-bold">Автоматично надавати доступ</div>
+          <div className="font-mono text-[11px] text-rh-text-dim mt-0.5">
+            Без цього — кожен запит питає підтвердження (Так/Ні) на цьому ПК
+          </div>
+        </div>
+        <label className="relative inline-flex items-center cursor-pointer flex-shrink-0">
+          <input
+            type="checkbox"
+            checked={powerShareAutoApprove}
+            onChange={(e) => onToggleAutoApprove(e.target.checked)}
             className="sr-only peer"
           />
           <div className="w-9 h-5 bg-rh-border rounded-full peer-checked:bg-rh-accent transition-colors" />

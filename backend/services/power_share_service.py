@@ -103,6 +103,12 @@ def handle_incoming_consent_request(body: dict, broadcast_fn=None, loop=None) ->
             )
             return False, "no_profile"
 
+        if settings.power_share_auto_approve:
+            power_logger.info(
+                "AUTO-APPROVE (setting) requester=%s title=%s", body["requester_host"], body["title_name"]
+            )
+            return True, "auto_approved"
+
         existing = (
             db.query(PowerShareConsent)
             .filter(

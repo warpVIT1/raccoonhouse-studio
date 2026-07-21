@@ -15,6 +15,7 @@ const EMPTY_SETTINGS: AppSettings = {
   active_profile_id: null,
   active_profile: null,
   power_share_enabled: true,
+  power_share_auto_approve: false,
   manual_peer_host: null,
   manual_peer_port: 8765,
   online_signaling_enabled: true,
@@ -247,6 +248,8 @@ export function SettingsPage() {
       <PowerSharePanel
         powerShareEnabled={settings.power_share_enabled}
         onToggle={(v) => save({ power_share_enabled: v })}
+        powerShareAutoApprove={settings.power_share_auto_approve}
+        onToggleAutoApprove={(v) => save({ power_share_auto_approve: v })}
         manualPeerHost={settings.manual_peer_host}
         manualPeerPort={settings.manual_peer_port}
         onSaveManualPeer={(host, port) => save({ manual_peer_host: host, manual_peer_port: port })}

@@ -150,20 +150,16 @@ class AppSettings(Base):
     # by default so a fresh install never silently starts a large background
     # download nobody asked for.
     gpu_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    # Manual fallback for when both PCs aren't on the same LAN (auto-discovery via
-    # UDP broadcast can't cross the internet, or doesn't reliably cross a VPN mesh
-    # like Hamachi/Radmin) — one pinned "connect directly to this PC" address.
-    manual_peer_host: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    manual_peer_port: Mapped[int] = mapped_column(Integer, nullable=False, default=8765)
-    # Third discovery channel, for two PCs with no LAN/VPN-mesh path between
-    # them at all — a small Cloudflare Worker (cloudflare-signaling/) that
-    # only ever sees "who's online and at what public IP" plus tiny consent
-    # messages; the actual separation job's file upload still goes directly
-    # PC-to-PC over plain HTTP (see power_share_service.py). On by default,
-    # pointed at the group's own deployed Worker — see power_share_enabled's
-    # comment above for why. Redeploying cloudflare-signaling/ to a
-    # different URL means updating this default (existing installs keep
-    # whatever they already have — this only affects fresh app_settings rows).
+    # The only discovery/transport mechanism for Power Share — a small
+    # Cloudflare Worker (cloudflare-signaling/) that tracks who's online,
+    # relays the consent handshake between two specific peers, and store-
+    # and-forwards the actual job file through its R2 bucket (see
+    # discovery_service.py / power_share_service.py). Nothing connects to a
+    # peer's IP directly anymore, so this is on by default, pointed at the
+    # group's own deployed Worker — see power_share_enabled's comment above
+    # for why. Redeploying cloudflare-signaling/ to a different URL means
+    # updating this default (existing installs keep whatever they already
+    # have — this only affects fresh app_settings rows).
     online_signaling_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     online_signaling_url: Mapped[Optional[str]] = mapped_column(
         String(512), nullable=True, default="wss://raccoonhouse-signaling.raccoonhause.workers.dev/"
@@ -187,6 +183,10 @@ class PowerShareConsent(Base):
     __tablename__ = "power_share_consents"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Historically a bare IP (back when peers dialed each other directly) —
+    # now the peer's Worker-assigned signaling id, since nothing connects to
+    # a peer's IP anymore. Column name kept as-is to avoid a schema migration
+    # (this project has no Alembic; init_db() is a plain create_all()).
     peer_host: Mapped[str] = mapped_column(String(255), nullable=False)
     title_id: Mapped[int] = mapped_column(Integer, ForeignKey("titles.id"), nullable=False)
     granted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

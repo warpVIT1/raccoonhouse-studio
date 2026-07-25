@@ -74,7 +74,7 @@ def _install_gpu_runtime_job(reporter):
 
 
 @router.post("/settings/install-gpu-runtime")
-def install_gpu_runtime_endpoint():
+async def install_gpu_runtime_endpoint():
     if not gpu_runtime_service.has_nvidia_gpu():
         raise HTTPException(400, "NVIDIA GPU не знайдено на цьому комп'ютері")
     if gpu_runtime_service.is_gpu_runtime_installed() and gpu_runtime_service.is_torch_cuda_installed():

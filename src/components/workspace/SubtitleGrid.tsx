@@ -235,6 +235,18 @@ export function SubtitleGrid({
   const handleCellClick = useCallback(
     (rowIdx: number, col: string, e: React.MouseEvent) => {
       e.stopPropagation()
+      // Already editing this exact cell — bail out before touching selection/
+      // seek/editing state at all. Without this, dragging a text selection
+      // inside the textarea and releasing the mouse just outside its own
+      // bounds but still inside this wrapper div fires a plain click here:
+      // the textarea's native blur (which commits and closes the editor) has
+      // already fired by the time this synthetic click runs, and this
+      // handler would then also clear the row selection, seek the video, and
+      // immediately reopen a fresh textarea from the (stale, pre-commit)
+      // `line.text` prop — visible as the edit box flickering shut and
+      // losing the in-progress selection/cursor rather than just letting the
+      // native text selection continue uninterrupted.
+      if (editingCell?.row === rowIdx && editingCell.col === col) return
       // Ctrl/Shift+click here must behave exactly like clicking the row's
       // background — toggle/range-select — instead of opening an editor.
       // A plain click still clears selection, seeks, and (for text/actor)
@@ -250,7 +262,7 @@ export function SubtitleGrid({
         setEditingCell({ row: rowIdx, col })
       }
     },
-    [handleSelectionClick]
+    [handleSelectionClick, editingCell]
   )
 
   const handleTimeDoubleClick = useCallback((rowIdx: number, col: 'start' | 'end', e: React.MouseEvent) => {

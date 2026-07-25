@@ -14,6 +14,8 @@ from ..database import get_db
 from ..models import Episode, Title, SubtitleLine, Character
 from ..schemas import EpisodeCreate, EpisodeUpdate, EpisodeOut, ImportVideoRequest
 from .. import job_manager
+from ..services.power_share_service import app_logger
+from ..services.title_status import bump_title_in_progress
 
 router = APIRouter(tags=["episodes"])
 
@@ -106,9 +108,12 @@ async def import_video(
 ):
     title = db.get(Title, title_id)
     if not title:
+        app_logger.warning("import-video: title %s not found", title_id)
         raise HTTPException(404, "Title not found")
     if not os.path.isfile(body.file_path):
+        app_logger.warning("import-video: file not found: %r", body.file_path)
         raise HTTPException(400, f"File not found: {body.file_path}")
+    app_logger.info("import-video: title=%s season=%s episode=%s file=%s", title_id, body.season, body.episode_number, body.file_path)
 
     # Create episode record
     existing = (
@@ -140,13 +145,24 @@ async def import_video(
 async def separate_vocals(ep_id: int, request: Request, db: Session = Depends(get_db)):
     ep = db.get(Episode, ep_id)
     if not ep:
+        app_logger.warning("separate-vocals: episode %s not found", ep_id)
         raise HTTPException(404)
     if not ep.audio_stem_path or not os.path.isfile(ep.audio_stem_path):
+        app_logger.warning(
+            "separate-vocals: episode %s has no audio stem (audio_stem_path=%r) — import video first",
+            ep_id, ep.audio_stem_path,
+        )
         raise HTTPException(400, "Audio stem not found — import video first")
 
     body = await request.json()
     model = body.get("model", "MDX23C")
     ensemble = body.get("ensemble", False)
+    model_file = body.get("model_file")
+    params = body.get("params")
+    app_logger.info(
+        "separate-vocals: episode=%s model=%s ensemble=%s model_file=%s params=%s",
+        ep_id, model, ensemble, model_file, params,
+    )
 
     job = job_manager.create_job("separate_vocals", episode_id=ep_id)
 
@@ -154,7 +170,129 @@ async def separate_vocals(ep_id: int, request: Request, db: Session = Depends(ge
     loop = asyncio.get_event_loop()
     audio_stem_path = ep.audio_stem_path
     asyncio.create_task(
-        job_manager.run_job(loop, job, lambda r: run_separation(ep_id, audio_stem_path, model, ensemble, r))
+        job_manager.run_job(loop, job, lambda r: run_separation(ep_id, audio_stem_path, model, ensemble, r, model_file=model_file, params=params))
+    )
+
+    return {"job_id": job.id}
+
+
+@router.post("/episodes/{ep_id}/batch-separate-vocals")
+async def batch_separate_vocals(ep_id: int, request: Request, db: Session = Depends(get_db)):
+    """Like Ensemble Mode (runs all 5 models), but keeps each model's result
+    as its own separate file instead of averaging them into one blended
+    output — see separator_service.separate_file_batch's docstring."""
+    ep = db.get(Episode, ep_id)
+    if not ep:
+        app_logger.warning("batch-separate-vocals: episode %s not found", ep_id)
+        raise HTTPException(404)
+    if not ep.audio_stem_path or not os.path.isfile(ep.audio_stem_path):
+        app_logger.warning("batch-separate-vocals: episode %s has no audio stem", ep_id)
+        raise HTTPException(400, "Audio stem not found — import video first")
+    app_logger.info("batch-separate-vocals: episode=%s", ep_id)
+
+    # Optional output_dir (user-picked via the native folder dialog, same
+    # pattern as mux-audio above) — falls back to the episode's own data-dir
+    # folder if omitted.
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    output_dir = body.get("output_dir")
+
+    job = job_manager.create_job("batch_separate_vocals", episode_id=ep_id)
+
+    from ..services.separator_service import run_batch_separation
+    loop = asyncio.get_event_loop()
+    audio_stem_path = ep.audio_stem_path
+    asyncio.create_task(
+        job_manager.run_job(loop, job, lambda r: run_batch_separation(ep_id, audio_stem_path, r, output_dir=output_dir))
+    )
+
+    return {"job_id": job.id}
+
+
+@router.post("/episodes/{ep_id}/use-batch-result")
+async def use_batch_result(ep_id: int, request: Request, db: Session = Depends(get_db)):
+    """Batch mode (see batch_separate_vocals above) deliberately never sets
+    the episode's own vocal_stem_path — it produces N comparison files with
+    no single "the" result to promote. This is how the user actually picks
+    one of those N files to become the episode's real instrumental, so
+    "Рендерити фінальну доріжку" (which reads vocal_stem_path directly, see
+    mux_audio below) has something to work with."""
+    ep = db.get(Episode, ep_id)
+    if not ep:
+        raise HTTPException(404)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Невірне тіло запиту")
+    path = body.get("path")
+    job_id = body.get("job_id")
+    if not path or not job_id:
+        raise HTTPException(400, "path і job_id обов'язкові")
+
+    # The batch output folder can now be anywhere the user picked via the
+    # native folder dialog (see batch_separate_vocals' output_dir), so a
+    # fixed-directory prefix check no longer works — instead, only accept a
+    # path that's literally one of THIS job's own recorded results. Never
+    # accept an arbitrary filesystem path from the request body.
+    job = job_manager.get_job(job_id)
+    if (
+        not job
+        or job.episode_id != ep_id
+        or job.type != "batch_separate_vocals"
+        or path not in (job.result.get("models") or {}).values()
+    ):
+        app_logger.warning("use-batch-result: rejected path=%r job_id=%r for episode %s", path, job_id, ep_id)
+        raise HTTPException(400, "Невірний шлях до файлу")
+
+    if not os.path.isfile(path):
+        raise HTTPException(400, "Файл більше не існує")
+
+    ep.vocal_stem_path = path
+    if ep.status not in ("marked", "ready"):
+        ep.status = "vocal_isolated"
+    bump_title_in_progress(db, ep.title_id)
+    db.commit()
+    app_logger.info("use-batch-result: episode %s now uses %s", ep_id, path)
+    return {"ok": True}
+
+
+@router.post("/episodes/{ep_id}/distributed-separate-vocals")
+async def distributed_separate_vocals(ep_id: int, request: Request, db: Session = Depends(get_db)):
+    """Splits the episode's audio across every currently-available Power
+    Share peer (plus this machine) and runs each piece's separation in
+    parallel — see distributed_separation_service.py's module docstring.
+    Falls back to plain local separation automatically if no peers accept."""
+    ep = db.get(Episode, ep_id)
+    if not ep:
+        app_logger.warning("distributed-separate-vocals: episode %s not found", ep_id)
+        raise HTTPException(404)
+    if not ep.audio_stem_path or not os.path.isfile(ep.audio_stem_path):
+        app_logger.warning("distributed-separate-vocals: episode %s has no audio stem", ep_id)
+        raise HTTPException(400, "Audio stem not found — import video first")
+
+    body = await request.json()
+    model = body.get("model", "MDX23C")
+    ensemble = body.get("ensemble", False)
+    model_file = body.get("model_file")
+    params = body.get("params")
+    app_logger.info(
+        "distributed-separate-vocals: episode=%s model=%s ensemble=%s model_file=%s params=%s",
+        ep_id, model, ensemble, model_file, params,
+    )
+
+    job = job_manager.create_job("distributed_separate_vocals", episode_id=ep_id)
+
+    from ..services.distributed_separation_service import run_distributed_separation
+    loop = asyncio.get_event_loop()
+    # audio_stem_path deliberately not extracted here — unlike separate-vocals/
+    # batch-separate-vocals, run_distributed_separation opens its own DB
+    # session and re-reads it itself (it needs a live Episode/Title anyway
+    # for the peer-consent broadcast).
+    asyncio.create_task(
+        job_manager.run_job(loop, job, lambda r: run_distributed_separation(ep_id, model, ensemble, r, model_file=model_file, params=params))
     )
 
     return {"job_id": job.id}
@@ -172,7 +310,12 @@ async def detect_markers(ep_id: int, db: Session = Depends(get_db)):
     # crosses the wire), so they need a clear error rather than silently
     # running VAD against the wrong (or missing) file.
     if not ep.vocal_only_stem_path or not os.path.isfile(ep.vocal_only_stem_path):
+        app_logger.warning(
+            "detect-markers: episode %s has no vocal-only stem (vocal_only_stem_path=%r)",
+            ep_id, ep.vocal_only_stem_path,
+        )
         raise HTTPException(400, "Vocal-only stem not found — run vocal isolation first (locally, not via power-share)")
+    app_logger.info("detect-markers: episode=%s", ep_id)
 
     job = job_manager.create_job("detect_markers", episode_id=ep_id)
 
@@ -202,6 +345,7 @@ async def mux_audio(ep_id: int, request: Request, db: Session = Depends(get_db))
     # anymore, this is now a one-click render of what's already there.
     mixed_audio_path = ep.vocal_stem_path
     if not mixed_audio_path or not os.path.isfile(mixed_audio_path):
+        app_logger.warning("mux-audio: episode %s has no instrumental (vocal_stem_path=%r)", ep_id, mixed_audio_path)
         raise HTTPException(400, "Інструментал не знайдено — виконайте ізоляцію вокалу спочатку")
 
     # Optional output_dir (user-picked via the native folder dialog) — falls

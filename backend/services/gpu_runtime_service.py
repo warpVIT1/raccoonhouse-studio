@@ -79,6 +79,17 @@ def ensure_gpu_provider_placed() -> None:
     for src in GPU_RUNTIME_DIR.iterdir():
         if src.name.startswith("."):
             continue
+        # GPU_RUNTIME_DIR also holds the torch-cuda/ subdirectory (see
+        # TORCH_CUDA_DIR below) once torch's CUDA build has been installed —
+        # this loop only wants the flat onnxruntime CUDA provider DLLs sitting
+        # directly in GPU_RUNTIME_DIR, so a directory here must be skipped.
+        # Without this check, os.link()/shutil.copy2() below would try to
+        # hardlink/copy torch-cuda/ itself as if it were a file and crash with
+        # PermissionError — confirmed live: this made EVERY separation attempt
+        # fail immediately once a user had both GPU runtimes installed,
+        # regardless of which model was selected.
+        if src.is_dir():
+            continue
         dst = capi_dir / src.name
         if dst.exists():
             continue

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from ..models import Episode
 from ..database import SessionLocal
 from ..job_manager import ProgressReporter
+from .power_share_service import app_logger
 
 DATA_DIR = os.environ.get("RH_DATA_DIR", os.path.join(os.path.expanduser("~"), ".raccoonhouse"))
 
@@ -77,6 +78,7 @@ def run_import_ffmpeg_only(
     is prefixed 'ffmpeg:' so the UI never shows a bare, unexplained 'Обробка'
     without saying which of the two engines (ffmpeg vs. the neural separator)
     is actually running."""
+    app_logger.info("run_import_ffmpeg_only: start file_path=%s out_dir=%s", file_path, out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     def progress(pct, msg):
@@ -108,11 +110,16 @@ def run_import_ffmpeg_only(
             "-compression_level", "0",  # fastest
             audio_out,
         ]
+        app_logger.info("run_import_ffmpeg_only: running ffmpeg: %s", " ".join(cmd_audio))
         proc = subprocess.Popen(
             cmd_audio, stderr=subprocess.PIPE, text=True,
             encoding="utf-8", errors="replace",
         )
+        stderr_tail: list[str] = []
         for line in proc.stderr:
+            stderr_tail.append(line)
+            if len(stderr_tail) > 200:
+                stderr_tail.pop(0)
             if is_cancelled and is_cancelled():
                 proc.kill()
                 raise RuntimeError("Скасовано")
@@ -125,6 +132,10 @@ def run_import_ffmpeg_only(
                     pass
         proc.wait()
         if proc.returncode != 0:
+            app_logger.error(
+                "run_import_ffmpeg_only: ffmpeg exited with code %s, last output:\n%s",
+                proc.returncode, "".join(stderr_tail),
+            )
             raise RuntimeError("ffmpeg audio extraction failed")
 
     progress(100, "ffmpeg: аудіо готове")
@@ -160,14 +171,19 @@ def run_import_pipeline(
     try:
         ep = db.get(Episode, episode_id)
         if not ep:
+            app_logger.error("run_import_pipeline: episode %s not found", episode_id)
             raise ValueError(f"Episode {episode_id} not found")
 
         ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
 
-        result = run_import_ffmpeg_only(
-            file_path, str(ep_dir),
-            on_progress=reporter.update, is_cancelled=lambda: reporter.cancelled,
-        )
+        try:
+            result = run_import_ffmpeg_only(
+                file_path, str(ep_dir),
+                on_progress=reporter.update, is_cancelled=lambda: reporter.cancelled,
+            )
+        except Exception:
+            app_logger.exception("run_import_pipeline: failed for episode %s (file=%s)", episode_id, file_path)
+            raise
 
         reporter.update(95, "Оновлюю базу даних…")
 
@@ -179,6 +195,7 @@ def run_import_pipeline(
         ep.duration = result["duration"]
         ep.status = "processing"
         db.commit()
+        app_logger.info("run_import_pipeline: episode %s done, audio_path=%s", episode_id, result["audio_path"])
 
         reporter.update(100, "Аудіо готове")
         return {"audio_path": result["audio_path"]}
@@ -212,7 +229,12 @@ def _run_mux_pipeline(
 ) -> dict:
     ep = db.get(Episode, episode_id)
     if not ep:
+        app_logger.error("_run_mux_pipeline: episode %s not found", episode_id)
         raise ValueError(f"Episode {episode_id} not found")
+    app_logger.info(
+        "_run_mux_pipeline: start episode=%s video=%s audio=%s output_dir=%s",
+        episode_id, original_video_path, mixed_audio_path, output_dir,
+    )
 
     # User-picked destination (native folder dialog) if given, otherwise the
     # episode's own data-dir folder as before.
@@ -245,11 +267,16 @@ def _run_mux_pipeline(
     ]
 
     duration = ep.duration or 0
+    app_logger.info("_run_mux_pipeline: running ffmpeg: %s", " ".join(cmd))
     proc = subprocess.Popen(
         cmd, stderr=subprocess.PIPE, text=True,
         encoding="utf-8", errors="replace",
     )
+    stderr_tail: list[str] = []
     for line in proc.stderr:
+        stderr_tail.append(line)
+        if len(stderr_tail) > 200:
+            stderr_tail.pop(0)
         if "time=" in line and duration:
             try:
                 t = _parse_time(line)
@@ -259,10 +286,15 @@ def _run_mux_pipeline(
                 pass
     proc.wait()
     if proc.returncode != 0:
+        app_logger.error(
+            "_run_mux_pipeline: ffmpeg exited with code %s, last output:\n%s",
+            proc.returncode, "".join(stderr_tail),
+        )
         raise RuntimeError("ffmpeg mux failed")
 
     ep.status = "ready"
     db.commit()
+    app_logger.info("_run_mux_pipeline: episode %s done, output=%s", episode_id, out_path)
 
     reporter.update(100, "Готово")
     return {"output_path": out_path}

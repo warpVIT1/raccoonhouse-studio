@@ -18,16 +18,20 @@ not the bare display name — verified 2026-07-19 against audio-separator 0.44.3
 import glob
 import math
 import os
+import re
 import shutil
 import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 from sqlalchemy.orm import Session
 
 from ..models import Episode
 from ..database import SessionLocal
 from ..job_manager import ProgressReporter
+from .power_share_service import app_logger
+from .title_status import bump_title_in_progress
 
 DATA_DIR = os.environ.get("RH_DATA_DIR", os.path.join(os.path.expanduser("~"), ".raccoonhouse"))
 
@@ -139,12 +143,69 @@ _patch_separator_gpu_detection()
 
 DEFAULT_MODEL = "MDX-Net"
 
-MODEL_MAP = {
-    "MDX-Net": "UVR-MDX-NET-Inst_HQ_3.onnx",
-    "VR Arch": "UVR-De-Echo-Normal.pth",
-    "Demucs": "htdemucs_ft.yaml",
-    "MDX23C": "MDX23C-8KFFT-InstVoc_HQ.ckpt",
-    "BS-RoFormer": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+# Curated subset of audio-separator's full model registry (see
+# Separator().list_supported_model_files() — hundreds of entries, mostly
+# narrow community fine-tunes) for each method's dropdown in the Vocal
+# Isolation window. First entry per method is that method's default
+# (MODEL_MAP below). Filenames must match the registry exactly (checked
+# live against audio-separator 0.44.3).
+MODEL_CHOICES: dict[str, list[tuple[str, str]]] = {
+    "MDX-Net": [
+        ("UVR-MDX-NET Inst HQ 3", "UVR-MDX-NET-Inst_HQ_3.onnx"),
+        ("UVR-MDX-NET Inst HQ 4", "UVR-MDX-NET-Inst_HQ_4.onnx"),
+        ("UVR-MDX-NET Inst HQ 5", "UVR-MDX-NET-Inst_HQ_5.onnx"),
+        ("UVR-MDX-NET Inst Main", "UVR-MDX-NET-Inst_Main.onnx"),
+        ("UVR-MDX-NET Voc FT", "UVR-MDX-NET-Voc_FT.onnx"),
+        ("Kim Vocal 2", "Kim_Vocal_2.onnx"),
+        ("UVR-MDX-NET Karaoke 2", "UVR_MDXNET_KARA_2.onnx"),
+        # Added from the UVR community tier list (Tier 1) — see
+        # https://github.com/Anjok07/ultimatevocalremovergui's guide doc.
+        ("Kim Inst", "Kim_Inst.onnx"),
+        ("UVR-MDX-NET Inst 3", "UVR-MDX-NET-Inst_3.onnx"),
+    ],
+    "VR Arch": [
+        ("UVR-De-Echo-Normal", "UVR-De-Echo-Normal.pth"),
+        ("UVR-De-Echo-Aggressive", "UVR-De-Echo-Aggressive.pth"),
+        ("UVR-DeEcho-DeReverb", "UVR-DeEcho-DeReverb.pth"),
+        ("3_HP-Vocal-UVR", "3_HP-Vocal-UVR.pth"),
+        ("4_HP-Vocal-UVR", "4_HP-Vocal-UVR.pth"),
+        ("UVR-DeNoise", "UVR-DeNoise.pth"),
+    ],
+    "Demucs": [
+        ("htdemucs_ft", "htdemucs_ft.yaml"),
+        ("htdemucs", "htdemucs.yaml"),
+        ("hdemucs_mmi", "hdemucs_mmi.yaml"),
+        ("htdemucs_6s", "htdemucs_6s.yaml"),
+    ],
+    "MDX23C": [
+        ("MDX23C-InstVoc HQ", "MDX23C-8KFFT-InstVoc_HQ.ckpt"),
+        ("MDX23C-InstVoc HQ 2", "MDX23C-8KFFT-InstVoc_HQ_2.ckpt"),
+        ("MDX23C De-Reverb", "MDX23C-De-Reverb-aufr33-jarredou.ckpt"),
+        # Tier 1 in the UVR community guide's model tier list.
+        ("MDX23C D1581", "MDX23C_D1581.ckpt"),
+    ],
+    "BS-RoFormer": [
+        ("BS-Roformer-Viperx-1297", "model_bs_roformer_ep_317_sdr_12.9755.ckpt"),
+        ("BS-Roformer-Viperx-1296", "model_bs_roformer_ep_368_sdr_12.9628.ckpt"),
+        ("Mel-Roformer-Viperx-1143", "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt"),
+        ("MelBand Roformer Kim FT 3 (unwa)", "mel_band_roformer_kim_ft3_unwa.ckpt"),
+        ("MelBand Roformer Vocals (becruily)", "mel_band_roformer_vocals_becruily.ckpt"),
+        ("MelBand Roformer Instrumental (GaBOXR67)", "mel_band_roformer_instrumental_gabox.ckpt"),
+    ],
+}
+
+MODEL_MAP = {method: choices[0][1] for method, choices in MODEL_CHOICES.items()}
+
+# Which of audio-separator's Separator(...) per-architecture kwargs
+# (mdx_params / vr_params / demucs_params / mdxc_params) applies to each
+# model — MDX23C and BS-RoFormer are both "mdxc" architecture models (.ckpt),
+# matching audio-separator's own internal classification.
+MODEL_ARCH = {
+    "MDX-Net": "mdx",
+    "VR Arch": "vr",
+    "Demucs": "demucs",
+    "MDX23C": "mdxc",
+    "BS-RoFormer": "mdxc",
 }
 
 
@@ -153,16 +214,32 @@ def separate_file(
     output_dir: str,
     model_name: str,
     ensemble: bool,
+    model_file: Optional[str] = None,  # specific checkpoint filename — see MODEL_CHOICES; defaults to MODEL_MAP[model_name] if omitted
+    params: Optional[dict] = None,  # {"mdx"|"vr"|"demucs"|"mdxc": {...}} — see MODEL_ARCH
     on_progress=None,  # Optional[Callable[[int, str], None]] — no DB/job coupling
     is_cancelled=None,  # Optional[Callable[[], bool]]
 ) -> str:
     """Core separation routine, independent of any Episode/DB — used both for
     local jobs (run_separation below) and for power-shared jobs run on a peer
-    machine that has no record of this episode at all."""
+    machine that has no record of this episode at all.
+
+    `params`, if given, must be a COMPLETE per-architecture kwarg dict (every
+    key Separator's own default for that *_params carries) — audio-separator's
+    architecture classes read these via `arch_config.get("key")` with no
+    fallback default of their own, so a partial dict silently turns any
+    missing key into None instead of a sane value."""
     try:
         from audio_separator.separator import Separator
     except ImportError:
+        app_logger.exception("separate_file: audio-separator not installed")
         raise RuntimeError("audio-separator not installed. Run: pip install audio-separator")
+
+    app_logger.info(
+        "separate_file: start audio_path=%s output_dir=%s model_name=%s ensemble=%s model_file=%s params=%s",
+        audio_path, output_dir, model_name, ensemble, model_file, params,
+    )
+    if not os.path.isfile(audio_path):
+        app_logger.error("separate_file: audio_path does not exist: %s", audio_path)
 
     os.makedirs(output_dir, exist_ok=True)
     models_to_run = list(MODEL_MAP.keys()) if ensemble else [model_name]
@@ -177,17 +254,30 @@ def separate_file(
         if is_cancelled and is_cancelled():
             raise RuntimeError("Скасовано")
 
-        uvr_model = MODEL_MAP.get(mdl, mdl)
+        # A specific-checkpoint override only applies to a single selected
+        # method, not ensemble mode (which always runs each method's own
+        # default checkpoint — there's no single "the" model_file to apply
+        # across 5 different architectures at once).
+        uvr_model = model_file if (model_file and not ensemble) else MODEL_MAP.get(mdl, mdl)
         base_pct = int(idx / len(models_to_run) * 80)
         progress(base_pct + 5, f"нейромережа: завантаження моделі {mdl}…")
 
-        sep = Separator(
+        sep_kwargs = dict(
             output_dir=output_dir,
             output_format="WAV",
             normalization_threshold=0.9,
             model_file_dir=str(Path(DATA_DIR) / "models"),
         )
-        sep.load_model(uvr_model)
+        arch = MODEL_ARCH.get(mdl)
+        if params and arch and params.get(arch):
+            sep_kwargs[f"{arch}_params"] = params[arch]
+        app_logger.info("separate_file: loading model %s (arch=%s, file=%s)", mdl, arch, uvr_model)
+        try:
+            sep = Separator(**sep_kwargs)
+            sep.load_model(uvr_model)
+        except Exception:
+            app_logger.exception("separate_file: failed to load model %s (file=%s)", mdl, uvr_model)
+            raise
 
         progress(base_pct + 15, f"нейромережа: ізоляція вокалу ({mdl})…")
 
@@ -215,9 +305,13 @@ def separate_file(
         hb_thread.start()
         try:
             output_files = sep.separate(audio_path)
+        except Exception:
+            app_logger.exception("separate_file: sep.separate() failed for model %s", mdl)
+            raise
         finally:
             heartbeat_stop.set()
             hb_thread.join(timeout=3)
+        app_logger.info("separate_file: model %s produced output files: %s", mdl, output_files)
         # audio-separator returns bare filenames relative to output_dir, NOT
         # full/absolute paths — joining is required, otherwise os.path.isfile
         # below checks the process's CWD instead and silently "finds nothing"
@@ -261,6 +355,10 @@ def separate_file(
         progress(base_pct + int(80 / len(models_to_run)), f"нейромережа: готово {mdl}")
 
     if not instrumental_stems:
+        app_logger.error(
+            "separate_file: no instrumental stems produced (vocal_stems=%s, instrumental_stems=%s)",
+            vocal_stems, instrumental_stems,
+        )
         raise RuntimeError("Не вдалося отримати інструментальний стем")
 
     # The instrumental (original vocal removed) is the actual deliverable —
@@ -293,6 +391,8 @@ def run_separation(
     model_name: str,
     ensemble: bool,
     reporter: ProgressReporter,
+    model_file: Optional[str] = None,
+    params: Optional[dict] = None,
 ) -> dict:
     """Opens its own DB session rather than reusing the request's — this runs
     in a background thread pool that outlives the HTTP request, and a
@@ -302,23 +402,158 @@ def run_separation(
     try:
         ep = db.get(Episode, episode_id)
         if not ep:
+            app_logger.error("run_separation: episode %s not found", episode_id)
             raise ValueError(f"Episode {episode_id} not found")
 
         ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
         output_dir = ep_dir / "stems"
 
-        stems = separate_file(
-            audio_path, str(output_dir), model_name, ensemble,
-            on_progress=reporter.update, is_cancelled=lambda: reporter.cancelled,
-        )
+        try:
+            stems = separate_file(
+                audio_path, str(output_dir), model_name, ensemble, model_file=model_file, params=params,
+                on_progress=reporter.update, is_cancelled=lambda: reporter.cancelled,
+            )
+        except Exception:
+            app_logger.exception("run_separation: separate_file failed for episode %s", episode_id)
+            raise
 
         reporter.update(95, "Оновлення БД…")
         ep.vocal_stem_path = stems["vocal_stem_path"]
         ep.vocal_only_stem_path = stems["vocal_only_stem_path"]
         ep.status = "vocal_isolated"
+        bump_title_in_progress(db, ep.title_id)
         db.commit()
+        app_logger.info("run_separation: episode %s done, stems=%s", episode_id, stems)
 
         return stems
+    finally:
+        db.close()
+
+
+def separate_file_batch(
+    audio_path: str,
+    output_dir: str,
+    on_progress=None,  # Optional[Callable[[int, str], None]]
+    is_cancelled=None,  # Optional[Callable[[], bool]]
+) -> dict[str, str]:
+    """Runs every model in MODEL_MAP (the same set Ensemble Mode uses) but,
+    unlike Ensemble Mode, keeps each model's own instrumental as a SEPARATE
+    file instead of averaging them into one blended result — for comparing
+    models side by side or rendering with whichever one turns out best
+    per-episode, rather than committing to a single averaged guess. Only the
+    instrumental is kept (not the isolated-vocal counterpart) — this mode is
+    for picking/comparing a final instrumental track, which is the only
+    thing dubbing actually needs; FLAC, not WAV, to keep 5x the usual output
+    size down to something reasonable while staying lossless.
+
+    Returns {model_name: instrumental_flac_path} — deliberately does not
+    touch any Episode column (there's no single "the" result to promote the
+    way normal/ensemble separation has), so the episode's status and
+    vocal_stem_path are left exactly as they were before this ran."""
+    try:
+        from audio_separator.separator import Separator
+    except ImportError:
+        app_logger.exception("separate_file_batch: audio-separator not installed")
+        raise RuntimeError("audio-separator not installed. Run: pip install audio-separator")
+
+    app_logger.info("separate_file_batch: start audio_path=%s output_dir=%s", audio_path, output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    models_to_run = list(MODEL_MAP.keys())
+    results: dict[str, str] = {}
+
+    def progress(pct, msg):
+        if on_progress:
+            on_progress(pct, msg)
+
+    for idx, mdl in enumerate(models_to_run):
+        if is_cancelled and is_cancelled():
+            raise RuntimeError("Скасовано")
+
+        uvr_model = MODEL_MAP[mdl]
+        base_pct = int(idx / len(models_to_run) * 90)
+        progress(base_pct + 2, f"нейромережа: завантаження моделі {mdl}…")
+
+        sep = Separator(
+            output_dir=output_dir,
+            output_format="FLAC",
+            normalization_threshold=0.9,
+            model_file_dir=str(Path(DATA_DIR) / "models"),
+        )
+        try:
+            sep.load_model(uvr_model)
+        except Exception:
+            app_logger.exception("separate_file_batch: failed to load model %s (file=%s)", mdl, uvr_model)
+            raise
+
+        progress(base_pct + int(90 / len(models_to_run) / 2), f"нейромережа: ізоляція вокалу ({mdl})…")
+        try:
+            output_files = sep.separate(audio_path)
+        except Exception:
+            app_logger.exception("separate_file_batch: sep.separate() failed for model %s", mdl)
+            raise
+        output_paths = [
+            f if os.path.isabs(f) else str(Path(output_dir) / f)
+            for f in output_files
+        ]
+
+        # Only the instrumental is kept for batch mode (see docstring) — no
+        # need to even locate the vocal-only counterpart.
+        instrumental_file = next((f for f in output_paths if "instrumental" in f.lower()), None)
+        if not instrumental_file and output_paths:
+            instrumental_file = output_paths[0]
+
+        safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", mdl)
+        if instrumental_file and os.path.isfile(instrumental_file):
+            final_instrumental = str(Path(output_dir) / f"{safe_name}_instrumental.flac")
+            shutil.copy2(instrumental_file, final_instrumental)
+            results[mdl] = final_instrumental
+        # Every intermediate file audio-separator wrote for this model
+        # (including whichever one WASN'T the instrumental — the isolated
+        # vocal stem this mode doesn't keep) is no longer needed once its
+        # renamed copy exists — without cleanup, output_dir would keep every
+        # model's raw output on top of the renamed copies.
+        for f in output_paths:
+            if f != instrumental_file and os.path.isfile(f):
+                os.remove(f)
+
+        progress(base_pct + int(90 / len(models_to_run)), f"нейромережа: готово {mdl}")
+
+    progress(100, "нейромережа: всі моделі оброблено")
+    app_logger.info("separate_file_batch: done, results=%s", results)
+    return results
+
+
+def run_batch_separation(
+    episode_id: int,
+    audio_path: str,
+    reporter: ProgressReporter,
+    output_dir: Optional[str] = None,  # user-picked via the native folder dialog; falls back to the episode's own data-dir folder if omitted
+) -> dict:
+    """Opens its own DB session — see run_separation's docstring for why."""
+    db = SessionLocal()
+    try:
+        ep = db.get(Episode, episode_id)
+        if not ep:
+            app_logger.error("run_batch_separation: episode %s not found", episode_id)
+            raise ValueError(f"Episode {episode_id} not found")
+
+        if output_dir:
+            output_dir = Path(output_dir)
+        else:
+            ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
+            output_dir = ep_dir / "stems" / "batch"
+
+        try:
+            results = separate_file_batch(
+                audio_path, str(output_dir),
+                on_progress=reporter.update, is_cancelled=lambda: reporter.cancelled,
+            )
+        except Exception:
+            app_logger.exception("run_batch_separation: failed for episode %s", episode_id)
+            raise
+
+        app_logger.info("run_batch_separation: episode %s done, output_dir=%s", episode_id, output_dir)
+        return {"output_dir": str(output_dir), "models": results}
     finally:
         db.close()
 

@@ -1,13 +1,17 @@
-// RaccoonHouse Power Share — online signaling.
+// RaccoonHouse Power Share — online signaling + transfer relay.
 //
-// Solves discovery only, not NAT traversal: this Worker just answers "who
-// else is online right now, and at what public IP/port" and relays the tiny
-// consent-request/response messages between two specific peers. The actual
-// video/audio upload for a running separation job still goes directly
-// machine-to-machine over plain HTTP (see backend/routers/power_share.py) —
-// this process never sees that traffic and couldn't handle it anyway
-// (Workers have per-request CPU/duration limits that make them a bad fit
-// for relaying multi-gigabyte files).
+// Discovery/consent: this Worker answers "who else is online right now" and
+// relays small consent-request/response and job-control messages between two
+// specific peers over WebSocket (see PeerRegistry below).
+//
+// File transfer: the actual video/audio for a power-shared job is store-
+// and-forwarded through the TRANSFERS R2 bucket via plain HTTP PUT/GET/
+// DELETE on /transfer/:id (handled directly in the default fetch handler,
+// below, entirely outside the Durable Object) — a Worker can stream a
+// request body straight into R2 and back out without buffering the whole
+// file in memory, which sidesteps the per-request CPU/duration limits that
+// would make relaying multi-gigabyte files through a plain request/response
+// or through the WebSocket a bad idea.
 //
 // One shared PeerRegistry Durable Object instance (idFromName("global"))
 // holds every currently-connected client's WebSocket. Uses the Hibernation
@@ -20,6 +24,7 @@
 
 interface Env {
   PEER_REGISTRY: DurableObjectNamespace;
+  TRANSFERS: R2Bucket;
 }
 
 interface PeerAttachment {
@@ -99,8 +104,16 @@ export class PeerRegistry {
 
     if (msg.type === "hello") {
       const existing = ws.deserializeAttachment() as PeerAttachment;
+      // Prefer the client's own persisted id over the random one assigned
+      // at connection time — without this, every WebSocket reconnect (network
+      // blip, Worker-side connection recycling, etc.) would hand out a brand
+      // new id, and any relay reply already in flight to the OLD id (a
+      // consent response, or a job's result) would have nowhere to go,
+      // silently stranding the requester until its own long timeout expires.
+      const clientId = typeof msg.client_id === "string" && msg.client_id ? msg.client_id : existing.id;
       ws.serializeAttachment({
         ...existing,
+        id: clientId,
         name: String(msg.name ?? "?"),
         port: Number(msg.port) || 0,
         gpu_name: String(msg.gpu_name ?? "?"),
@@ -112,14 +125,15 @@ export class PeerRegistry {
       // peer list is itself (it doesn't know its own public IP, and several
       // peers could plausibly share a name) — tell it directly, once, so it
       // can filter its own id out of every "peers" message from here on.
-      ws.send(JSON.stringify({ type: "welcome", your_id: existing.id }));
+      ws.send(JSON.stringify({ type: "welcome", your_id: clientId }));
       this.broadcastPeerList();
       return;
     }
 
     if (msg.type === "relay") {
-      // Small consent-request/response messages only — see the module
-      // docstring for why actual file data never goes through here.
+      // Small consent-request/response and job-control messages only — the
+      // actual file bytes go through the /transfer/:id R2 routes instead
+      // (see the module docstring and the default fetch handler below).
       const targetId = String(msg.target_id ?? "");
       const from = ws.deserializeAttachment() as PeerAttachment;
       for (const target of this.ctx.getWebSockets()) {
@@ -141,10 +155,94 @@ export class PeerRegistry {
   }
 }
 
+function transferId(url: URL): string | null {
+  const match = url.pathname.match(/^\/transfer\/([A-Za-z0-9_-]+)$/);
+  return match ? match[1] : null;
+}
+
+// Cloudflare's own account-level request body size cap (100MB on Free/Pro,
+// 200MB Business) sits well under the size of an uncompressed separated WAV
+// stem (routinely 300-400MB+ for a full episode) — confirmed live 2026-07-23:
+// a single-shot PUT of a ~376MB result file was rejected outright before
+// even reaching this Worker's own code. R2 itself has no such limit (up to
+// 5TB per object), so the fix is R2's multipart upload API: the client
+// splits the file into several smaller PUTs (each safely under the request
+// body cap) instead of one giant one. These routes exist purely to expose
+// that 3-step protocol (create/uploadPart/complete) over plain HTTP, mirroring
+// R2Bucket's own API shape one-to-one.
+const MULTIPART_CREATE = /^\/transfer\/([A-Za-z0-9_-]+)\/multipart$/;
+const MULTIPART_PART = /^\/transfer\/([A-Za-z0-9_-]+)\/multipart\/([^/]+)\/(\d+)$/;
+const MULTIPART_COMPLETE = /^\/transfer\/([A-Za-z0-9_-]+)\/multipart\/([^/]+)\/complete$/;
+const MULTIPART_ABORT = /^\/transfer\/([A-Za-z0-9_-]+)\/multipart\/([^/]+)\/abort$/;
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const id = env.PEER_REGISTRY.idFromName("global");
-    const stub = env.PEER_REGISTRY.get(id);
+    const url = new URL(request.url);
+
+    let m = url.pathname.match(MULTIPART_CREATE);
+    if (m && request.method === "POST") {
+      const multipart = await env.TRANSFERS.createMultipartUpload(m[1]);
+      return Response.json({ uploadId: multipart.uploadId });
+    }
+
+    m = url.pathname.match(MULTIPART_PART);
+    if (m && request.method === "PUT") {
+      const [, id, uploadId, partNumberStr] = m;
+      const multipart = env.TRANSFERS.resumeMultipartUpload(id, uploadId);
+      const part = await multipart.uploadPart(parseInt(partNumberStr, 10), request.body as ReadableStream);
+      return Response.json({ partNumber: part.partNumber, etag: part.etag });
+    }
+
+    m = url.pathname.match(MULTIPART_COMPLETE);
+    if (m && request.method === "POST") {
+      const [, id, uploadId] = m;
+      const parts = await request.json() as { partNumber: number; etag: string }[];
+      const multipart = env.TRANSFERS.resumeMultipartUpload(id, uploadId);
+      await multipart.complete(parts);
+      return new Response(null, { status: 204 });
+    }
+
+    m = url.pathname.match(MULTIPART_ABORT);
+    if (m && request.method === "POST") {
+      const [, id, uploadId] = m;
+      const multipart = env.TRANSFERS.resumeMultipartUpload(id, uploadId);
+      try {
+        await multipart.abort();
+      } catch {
+        // Already completed, already aborted, or expired past R2's own
+        // 7-day auto-abort — nothing left to clean up either way.
+      }
+      return new Response(null, { status: 204 });
+    }
+
+    const id = transferId(url);
+    if (id !== null) {
+      if (request.method === "PUT") {
+        // Single-shot path — still used directly for anything under the
+        // request body cap (most inputs: original audio/video, FLAC extracts).
+        // Streamed straight into R2 — request.body is a ReadableStream, so
+        // this never buffers the whole file in the Worker's memory.
+        await env.TRANSFERS.put(id, request.body);
+        return new Response(null, { status: 204 });
+      }
+      if (request.method === "GET") {
+        const obj = await env.TRANSFERS.get(id);
+        if (obj === null) {
+          return new Response("Not found", { status: 404 });
+        }
+        return new Response(obj.body, {
+          headers: { "Content-Length": String(obj.size) },
+        });
+      }
+      if (request.method === "DELETE") {
+        await env.TRANSFERS.delete(id);
+        return new Response(null, { status: 204 });
+      }
+      return new Response("Method not allowed", { status: 405 });
+    }
+
+    const doId = env.PEER_REGISTRY.idFromName("global");
+    const stub = env.PEER_REGISTRY.get(doId);
     return stub.fetch(request);
   },
 };

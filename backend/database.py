@@ -32,6 +32,7 @@ def init_db():
     from . import models  # noqa: F401
     Base.metadata.create_all(bind=engine)
     _sync_missing_columns()
+    _repair_stale_episode_paths()
 
 
 def _sync_missing_columns():
@@ -51,6 +52,49 @@ def _sync_missing_columns():
                 conn.execute(text(
                     f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {col_type} {default_sql}'
                 ))
+
+
+_EPISODE_PATH_COLUMNS = ("audio_stem_path", "vocal_stem_path", "vocal_only_stem_path")
+
+
+def _repair_stale_episode_paths():
+    """If the app's own data directory moved (see electron/main.ts's
+    userData-to-install-drive migration), every episode row that still
+    points at the OLD directory needs re-anchoring — moving files on disk
+    doesn't touch absolute paths already stored in the database, and a raw
+    byte-level rewrite of the .db file isn't safe (SQLite's record layout
+    encodes string lengths; a differently-sized replacement path would
+    corrupt it). Only touches the 3 columns this codebase itself always
+    generates as <DATA_DIR>/episodes/<id>/... — never
+    original_file_path (the user's own source video, never copied here) or
+    a batch result the user redirected to a folder of their own choosing
+    (that file never moved, so its stored path is still correct)."""
+    with engine.begin() as conn:
+        rows = conn.execute(text(
+            f'SELECT id, {", ".join(_EPISODE_PATH_COLUMNS)} FROM episodes'
+        )).fetchall()
+        for row in rows:
+            ep_id = row[0]
+            updates = {}
+            for col, stored in zip(_EPISODE_PATH_COLUMNS, row[1:]):
+                fixed = _reanchor_episode_path(stored, ep_id)
+                if fixed:
+                    updates[col] = fixed
+            if updates:
+                set_clause = ", ".join(f'"{c}" = :{c}' for c in updates)
+                conn.execute(text(f'UPDATE episodes SET {set_clause} WHERE id = :id'), {**updates, "id": ep_id})
+
+
+def _reanchor_episode_path(stored_path, episode_id) -> "str | None":
+    if not stored_path or os.path.isfile(stored_path):
+        return None  # nothing stored, or already valid — nothing to fix
+    marker = os.path.join("episodes", str(episode_id))
+    idx = stored_path.rfind(marker)
+    if idx == -1:
+        return None  # not a path this codebase generated under episodes/<id>/ — leave it alone
+    remainder = stored_path[idx + len(marker):].lstrip("\\/")
+    candidate = os.path.join(DATA_DIR, "episodes", str(episode_id), remainder)
+    return candidate if os.path.isfile(candidate) else None
 
 
 def _default_sql_for(column) -> str:

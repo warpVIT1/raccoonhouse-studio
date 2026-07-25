@@ -7,16 +7,33 @@ import argparse
 import asyncio
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from typing import Set
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 # Make sure the package root is importable when run directly (python backend/main.py)
 if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# audio-separator (a third-party library, not ours) runs its own internal
+# `subprocess.check_output(["ffmpeg", "-version"])` sanity check the moment a
+# Separator() is instantiated — by bare name, relying on ffmpeg being on
+# PATH. Our own ffmpeg_service.py resolves the bundled resources/bin/ffmpeg.exe
+# by full path for our own subprocess calls (see _ffmpeg_bin()), but that does
+# nothing for a subprocess call INSIDE a dependency we don't control. On any
+# machine without ffmpeg installed system-wide — which is exactly the point
+# of bundling our own, so users never have to — this made every single
+# separation attempt fail immediately with FileNotFoundError, before any
+# model even loaded. Putting the bundled dir on PATH once at startup fixes
+# this for every subprocess call in the process, ours and third-party alike.
+_resources_dir = os.environ.get("RH_RESOURCES_DIR")
+if _resources_dir and os.path.isdir(_resources_dir):
+    os.environ["PATH"] = _resources_dir + os.pathsep + os.environ.get("PATH", "")
 
 # GPU acceleration is opt-in (Settings → gpu_enabled) and, when enabled,
 # needs torch's CUDA build swapped in ahead of the plain CPU one that's
@@ -39,6 +56,7 @@ from backend import job_manager
 from backend.routers import titles, episodes, characters, subtitles, markers, jobs, settings, hikka, profiles, power_share
 from backend.services.ffmpeg_service import get_waveform_samples
 from backend.services import discovery_service
+from backend.services.power_share_service import app_logger
 from backend.models import AppSettings, Profile
 from backend.schemas import WaveformResponse
 
@@ -73,17 +91,6 @@ def _discovery_state():
         db.close()
 
 
-def _manual_peer_config():
-    db = SessionLocal()
-    try:
-        s = db.get(AppSettings, 1)
-        if not s or not s.manual_peer_host:
-            return None, 8765
-        return s.manual_peer_host, s.manual_peer_port
-    finally:
-        db.close()
-
-
 def _online_signaling_config():
     db = SessionLocal()
     try:
@@ -100,8 +107,8 @@ async def lifespan(app: FastAPI):
     init_db()
     job_manager.set_broadcast(broadcast)
     discovery_service.set_state_provider(_discovery_state)
-    discovery_service.set_manual_peer_provider(_manual_peer_config)
     discovery_service.set_online_signaling_provider(_online_signaling_config)
+    discovery_service.set_broadcast(asyncio.get_event_loop(), job_manager._ws_broadcast)
     discovery_service.start(int(os.environ.get("RH_BACKEND_PORT", "8765")))
     yield
 
@@ -114,6 +121,44 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_all_requests(request: Request, call_next):
+    # Single choke point every single HTTP request passes through — logging
+    # here (rather than scattering a log call into every router function)
+    # guarantees complete coverage, including routers nobody's gotten around
+    # to instrumenting individually and any added later. /health and /ws are
+    # excluded: /health is polled continuously by the frontend's backend-ready
+    # check and would otherwise drown app.log in noise within minutes.
+    if request.url.path in ("/health",):
+        return await call_next(request)
+
+    start = time.monotonic()
+    try:
+        response = await call_next(request)
+    except Exception:
+        # The generic exception_handler below also logs this same traceback
+        # for the HTTP response it sends back — this duplicate catch is only
+        # to record the timing/path before re-raising, not to swallow it.
+        elapsed_ms = (time.monotonic() - start) * 1000
+        app_logger.exception("%s %s -> EXCEPTION (%.0fms)", request.method, request.url.path, elapsed_ms)
+        raise
+    elapsed_ms = (time.monotonic() - start) * 1000
+    log_fn = app_logger.warning if response.status_code >= 400 else app_logger.info
+    log_fn("%s %s -> %s (%.0fms)", request.method, request.url.path, response.status_code, elapsed_ms)
+    return response
+
+
+@app.exception_handler(Exception)
+async def log_unhandled_exception(request: Request, exc: Exception):
+    # Without this, an unhandled exception in any endpoint just becomes a
+    # bare 500 with no trace anywhere the user could actually send us — the
+    # packaged app has no visible console, so uvicorn's default stderr
+    # logging is otherwise unrecoverable. logger.exception() captures the
+    # full traceback into app.log, which a user CAN attach to a report.
+    app_logger.exception("UNHANDLED %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 # Register routers under /api prefix
 app.include_router(titles.router, prefix="/api")
@@ -160,10 +205,11 @@ def health():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
-    # 0.0.0.0 by default so the optional power-sharing feature can reach this
-    # machine over LAN — power-share endpoints themselves stay inert unless the
-    # user explicitly turns the feature on in Settings (off by default).
-    parser.add_argument("--host", default="0.0.0.0")
+    # Loopback only — Power Share no longer accepts direct inbound connections
+    # from other PCs (everything routes through the Cloudflare signaling
+    # Worker instead, see backend/services/discovery_service.py), so nothing
+    # needs this machine's local API reachable from the LAN anymore.
+    parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
 
     uvicorn.run(

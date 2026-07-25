@@ -13,8 +13,14 @@ const STATUS_FILTER_OPTIONS: Array<{ value: TitleStatus | 'all'; label: string }
   { value: 'done', label: 'Завершені' },
 ]
 
+const STATUS_OPTIONS: Array<{ value: TitleStatus; label: string }> = [
+  { value: 'new', label: 'Новий' },
+  { value: 'in_progress', label: 'В роботі' },
+  { value: 'done', label: 'Готово' },
+]
+
 export function TitlesPage() {
-  const { get, del } = useApi()
+  const { get, put, del } = useApi()
   const backendReady = useAppStore((s) => s.backendReady)
   const setSelectedTitle = useAppStore((s) => s.setSelectedTitle)
 
@@ -37,6 +43,15 @@ export function TitlesPage() {
     try {
       await del(`/titles/${id}`)
       setTitles((prev) => prev.filter((t) => t.id !== id))
+    } catch {
+      // ignore
+    }
+  }
+
+  async function handleStatusChange(id: number, status: TitleStatus) {
+    try {
+      const updated = await put<Title>(`/titles/${id}`, { status })
+      setTitles((prev) => prev.map((t) => (t.id === id ? updated : t)))
     } catch {
       // ignore
     }
@@ -122,6 +137,7 @@ export function TitlesPage() {
                 title={title}
                 onClick={() => setSelectedTitle(title.id)}
                 onDelete={() => handleDeleteTitle(title.id)}
+                onStatusChange={(status) => handleStatusChange(title.id, status)}
               />
             ))}
           </div>
@@ -145,9 +161,11 @@ interface TitleCardProps {
   title: Title
   onClick: () => void
   onDelete: () => void
+  onStatusChange: (status: TitleStatus) => void
 }
-function TitleCard({ title, onClick, onDelete }: TitleCardProps) {
+function TitleCard({ title, onClick, onDelete, onStatusChange }: TitleCardProps) {
   const [confirmingDelete, setConfirmingDelete] = useState(false)
+  const [changingStatus, setChangingStatus] = useState(false)
 
   return (
     <div
@@ -203,11 +221,30 @@ function TitleCard({ title, onClick, onDelete }: TitleCardProps) {
           {title.name_ua}
         </div>
         <div className="text-xs text-rh-muted line-clamp-1">{title.name_original}</div>
-        <div className="flex items-center justify-between mt-0.5">
-          <TitleBadge status={title.status} />
+        <div className="flex items-center justify-between mt-0.5 relative">
+          <button onClick={(e) => { e.stopPropagation(); setChangingStatus((v) => !v) }} className="cursor-pointer">
+            <TitleBadge status={title.status} />
+          </button>
           <span className="text-xs text-rh-muted">
             {title.episode_count ?? 0} еп.
           </span>
+
+          {changingStatus && (
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="absolute left-0 bottom-6 z-40 bg-[#1B1B1F] border border-rh-border2 rounded-xl p-1 min-w-[140px] shadow-2xl flex flex-col"
+            >
+              {STATUS_OPTIONS.map((opt) => (
+                <button
+                  key={opt.value}
+                  onClick={() => { onStatusChange(opt.value); setChangingStatus(false) }}
+                  className={`text-left rounded-lg px-2.5 py-1.5 text-xs hover:bg-white/5 ${opt.value === title.status ? 'text-rh-accent font-semibold' : 'text-rh-text'}`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>

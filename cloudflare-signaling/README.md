@@ -1,41 +1,53 @@
-# RaccoonHouse online power-share signaling
+# RaccoonHouse online power-share signaling + transfer relay
 
-A small Cloudflare Worker + Durable Object that lets two RaccoonHouse
-instances find each other over the internet (not just LAN/VPN mesh) for the
-Power Share feature. It only ever sees:
+A small Cloudflare Worker + Durable Object + R2 bucket that lets two
+RaccoonHouse instances share power **entirely over the internet, with no
+direct connection between them** — no shared LAN, no VPN mesh, no port
+forwarding. Everything a Power Share job needs flows through this Worker:
 
-- who's currently online, and their public IP (learned from the connection
-  itself via Cloudflare's `CF-Connecting-IP` header — no self-IP-detection
-  needed on the client)
-- tiny consent-request/response messages between two specific peers
-
-The actual separation job's file upload still goes **directly** PC-to-PC
-over plain HTTP (see `backend/services/power_share_service.py`) — this
-Worker never sees that traffic, and structurally couldn't handle it anyway
-(Workers have per-request CPU/duration limits that make them a poor fit for
-relaying multi-gigabyte video files).
-
-This does **not** solve NAT traversal. If the receiving PC's router blocks
-unsolicited incoming connections (no port forwarding / UPnP), the direct
-file upload still won't connect even after both sides find each other here.
+- **Presence** — who's currently online, learned from the connection itself
+  via Cloudflare's `CF-Connecting-IP` header (kept for logging only; it's no
+  longer used to open a direct connection to a peer).
+- **Consent** — the "can I borrow your PC?" request/response, relayed as a
+  small WebSocket message between the two specific peers involved.
+- **File transfer** — the actual audio/video, and the processed result
+  coming back, both go through the `TRANSFERS` R2 bucket: the sender `PUT`s
+  the file to `/transfer/:id`, the receiver `GET`s it from the same URL, and
+  both sides `DELETE` it when they're done. This is a store-and-forward
+  relay, not a live proxy — the Worker only ever holds the object in R2
+  between the two HTTP calls, which is what lets it handle multi-gigabyte
+  files without hitting a Worker's per-request CPU/duration limits (which a
+  live in-request relay of that much data would).
 
 ## Deploy
 
 Needs a free Cloudflare account (no card required for the Workers free
-tier).
+tier; R2 may ask you to add a payment method to enable it even though the
+free tier itself has no charge for typical personal usage — 10GB storage,
+generous free request quota, no egress fee).
 
 ```sh
 cd cloudflare-signaling
 npm install
-npx wrangler login          # opens a browser to authorize once
+npx wrangler login                              # opens a browser to authorize once
+npx wrangler r2 bucket create raccoonhouse-transfers   # one-time, matches wrangler.jsonc
 npx wrangler deploy
+```
+
+Optional but recommended — auto-expire any transfer object nobody ever
+picked up (e.g. the receiver's PC crashed mid-job), as a safety net on top
+of the app's own explicit `DELETE` after a completed transfer:
+
+```sh
+npx wrangler r2 bucket lifecycle add raccoonhouse-transfers --expire-days 1
 ```
 
 Wrangler prints the deployed URL, e.g.
 `https://raccoonhouse-signaling.<your-subdomain>.workers.dev` — the app
 needs it as `wss://raccoonhouse-signaling.<your-subdomain>.workers.dev/`
-(note `wss://`, not `https://`) in Settings → Power Share → online
-signaling URL, on every instance that should use it.
+(note `wss://`, not `https://`) in Settings → Power Share → signaling URL,
+on every instance that should use it. The app derives the `https://` base
+for `/transfer/:id` calls from that same URL.
 
 ## Local development
 
@@ -43,8 +55,9 @@ signaling URL, on every instance that should use it.
 npm run dev
 ```
 
-Starts a local copy at `ws://127.0.0.1:8787/` — point a dev build's
-`online_signaling_url` setting at that to test without deploying.
+Starts a local copy at `ws://127.0.0.1:8787/` (and R2 is emulated locally
+too) — point a dev build's `online_signaling_url` setting at that to test
+without deploying.
 
 ## Protocol
 
@@ -63,7 +76,17 @@ Worker → all clients, whenever the online set changes:
 {"type": "peers", "peers": [{"id": "...", "host": "1.2.3.4", "port": 8765, "name": "...", ...}]}
 ```
 
-Client → Worker → target peer (small messages only):
+Client → Worker → target peer (consent handshake and job control; payload
+`kind` is one of `consent_request` / `consent_response` / `job_request` /
+`job_done` / `job_error` — see `backend/services/discovery_service.py`):
 ```json
-{"type": "relay", "target_id": "...", "payload": {...}}
+{"type": "relay", "target_id": "...", "payload": {"kind": "...", "request_id": "...", ...}}
+```
+
+File transfer (plain HTTPS, not WebSocket) — `id` is a per-transfer UUID
+agreed between the two peers via the `relay` messages above:
+```
+PUT    /transfer/:id     body = raw file bytes, streamed into R2
+GET    /transfer/:id     -> raw file bytes, streamed from R2 (404 if absent)
+DELETE /transfer/:id     removes the object
 ```

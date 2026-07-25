@@ -10,6 +10,12 @@
       }
     ]
   },
+  "r2_buckets": [
+    {
+      "binding": "TRANSFERS",
+      "bucket_name": "raccoonhouse-transfers"
+    }
+  ],
   "migrations": [
     {
       "tag": "v1",

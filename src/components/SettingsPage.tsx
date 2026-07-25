@@ -16,8 +16,6 @@ const EMPTY_SETTINGS: AppSettings = {
   active_profile: null,
   power_share_enabled: true,
   power_share_auto_approve: false,
-  manual_peer_host: null,
-  manual_peer_port: 8765,
   online_signaling_enabled: true,
   online_signaling_url: 'wss://raccoonhouse-signaling.raccoonhause.workers.dev/',
   gpu_enabled: false,
@@ -114,49 +112,6 @@ export function SettingsPage() {
           )}
         </Row>
 
-        {/* Separation model */}
-        <Row
-          label="Модель вокал-розділення"
-          value={`${settings.separation_model}${settings.ensemble_default ? ' · Ensemble' : ''}`}
-          action={editingModel ? undefined : 'Обрати'}
-          onAction={() => setEditingModel(true)}
-        >
-          {editingModel && (
-            <div className="flex flex-col gap-2 mt-2.5">
-              <div className="flex flex-wrap gap-1.5">
-                {settings.available_models.map((m) => (
-                  <button
-                    key={m}
-                    onClick={() => save({ separation_model: m })}
-                    className={`px-3 py-1.5 rounded-full text-[11px] font-semibold border transition-colors ${
-                      settings.separation_model === m
-                        ? 'bg-rh-accent/15 border-rh-accent/50 text-white'
-                        : 'border-rh-border text-rh-text-dim hover:border-rh-accent/40 hover:text-white'
-                    }`}
-                  >
-                    {m}
-                  </button>
-                ))}
-              </div>
-              <label className="flex items-center gap-2 text-[11.5px] text-rh-text-dim cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={settings.ensemble_default}
-                  onChange={(e) => save({ ensemble_default: e.target.checked })}
-                  className="accent-rh-accent"
-                />
-                Ensemble Mode — запускати кілька моделей і об'єднувати результат
-              </label>
-              <button
-                onClick={() => setEditingModel(false)}
-                className="self-start text-[11px] font-semibold text-rh-muted hover:text-white transition-colors"
-              >
-                Готово
-              </button>
-            </div>
-          )}
-        </Row>
-
         {/* GPU acceleration — off by default, opt-in because enabling it
             downloads a one-time ~2.5GB CUDA runtime (see gpu_runtime_service.py) */}
         <div className="flex items-center gap-3 py-3.5 px-4 border-b border-rh-border/70">
@@ -250,9 +205,6 @@ export function SettingsPage() {
         onToggle={(v) => save({ power_share_enabled: v })}
         powerShareAutoApprove={settings.power_share_auto_approve}
         onToggleAutoApprove={(v) => save({ power_share_auto_approve: v })}
-        manualPeerHost={settings.manual_peer_host}
-        manualPeerPort={settings.manual_peer_port}
-        onSaveManualPeer={(host, port) => save({ manual_peer_host: host, manual_peer_port: port })}
         onlineSignalingEnabled={settings.online_signaling_enabled}
         onlineSignalingUrl={settings.online_signaling_url}
         onSaveOnlineSignaling={(enabled, url) => save({ online_signaling_enabled: enabled, online_signaling_url: url })}

@@ -6,6 +6,7 @@ import { WaveformViewer } from './workspace/WaveformViewer'
 import { SubtitleGrid } from './workspace/SubtitleGrid'
 import { MarkersTab } from './workspace/MarkersTab'
 import { Spinner } from './ui/Spinner'
+import { VocalSeparationModal, type SeparationModel, type SeparationParams } from './VocalSeparationModal'
 import type { Episode, SubtitleLine, Marker, Character, Dubber, JobStatus } from '../types'
 
 type WorkspaceTab = 'subtitles' | 'markers'
@@ -50,14 +51,17 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   const resizingRef = useRef(false)
 
   // Separation panel state
-  const SEPARATION_MODELS = ['MDX-Net', 'VR Arch', 'Demucs', 'MDX23C', 'BS-RoFormer'] as const
   const [showSeparationPanel, setShowSeparationPanel] = useState(false)
-  const [sepModel, setSepModel] = useState<typeof SEPARATION_MODELS[number]>('MDX-Net')
-  const [ensembleMode, setEnsembleMode] = useState(false)
   const [separating, setSeparating] = useState(false)
   const [powerShareEnabled, setPowerShareEnabled] = useState(false)
   const [requestingPower, setRequestingPower] = useState(false)
   const [powerShareError, setPowerShareError] = useState<string | null>(null)
+  const [separationError, setSeparationError] = useState<string | null>(null)
+  const [batchRendering, setBatchRendering] = useState(false)
+  const [batchResults, setBatchResults] = useState<{ jobId: string; items: { model: string; path: string }[] } | null>(null)
+  const [usingBatchResult, setUsingBatchResult] = useState<string | null>(null)
+  const [distributedRunning, setDistributedRunning] = useState(false)
+  const [markersError, setMarkersError] = useState<string | null>(null)
 
   // Final render/mux
   const [rendering, setRendering] = useState(false)
@@ -102,19 +106,46 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     if (!backendReady) return
     for (const job of activeJobs.values()) {
       if (job.episode_id !== episodeId) continue
-      if (job.status === 'error' && job.type === 'request_remote_separation') {
-        // Surfaces the exact deny reason (per-peer) from the background job —
-        // otherwise a remote-power failure would only ever show up as a
-        // silently-vanished spinner in the title bar.
+      if (job.status === 'error') {
+        // Surfaces the exact failure reason from the background job — without
+        // this, ANY job failing (separation, marker detection, mux, remote
+        // power request…) only ever showed up as a silently-vanished spinner,
+        // indistinguishable from it never having started at all.
         if (!handledJobIdsRef.current.has(job.id)) {
           handledJobIdsRef.current.add(job.id)
-          setPowerShareError(job.message || 'Не вдалося отримати потужність')
+          console.error(`[job ${job.type}] failed:`, job.message)
+          if (job.type === 'request_remote_separation') {
+            setPowerShareError(job.message || 'Не вдалося отримати потужність')
+          } else if (job.type === 'separate_vocals' || job.type === 'batch_separate_vocals' || job.type === 'distributed_separate_vocals') {
+            setSeparationError(job.message || 'Не вдалося виконати ізоляцію вокалу')
+          } else if (job.type === 'detect_markers') {
+            setMarkersError(job.message || 'Не вдалося виявити маркери')
+          }
         }
         continue
       }
       if (job.status !== 'complete') continue
       if (handledJobIdsRef.current.has(job.id)) continue
       handledJobIdsRef.current.add(job.id)
+
+      // Batch mode deliberately never touches the episode's own fields (see
+      // separate_file_batch's docstring) — its N separate FLAC files have no
+      // other home in the UI, so the only way the user actually sees them is
+      // opening the folder they landed in directly.
+      if (job.type === 'batch_separate_vocals') {
+        const outputDir = job.result?.output_dir
+        if (typeof outputDir === 'string' && window.electronAPI?.openPath) {
+          window.electronAPI.openPath(outputDir).catch((err) => console.error('[batch] failed to open output folder:', err))
+        }
+        const models = job.result?.models
+        if (models && typeof models === 'object') {
+          setBatchResults({
+            jobId: job.id,
+            items: Object.entries(models as Record<string, string>).map(([model, path]) => ({ model, path })),
+          })
+        }
+        continue
+      }
 
       get<Episode>(`/episodes/${episodeId}`).then(setEpisode).catch(() => {})
       get<SubtitleLine[]>(`/episodes/${episodeId}/subtitle-lines`).then(setSubtitles).catch(() => {})
@@ -418,13 +449,13 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   }
 
   // Vocal separation
-  async function handleSeparate() {
+  async function handleSeparate(model: SeparationModel, ensemble: boolean, modelFile?: string, params?: SeparationParams) {
     if (!backendReady || !episode?.original_file_path) return
     setSeparating(true)
+    setSeparationError(null)
     try {
       const result = await post<{ job_id: string }>(`/episodes/${episodeId}/separate-vocals`, {
-        model: sepModel,
-        ensemble: ensembleMode,
+        model, ensemble, model_file: modelFile, params,
       })
       upsertJob({
         id: result.job_id,
@@ -435,28 +466,31 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
         episode_id: episodeId,
       })
       setShowSeparationPanel(false)
-    } catch {
-      // ignore
+    } catch (err) {
+      // Previously swallowed entirely — the "Запустити" button would just
+      // stop spinning with zero feedback (e.g. when audio_stem_path isn't
+      // ready yet, the backend returns 400 and nothing told the user why).
+      console.error('[separate-vocals] request failed:', err)
+      setSeparationError(err instanceof Error ? err.message : 'Не вдалося запустити ізоляцію вокалу')
     } finally {
       setSeparating(false)
     }
   }
 
-  async function handleRequestRemotePower() {
+  async function handleRequestRemotePower(model: SeparationModel, ensemble: boolean, modelFile?: string, params?: SeparationParams) {
     if (!backendReady) return
     setRequestingPower(true)
     setPowerShareError(null)
     try {
       const result = await post<{ job_id: string }>(`/episodes/${episodeId}/request-remote-separation`, {
-        model: sepModel,
-        ensemble: ensembleMode,
+        model, ensemble, model_file: modelFile, params,
       })
       upsertJob({
         id: result.job_id,
         type: 'request_remote_separation',
         status: 'running',
         percent: 0,
-        message: 'Шукаю доступні ПК у мережі…',
+        message: 'Шукаю доступні ПК онлайн…',
         episode_id: episodeId,
       })
       setShowSeparationPanel(false)
@@ -467,11 +501,90 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     }
   }
 
+  // Batch render — runs all 5 methods, each kept as its own separate file
+  // (see backend/services/separator_service.py's separate_file_batch).
+  // Asks where to save first (native folder dialog), same pattern as
+  // handleRender above — cancelling the dialog aborts the batch run
+  // entirely rather than silently falling back to the internal data dir.
+  async function handleBatchSeparate() {
+    if (!backendReady || !episode?.original_file_path) return
+    let outputDir: string | null = null
+    if (window.electronAPI?.openDirectory) {
+      outputDir = await window.electronAPI.openDirectory()
+      if (!outputDir) return
+    }
+    setBatchRendering(true)
+    setSeparationError(null)
+    try {
+      const result = await post<{ job_id: string }>(`/episodes/${episodeId}/batch-separate-vocals`, {
+        output_dir: outputDir,
+      })
+      upsertJob({
+        id: result.job_id,
+        type: 'batch_separate_vocals',
+        status: 'running',
+        percent: 0,
+        message: 'Пакетний рендер (усі методи)…',
+        episode_id: episodeId,
+      })
+      setShowSeparationPanel(false)
+    } catch (err) {
+      console.error('[batch-separate-vocals] request failed:', err)
+      setSeparationError(err instanceof Error ? err.message : 'Не вдалося запустити пакетний рендер')
+    } finally {
+      setBatchRendering(false)
+    }
+  }
+
+  async function handleUseBatchResult(jobId: string, path: string) {
+    setUsingBatchResult(path)
+    try {
+      await post(`/episodes/${episodeId}/use-batch-result`, { job_id: jobId, path })
+      setBatchResults(null)
+      const ep = await get<Episode>(`/episodes/${episodeId}`)
+      setEpisode(ep)
+    } catch (err) {
+      console.error('[use-batch-result] failed:', err)
+      setSeparationError(err instanceof Error ? err.message : 'Не вдалося обрати цей файл')
+    } finally {
+      setUsingBatchResult(null)
+    }
+  }
+
+  // Distributed processing — splits the episode across every available
+  // Power Share peer + this machine, falling back to plain local separation
+  // if nobody's around (see backend/services/distributed_separation_service.py).
+  async function handleDistributedSeparate(model: SeparationModel, ensemble: boolean, modelFile?: string, params?: SeparationParams) {
+    if (!backendReady || !episode?.original_file_path) return
+    setDistributedRunning(true)
+    setSeparationError(null)
+    try {
+      const result = await post<{ job_id: string }>(`/episodes/${episodeId}/distributed-separate-vocals`, {
+        model, ensemble, model_file: modelFile, params,
+      })
+      upsertJob({
+        id: result.job_id,
+        type: 'distributed_separate_vocals',
+        status: 'running',
+        percent: 0,
+        message: 'Розподілена обробка…',
+        episode_id: episodeId,
+      })
+      setShowSeparationPanel(false)
+    } catch (err) {
+      console.error('[distributed-separate-vocals] request failed:', err)
+      setSeparationError(err instanceof Error ? err.message : 'Не вдалося запустити розподілену обробку')
+    } finally {
+      setDistributedRunning(false)
+    }
+  }
+
   // Detect markers
   async function handleDetectMarkers() {
     if (!backendReady) return
-    const result = await post<{ job_id: string }>(`/episodes/${episodeId}/detect-markers`, {}).catch(() => null)
-    if (result) {
+    setMarkersError(null)
+    try {
+      const result = await post<{ job_id: string }>(`/episodes/${episodeId}/detect-markers`, {})
       upsertJob({
         id: result.job_id,
         type: 'detect_markers',
@@ -480,6 +593,13 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
         message: 'Виявлення маркерів…',
         episode_id: episodeId,
       })
+    } catch (err) {
+      // Previously silently swallowed (.catch(() => null)) — a rejection
+      // here (e.g. no vocal-only stem, see detect_markers below) produced
+      // literally no feedback: button click, nothing happens, no spinner,
+      // no error. Surfacing it the same way separationError does elsewhere.
+      console.error('[detect-markers] request failed:', err)
+      setMarkersError(err instanceof Error ? err.message : 'Не вдалося запустити виявлення маркерів')
     }
   }
 
@@ -556,9 +676,28 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
         )}
 
         {episodeJob && (
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-amber-900/30 text-amber-300">
+          <span className="inline-flex items-center gap-1.5 pl-2.5 pr-1 py-1 rounded-full text-xs bg-amber-900/30 text-amber-300">
             <Spinner size={10} />
             {episodeJob.message} {episodeJob.percent > 0 ? `${episodeJob.percent}%` : ''}
+            <button
+              onClick={() => del(`/jobs/${episodeJob.id}`).catch(() => {})}
+              title="Скасувати"
+              className="w-4 h-4 rounded-full flex items-center justify-center text-amber-300/70 hover:text-white hover:bg-amber-400/20 leading-none"
+            >
+              ✕
+            </button>
+          </span>
+        )}
+
+        {markersError && (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-red-900/30 text-red-300 max-w-[420px]">
+            <span className="truncate">{markersError}</span>
+            <button
+              onClick={() => setMarkersError(null)}
+              className="w-4 h-4 rounded-full flex items-center justify-center text-red-300/70 hover:text-white hover:bg-red-400/20 leading-none flex-shrink-0"
+            >
+              ✕
+            </button>
           </span>
         )}
 
@@ -629,46 +768,56 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
         </div>
       </div>
 
-      {/* Separation panel */}
+      {/* Separation settings modal */}
       {showSeparationPanel && (
-        <div className="flex items-center gap-4 px-4 py-2.5 bg-rh-card border-b border-rh-border flex-shrink-0">
-          <span className="text-xs text-rh-muted">Модель:</span>
-          {SEPARATION_MODELS.map((m) => (
-            <button
-              key={m}
-              onClick={() => setSepModel(m)}
-              className={`px-3 py-1 rounded text-xs font-medium transition-colors
-                ${sepModel === m ? 'bg-rh-accent text-white' : 'text-rh-muted hover:text-rh-text hover:bg-white/5'}`}
-            >
-              {m}
-            </button>
-          ))}
-          <div className="w-px h-4 bg-rh-border" />
-          <label className="flex items-center gap-1.5 text-xs text-rh-text-dim cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={ensembleMode}
-              onChange={(e) => setEnsembleMode(e.target.checked)}
-              className="accent-rh-accent"
-            />
-            Ensemble Mode
-          </label>
-          <button onClick={handleSeparate} className="rh-btn-primary text-xs ml-2" disabled={separating || requestingPower || !episode?.original_file_path}>
-            {separating ? <Spinner size={12} /> : null}
-            Запустити
-          </button>
-          {powerShareEnabled && (
-            <button onClick={handleRequestRemotePower} className="rh-btn-outline text-xs" disabled={separating || requestingPower || !episode?.original_file_path}>
-              {requestingPower ? <Spinner size={12} /> : null}
-              Запросити потужність
-            </button>
-          )}
-          {!episode?.original_file_path && (
-            <span className="text-xs text-rh-muted">Спочатку завантажте відео</span>
-          )}
-          {powerShareError && (
-            <span className="text-xs text-red-400">{powerShareError}</span>
-          )}
+        <VocalSeparationModal
+          onClose={() => setShowSeparationPanel(false)}
+          onRun={handleSeparate}
+          onRequestPower={handleRequestRemotePower}
+          onRunBatch={handleBatchSeparate}
+          onRunDistributed={handleDistributedSeparate}
+          separating={separating}
+          requestingPower={requestingPower}
+          batchRendering={batchRendering}
+          distributedRunning={distributedRunning}
+          powerShareEnabled={powerShareEnabled}
+          powerShareError={powerShareError}
+          separationError={separationError}
+          disabled={!episode?.original_file_path}
+        />
+      )}
+
+      {/* Batch separation results — pick one to become the episode's actual
+          instrumental. Batch mode intentionally never sets this on its own
+          (see separator_service.separate_file_batch's docstring), so
+          without this picker "Рендерити фінальну доріжку" stays disabled
+          forever after a batch run even though usable output files exist. */}
+      {batchResults && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setBatchResults(null)}>
+          <div className="rh-card w-[420px] p-5 flex flex-col gap-3 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold">Пакетний рендер готовий — обрати результат</h2>
+              <button onClick={() => setBatchResults(null)} className="text-rh-muted hover:text-white text-lg leading-none px-1">✕</button>
+            </div>
+            <p className="text-xs text-rh-muted">
+              Кожен метод дав окремий файл у теці, яка щойно відкрилась. Оберіть той, що звучить найкраще —
+              він стане інструменталом цієї серії для рендеру.
+            </p>
+            <div className="flex flex-col gap-1.5">
+              {batchResults.items.map((r) => (
+                <div key={r.model} className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-rh-border">
+                  <span className="text-xs font-medium">{r.model}</span>
+                  <button
+                    onClick={() => handleUseBatchResult(batchResults.jobId, r.path)}
+                    disabled={usingBatchResult === r.path}
+                    className="rh-btn-outline text-[11px] px-2.5 py-1"
+                  >
+                    {usingBatchResult === r.path ? <Spinner size={11} /> : 'Обрати'}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       )}
 

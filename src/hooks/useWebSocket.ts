@@ -25,29 +25,39 @@ export function useWebSocket() {
         fetch(`http://localhost:${backendPort}/api/jobs`)
           .then((r) => r.json())
           .then((jobs: Array<{ id: string }>) => reconcileActiveJobs(jobs.map((j) => j.id)))
-          .catch(() => {})
+          .catch((err) => console.error('[ws] Failed to reconcile active jobs on connect:', err))
       }
 
       socket.onmessage = (event) => {
         try {
           const msg: WsMessage = JSON.parse(event.data)
+          // electron.log forwards console-message via Chromium's API, which
+          // stringifies non-string args with a bare toString() — an object
+          // arg here always came out as the useless literal "[object
+          // Object]" in the log file (confirmed live), even though DevTools
+          // itself renders it fine. Logging the original JSON string sidesteps
+          // that entirely.
+          console.log('[ws] message:', event.data)
           handleWsMessage(msg)
-        } catch {
-          // ignore malformed
+        } catch (err) {
+          console.error('[ws] Received malformed message, ignoring:', event.data, err)
         }
       }
 
       socket.onclose = () => {
+        console.log('[ws] Disconnected from backend — reconnecting in 2s')
         setBackendReady(false)
         ws.current = null
         // Reconnect after 2s
         reconnectTimer.current = setTimeout(connect, 2000)
       }
 
-      socket.onerror = () => {
+      socket.onerror = (event) => {
+        console.error('[ws] Socket error:', event)
         socket.close()
       }
-    } catch {
+    } catch (err) {
+      console.error('[ws] Failed to open socket, reconnecting in 2s:', err)
       reconnectTimer.current = setTimeout(connect, 2000)
     }
   }, [backendPort, handleWsMessage, setBackendReady, reconcileActiveJobs])

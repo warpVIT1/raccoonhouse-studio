@@ -209,8 +209,6 @@ class AppSettingsOut(BaseModel):
     active_profile: Optional["ProfileOut"] = None
     power_share_enabled: bool = True
     power_share_auto_approve: bool = False
-    manual_peer_host: Optional[str] = None
-    manual_peer_port: int = 8765
     online_signaling_enabled: bool = True
     online_signaling_url: Optional[str] = None
     gpu_enabled: bool = False
@@ -233,8 +231,6 @@ class AppSettingsUpdate(BaseModel):
     active_profile_id: Optional[int] = None
     power_share_enabled: Optional[bool] = None
     power_share_auto_approve: Optional[bool] = None
-    manual_peer_host: Optional[str] = None
-    manual_peer_port: Optional[int] = None
     online_signaling_enabled: Optional[bool] = None
     online_signaling_url: Optional[str] = None
     gpu_enabled: Optional[bool] = None
@@ -256,27 +252,10 @@ class ProfileOut(ProfileBase):
     model_config = {"from_attributes": True}
 
 
-class PowerShareRequestIn(BaseModel):
-    """Sent by the requester's machine to a peer's /power-share/consent-request."""
-    requester_name: str
-    requester_host: str
-    requester_port: int = 8765
-    title_id: int
-    title_name: str
-    episode_number: int
-    task: str = "separate"  # "separate" (vocal isolation) | "import" (full ffmpeg import)
-
-
 class PowerShareRespondIn(BaseModel):
     """Posted by the local user (on the peer machine) clicking Так/Ні."""
     request_id: str
     approved: bool
-
-
-class PowerShareDecisionOut(BaseModel):
-    request_id: str
-    approved: bool
-    reason: str = ""  # "approved" | "denied" | "timeout" | "remembered"
 
 
 class HikkaAnimeResult(BaseModel):

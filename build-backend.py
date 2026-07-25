@@ -25,6 +25,7 @@ def main():
         # temp directory on every launch, which would mean re-downloading
         # gigabytes on every single startup.
         "--onedir",
+        "--noconfirm",
         "--name", "raccoonhouse-backend",
         "--distpath", "backend-dist",
         "--workpath", "build-pyinstaller",

@@ -20,3 +20,5 @@ resources/*.bmp
 resources/bin/
 # Local Claude Code tooling config, not part of the app itself.
 .claude/
+# Assistant's own persistent working notes — private, not for publishing.
+CLAUDE.md

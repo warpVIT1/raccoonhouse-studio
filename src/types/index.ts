@@ -74,7 +74,7 @@ export interface Marker {
 
 export interface JobStatus {
   id: string
-  type: 'import_video' | 'import_video_remote' | 'separate_vocals' | 'request_remote_separation' | 'detect_markers' | 'export_srt' | 'mux_audio' | 'install_gpu_runtime'
+  type: 'import_video' | 'import_video_remote' | 'separate_vocals' | 'batch_separate_vocals' | 'distributed_separate_vocals' | 'request_remote_separation' | 'detect_markers' | 'export_srt' | 'mux_audio' | 'install_gpu_runtime'
   status: 'pending' | 'running' | 'complete' | 'error' | 'cancelled'
   percent: number
   message: string
@@ -83,7 +83,7 @@ export interface JobStatus {
 }
 
 export interface WsMessage {
-  type: 'progress' | 'complete' | 'error' | 'status' | 'power_share_request' | 'power_share_lending'
+  type: 'progress' | 'complete' | 'error' | 'cancelled' | 'status' | 'power_share_request' | 'power_share_lending'
   job_id?: string
   percent?: number
   message?: string
@@ -112,8 +112,6 @@ export interface AppSettings {
   active_profile: Profile | null
   power_share_enabled: boolean
   power_share_auto_approve: boolean
-  manual_peer_host: string | null
-  manual_peer_port: number
   online_signaling_enabled: boolean
   online_signaling_url: string | null
   gpu_enabled: boolean

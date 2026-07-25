@@ -10,6 +10,74 @@ const APP_ROOT = path.join(__dirname, '..')
 
 process.env.APP_ROOT = APP_ROOT
 
+// Keep all app data (DB, downloaded models, audio stems, GPU runtime,
+// Chromium's own caches, logs — everything Electron's default userData
+// would hold) on the same drive the program is actually installed on,
+// instead of always on the OS drive via %APPDATA% (which is hardcoded to
+// the user profile regardless of where the app itself was installed) —
+// the app can easily accumulate several GB (model weights + GPU runtime +
+// episode stems) and the user wants that off the system drive whenever
+// the app isn't installed there. Must run before ANY app.getPath('userData')
+// call and before Chromium's profile initializes (Electron only allows
+// setPath('userData', ...) prior to the 'ready' event), so this sits as
+// early as possible, right after APP_ROOT. Dev runs are left on the
+// default path — there's no meaningful "install drive" for an
+// unpackaged checkout.
+if (app.isPackaged) {
+  const installDir = path.dirname(app.getPath('exe'))
+  const dataDir = path.join(installDir, 'data')
+  // Where every previous version kept everything (Electron's own default
+  // userData) — computed independently of app.getPath('userData') itself,
+  // since that's about to be redirected below.
+  const legacyDataDir = path.join(app.getPath('appData'), app.getName())
+
+  if (
+    legacyDataDir !== dataDir &&
+    !fs.existsSync(path.join(dataDir, 'raccoonhouse.db')) &&
+    fs.existsSync(path.join(legacyDataDir, 'raccoonhouse.db'))
+  ) {
+    // One-time move for anyone upgrading from a version that stored
+    // everything under %APPDATA%. fs.renameSync is tried first (instant,
+    // no double disk usage) but Node's rename on Windows fails with EXDEV
+    // across drive letters — exactly the common case here (old data on
+    // C:, install typically elsewhere) — confirmed live: silently no-op'd
+    // and left a fresh empty profile instead of the real data. Falls back
+    // to a recursive copy + delete-the-source, which works across drives.
+    try {
+      fs.renameSync(legacyDataDir, dataDir)
+    } catch {
+      try {
+        fs.cpSync(legacyDataDir, dataDir, { recursive: true })
+        fs.rmSync(legacyDataDir, { recursive: true, force: true })
+      } catch (err) {
+        console.error('[main] Failed to migrate data dir from', legacyDataDir, 'to', dataDir, err)
+      }
+    }
+  }
+
+  fs.mkdirSync(dataDir, { recursive: true })
+  app.setPath('userData', dataDir)
+}
+
+// Persistent file log for the main process AND the renderer (via the
+// console-message forwarding below) — same logs/ directory the Python
+// backend writes app.log/power_share.log into (RH_DATA_DIR is set to this
+// same userData path when the backend is spawned, see startBackend()).
+// Without this, every console.log/console.error in this file — and every
+// console.error a React component does — went nowhere a packaged app's user
+// could ever retrieve, since a packaged Electron app has no visible console.
+const LOG_DIR = path.join(app.getPath('userData'), 'logs')
+fs.mkdirSync(LOG_DIR, { recursive: true })
+const electronLogStream = fs.createWriteStream(path.join(LOG_DIR, 'electron.log'), { flags: 'a' })
+
+function logLine(level: 'INFO' | 'ERROR', tag: string, ...args: unknown[]) {
+  const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')
+  const line = `${new Date().toISOString()} ${level} [${tag}] ${msg}\n`
+  electronLogStream.write(line)
+  if (level === 'ERROR') console.error(`[${tag}]`, ...args)
+  else console.log(`[${tag}]`, ...args)
+}
+
 const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL
 const RENDERER_DIST = path.join(APP_ROOT, 'dist')
 process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL
@@ -37,7 +105,7 @@ function killAnyoneOnBackendPort() {
       out.split('\n').map((line) => line.trim().split(/\s+/).pop()).filter((pid): pid is string => !!pid && /^\d+$/.test(pid))
     )
     for (const pid of pids) {
-      console.log('[main] Killing stale process on port', BACKEND_PORT, 'pid=', pid)
+      logLine('INFO', 'main', 'Killing stale process on port', BACKEND_PORT, 'pid=', pid)
       try { execSync(`taskkill /PID ${pid} /T /F`) } catch { /* already gone */ }
     }
   } catch {
@@ -45,7 +113,173 @@ function killAnyoneOnBackendPort() {
   }
 }
 
-function startBackend() {
+// Runs a command to completion, streaming its output into electron.log as it
+// happens (rather than buffering it all until exit) — venv creation and pip
+// install can each take minutes, and a silent multi-minute hang with zero
+// output is indistinguishable from the process being stuck.
+function runCommand(cmd: string, args: string[], label: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    logLine('INFO', label, `$ ${cmd} ${args.join(' ')}`)
+    let proc: ChildProcess
+    try {
+      proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (err) {
+      logLine('ERROR', label, 'failed to spawn:', err)
+      resolve(false)
+      return
+    }
+    proc.stdout?.on('data', (d) => logLine('INFO', label, d.toString().trim()))
+    proc.stderr?.on('data', (d) => logLine('INFO', label, d.toString().trim()))
+    proc.on('error', (err) => {
+      logLine('ERROR', label, 'failed to spawn:', err)
+      resolve(false)
+    })
+    proc.on('exit', (code) => {
+      if (code !== 0) logLine('ERROR', label, `exited with code ${code}`)
+      resolve(code === 0)
+    })
+  })
+}
+
+// torch/torchvision/onnxruntime-gpu in requirements.txt are cp312-specific
+// wheels — a venv built off some OTHER Python minor version (e.g. whatever a
+// machine happens to have, like the 3.14 seen on this very machine's PATH)
+// would either fail to install these at all, or pick incompatible fallback
+// wheels. Keep in sync with whatever backend/requirements.txt's wheels are
+// actually built for (confirmed live: this project's own .venv runs 3.12.10).
+const REQUIRED_PYTHON_MAJOR_MINOR = '3.12'
+const REQUIRED_PYTHON_FULL_VERSION = '3.12.10'
+const PYTHON_INSTALLER_URL =
+  `https://www.python.org/ftp/python/${REQUIRED_PYTHON_FULL_VERSION}/python-${REQUIRED_PYTHON_FULL_VERSION}-amd64.exe`
+
+// Looks for an existing Python matching the required minor version — common
+// python.org install locations first (fast, no subprocess), then the Python
+// Launcher for Windows (`py -3.12`), which python.org's own installer sets up
+// and can find a specific minor version even when it isn't what a bare
+// "python" on PATH resolves to (there can be several Python versions
+// installed side by side).
+async function findCompatiblePython(): Promise<string | null> {
+  const versionTag = REQUIRED_PYTHON_MAJOR_MINOR.replace('.', '')
+  const candidates = [
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Python', `Python${versionTag}`, 'python.exe'),
+    `C:\\Python${versionTag}\\python.exe`,
+  ]
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c
+  }
+
+  const found = await new Promise<string | null>((resolve) => {
+    let proc: ChildProcess
+    try {
+      proc = spawn('py', [`-${REQUIRED_PYTHON_MAJOR_MINOR}`, '-c', 'import sys; print(sys.executable)'], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+      })
+    } catch {
+      resolve(null)
+      return
+    }
+    let out = ''
+    proc.stdout?.on('data', (d) => { out += d.toString() })
+    proc.on('error', () => resolve(null))
+    proc.on('exit', (code) => resolve(code === 0 ? out.trim() : null))
+  })
+  return found && fs.existsSync(found) ? found : null
+}
+
+// Downloads a file with electron's own net/fetch (available in this Node/
+// Electron version) straight to disk — no extra dependency needed for a
+// single ~25MB download.
+async function downloadFile(url: string, destPath: string): Promise<boolean> {
+  try {
+    logLine('INFO', 'python-install', `Downloading ${url} ...`)
+    const res = await fetch(url)
+    if (!res.ok || !res.body) {
+      logLine('ERROR', 'python-install', `Download failed: HTTP ${res.status}`)
+      return false
+    }
+    fs.writeFileSync(destPath, Buffer.from(await res.arrayBuffer()))
+    return true
+  } catch (err) {
+    logLine('ERROR', 'python-install', 'Download failed:', err)
+    return false
+  }
+}
+
+// Downloads and silently installs the exact Python version this project
+// needs if nothing matching is already on this machine. Windows-only (this
+// project only ships a Windows build — see electron-builder.yml's `win:`
+// target and the taskkill/netstat calls elsewhere in this file).
+async function ensurePythonInstalled(): Promise<string | null> {
+  const existing = await findCompatiblePython()
+  if (existing) return existing
+
+  if (process.platform !== 'win32') {
+    logLine('ERROR', 'main', `No Python ${REQUIRED_PYTHON_MAJOR_MINOR} found, and auto-install is Windows-only.`)
+    return null
+  }
+
+  logLine('INFO', 'main', `No Python ${REQUIRED_PYTHON_MAJOR_MINOR} install found — downloading and installing it automatically...`)
+  const installerPath = path.join(app.getPath('temp'), `python-${REQUIRED_PYTHON_FULL_VERSION}-amd64.exe`)
+  if (!(await downloadFile(PYTHON_INSTALLER_URL, installerPath))) return null
+
+  logLine('INFO', 'main', 'Installing Python silently (current user only, adds the py launcher + pip, no PATH changes)...')
+  const installed = await runCommand(installerPath, [
+    '/quiet', 'InstallAllUsers=0', 'PrependPath=0', 'Include_launcher=1', 'Include_pip=1', 'Include_test=0',
+  ], 'python-install')
+  fs.rmSync(installerPath, { force: true })
+  if (!installed) {
+    logLine('ERROR', 'main', 'Python installer failed.')
+    return null
+  }
+
+  const nowFound = await findCompatiblePython()
+  if (!nowFound) {
+    logLine('ERROR', 'main', 'Python installer reported success but no matching install was found afterward.')
+  }
+  return nowFound
+}
+
+// Creates .venv and installs backend/requirements.txt into it if .venv
+// doesn't already exist — covers a fresh clone/checkout that's never been
+// set up, where startBackend() used to just fall back to a bare "python"/
+// "python3" off PATH (whatever that happens to resolve to, usually missing
+// every dependency this project needs, or the wrong Python version entirely)
+// and the backend died on its very first import with no visible explanation.
+// No-op (near-instant) on every later launch once .venv exists. Returns
+// whether venvPython is now usable.
+async function ensureVenvAndDeps(backendDir: string, venvPython: string): Promise<boolean> {
+  if (fs.existsSync(venvPython)) return true
+
+  logLine('INFO', 'main', 'No .venv found — setting up the Python environment. ' +
+    'First run only; can take several minutes and download a few GB (Python itself if missing, then torch, audio-separator, onnxruntime...).')
+
+  const systemPython = await ensurePythonInstalled()
+  if (!systemPython) {
+    logLine('ERROR', 'main',
+      `No usable Python ${REQUIRED_PYTHON_MAJOR_MINOR} found or installable — ` +
+      'falling back to a bare system Python, which likely has none of the required packages or is the wrong version.')
+    return false
+  }
+
+  const venvDir = path.join(APP_ROOT, '.venv')
+  const created = await runCommand(systemPython, ['-m', 'venv', venvDir], 'venv-create')
+  if (!created) {
+    logLine('ERROR', 'main', `Could not create .venv with '${systemPython}'.`)
+    return false
+  }
+
+  const reqFile = path.join(backendDir, 'requirements.txt')
+  const installed = await runCommand(venvPython, ['-m', 'pip', 'install', '-r', reqFile], 'pip-install')
+  if (!installed) {
+    logLine('ERROR', 'main', 'pip install failed — the backend will likely fail to start until this is resolved.')
+    return false
+  }
+
+  logLine('INFO', 'main', '.venv created and all Python dependencies installed successfully.')
+  return true
+}
+
+async function startBackend() {
   killAnyoneOnBackendPort()
   const isDev = !!VITE_DEV_SERVER_URL
 
@@ -66,7 +300,8 @@ function startBackend() {
     const venvPython = process.platform === 'win32'
       ? path.join(APP_ROOT, '.venv', 'Scripts', 'python.exe')
       : path.join(APP_ROOT, '.venv', 'bin', 'python3')
-    backendExe = fs.existsSync(venvPython) ? venvPython : (process.platform === 'win32' ? 'python' : 'python3')
+    const venvReady = await ensureVenvAndDeps(backendDir, venvPython)
+    backendExe = venvReady ? venvPython : (process.platform === 'win32' ? 'python' : 'python3')
     backendArgs = [path.join(backendDir, 'run.py'), '--port', String(BACKEND_PORT)]
     resourcesDir = path.join(APP_ROOT, 'resources', 'bin')
   } else {
@@ -82,24 +317,38 @@ function startBackend() {
   }
 
   if (isDev && !fs.existsSync(path.join(APP_ROOT, 'backend', 'main.py'))) {
-    console.log('[main] Backend not found, skipping spawn (dev mode without backend)')
+    logLine('INFO', 'main', 'Backend not found, skipping spawn (dev mode without backend)')
     return
   }
 
   if (!isDev && !fs.existsSync(backendExe)) {
-    console.log('[main] Packaged backend not found:', backendExe)
+    logLine('ERROR', 'main', 'Packaged backend not found:', backendExe)
     return
   }
 
-  console.log('[main] Starting backend:', backendExe, backendArgs.join(' '))
+  logLine('INFO', 'main', 'Starting backend:', backendExe, backendArgs.join(' '))
   backendProcess = spawn(backendExe, backendArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, RH_DATA_DIR: app.getPath('userData'), RH_RESOURCES_DIR: resourcesDir },
   })
 
-  backendProcess.stdout?.on('data', (d) => console.log('[backend]', d.toString().trim()))
-  backendProcess.stderr?.on('data', (d) => console.error('[backend]', d.toString().trim()))
-  backendProcess.on('exit', (code) => console.log('[main] Backend exited with code', code))
+  // The Python backend's own stdout/stderr (uvicorn access logs, the
+  // bootstrap_deps auto-install output, any uncaught startup exception) —
+  // captured here too so a single electron.log has the full picture even if
+  // app.log itself never got created (e.g. the crash happened before the
+  // Python logging handlers were even set up).
+  // uvicorn writes its own normal "INFO:"-prefixed startup/access logs to
+  // stderr by default (not an error condition) — read the line's own level
+  // prefix rather than trusting which stream it came in on, otherwise every
+  // routine "Application startup complete" would get mislabeled ERROR here.
+  const levelFromLine = (line: string): 'INFO' | 'ERROR' =>
+    /^(INFO|DEBUG|WARNING)[: ]/.test(line.trim()) ? 'INFO' : 'ERROR'
+  backendProcess.stdout?.on('data', (d) => logLine('INFO', 'backend', d.toString().trim()))
+  backendProcess.stderr?.on('data', (d) => {
+    const text = d.toString().trim()
+    logLine(levelFromLine(text), 'backend', text)
+  })
+  backendProcess.on('exit', (code) => logLine(code === 0 ? 'INFO' : 'ERROR', 'main', 'Backend exited with code', code))
 }
 
 function stopBackend() {
@@ -148,6 +397,24 @@ function createWindow() {
 
   win.webContents.on('did-finish-load', () => {
     win?.webContents.send('main-process-message', new Date().toISOString())
+  })
+
+  // Every console.log/warn/error the renderer (React app) does — including
+  // useApi.ts's per-request logging and every console.error added for
+  // previously-silently-swallowed catch blocks — flows through here into the
+  // same electron.log a packaged app's user can actually send back, instead
+  // of only ever existing in a DevTools console nobody but a developer opens.
+  // Chromium's console-message level: 0=verbose, 1=info, 2=warning, 3=error.
+  win.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    logLine(level >= 2 ? 'ERROR' : 'INFO', 'renderer', `${message} (${sourceId}:${line})`)
+  })
+
+  win.webContents.on('render-process-gone', (_event, details) => {
+    logLine('ERROR', 'renderer', 'Render process gone:', details.reason)
+  })
+
+  win.webContents.on('unresponsive', () => {
+    logLine('ERROR', 'renderer', 'Window became unresponsive')
   })
 
   // The renderer opens export URLs (SRT/Reaper CSV — both Content-Disposition:
@@ -202,7 +469,7 @@ function initAutoUpdater() {
     releaseNotes: formatReleaseNotes(info.releaseNotes),
   }))
 
-  const check = () => autoUpdater.checkForUpdates().catch((err) => console.error('[updater] check failed', err))
+  const check = () => autoUpdater.checkForUpdates().catch((err) => logLine('ERROR', 'updater', 'check failed', err))
   check()
   // Nobody has to remember to click "Перевірити зараз" — this keeps checking
   // in the background for as long as the app stays open.
@@ -217,7 +484,7 @@ function formatReleaseNotes(notes: string | { version: string; note: string | nu
 
 ipcMain.handle('update:check', () => {
   if (!app.isPackaged) return
-  autoUpdater.checkForUpdates().catch((err) => console.error('[updater] check failed', err))
+  autoUpdater.checkForUpdates().catch((err) => logLine('ERROR', 'updater', 'check failed', err))
 })
 
 ipcMain.handle('update:download', () => {
@@ -277,6 +544,13 @@ app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow()
 })
 
+// Catch-all so a truly unexpected failure in the main process itself (not
+// the backend, not the renderer) still lands in electron.log instead of
+// only flashing past in a terminal window nobody's watching, or crashing
+// silently in a packaged build.
+process.on('uncaughtException', (err) => logLine('ERROR', 'main', 'Uncaught exception:', err))
+process.on('unhandledRejection', (reason) => logLine('ERROR', 'main', 'Unhandled rejection:', reason))
+
 app.whenReady().then(() => {
   // The app has its own custom title bar (frame: false) and no menu bar is
   // ever shown — but Electron's default application menu is still created
@@ -284,7 +558,12 @@ app.whenReady().then(() => {
   // those accelerators before they reach the renderer's own keydown
   // handlers, silently breaking the subtitle grid's undo/copy/paste.
   Menu.setApplicationMenu(null)
-  startBackend()
+  // Deliberately not awaited: a first-ever run with no .venv can take several
+  // minutes (venv create + pip install, see ensureVenvAndDeps) — the window
+  // opens immediately either way, same as before, and the renderer's own
+  // WebSocket reconnect loop already tolerates the backend taking a while to
+  // come up (it just keeps showing "not connected" until it does).
+  startBackend().catch((err) => logLine('ERROR', 'main', 'startBackend() crashed:', err))
   createWindow()
   initAutoUpdater()
 })

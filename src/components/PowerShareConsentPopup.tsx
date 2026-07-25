@@ -1,12 +1,21 @@
 import React, { useEffect, useState } from 'react'
 import { useApi } from '../hooks/useApi'
 import { useAppStore } from '../stores/appStore'
+import { playRaccoonChirp } from '../utils/notificationSound'
 
 export function PowerShareConsentPopup() {
   const request = useAppStore((s) => s.incomingPowerShareRequest)
   const clear = useAppStore((s) => s.clearIncomingPowerShareRequest)
   const { post } = useApi()
   const [secondsLeft, setSecondsLeft] = useState(0)
+
+  // request_id changes with every new incoming request, so this fires once
+  // per actual request — not on every countdown tick (the effect below
+  // re-runs on request identity, and re-triggering the chirp every second
+  // would be obnoxious, not a notification cue).
+  useEffect(() => {
+    if (request) playRaccoonChirp()
+  }, [request?.request_id])
 
   useEffect(() => {
     if (!request) return

@@ -106,13 +106,24 @@ export const useAppStore = create<AppState>((set, get) => ({
     } else if (msg.type === 'complete') {
       const existing = get().activeJobs.get(msg.job_id)
       if (existing) {
-        upsertJob({ ...existing, status: 'complete', percent: 100, message: 'Готово' })
+        // msg.data carries the job's return value (e.g. batch separation's
+        // {output_dir, models}) — without forwarding it onto the job here,
+        // any UI that reads job.result after completion (the batch-output
+        // folder auto-open, the results picker) silently no-ops because
+        // result stays whatever it was at job creation (nothing).
+        upsertJob({ ...existing, status: 'complete', percent: 100, message: 'Готово', result: msg.data ?? existing.result })
         setTimeout(() => removeJob(msg.job_id!), 3000)
       }
     } else if (msg.type === 'error') {
       const existing = get().activeJobs.get(msg.job_id)
       if (existing) {
         upsertJob({ ...existing, status: 'error', message: msg.error ?? 'Помилка' })
+      }
+    } else if (msg.type === 'cancelled') {
+      const existing = get().activeJobs.get(msg.job_id)
+      if (existing) {
+        upsertJob({ ...existing, status: 'cancelled', message: 'Скасовано' })
+        setTimeout(() => removeJob(msg.job_id!), 3000)
       }
     }
   },

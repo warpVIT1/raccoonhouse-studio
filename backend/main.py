@@ -110,6 +110,11 @@ async def lifespan(app: FastAPI):
     discovery_service.set_online_signaling_provider(_online_signaling_config)
     discovery_service.set_broadcast(asyncio.get_event_loop(), job_manager._ws_broadcast)
     discovery_service.start(int(os.environ.get("RH_BACKEND_PORT", "8765")))
+    # Warms gpu_runtime_service's has_nvidia_gpu() cache here, before the
+    # frontend's first GET /settings can possibly arrive — otherwise that
+    # very first Settings page load would block on nvidia-smi's own latency
+    # instead of getting an instant answer (see that function's docstring).
+    gpu_runtime_service.has_nvidia_gpu()
     yield
 
 

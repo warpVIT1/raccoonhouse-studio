@@ -48,14 +48,37 @@ GPU_RUNTIME_URLS = os.environ.get(
 ).split(",")
 
 
+_has_nvidia_gpu_cache: "bool | None" = None
+
+
 def has_nvidia_gpu() -> bool:
     """Cheap check via nvidia-smi — avoids offering (and downloading for) GPU
-    support on AMD/Intel/no-GPU machines where it could never work anyway."""
-    try:
-        subprocess.run(["nvidia-smi", "-L"], capture_output=True, timeout=5, check=True)
-        return True
-    except Exception:
-        return False
+    support on AMD/Intel/no-GPU machines where it could never work anyway.
+
+    Cached after the first successful determination: GET /settings can be
+    polled repeatedly by the frontend, and re-spawning nvidia-smi (up to a
+    5s timeout) on every single poll is wasteful when the answer can't
+    change while the app is running. Retries once on failure BEFORE
+    caching a negative result — a real machine with a GPU can still see a
+    one-off nvidia-smi failure right after boot (driver service not fully
+    up yet), and caching that transient failure as a permanent "no GPU"
+    would hide the install button for the rest of the session (confirmed
+    live 2026-07-26: the GPU install button was missing until an unrelated
+    settings save forced a fresh check that happened to succeed)."""
+    global _has_nvidia_gpu_cache
+    if _has_nvidia_gpu_cache is not None:
+        return _has_nvidia_gpu_cache
+
+    def _check() -> bool:
+        try:
+            subprocess.run(["nvidia-smi", "-L"], capture_output=True, timeout=5, check=True)
+            return True
+        except Exception:
+            return False
+
+    result = _check() or _check()
+    _has_nvidia_gpu_cache = result
+    return result
 
 
 def is_gpu_runtime_installed() -> bool:

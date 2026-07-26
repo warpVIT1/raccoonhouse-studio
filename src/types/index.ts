@@ -141,6 +141,8 @@ export interface PowerShareLendingPayload {
   requester_name: string
   title_name: string
   episode_number: number
+  percent?: number | null
+  message?: string | null
 }
 
 export interface HikkaAnimeResult {

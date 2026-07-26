@@ -181,7 +181,7 @@ def run_separation_job_for_peer(
     would have zero visibility that it's happening at all."""
     from .separator_service import separate_file
 
-    def _broadcast_lending(active: bool):
+    def _broadcast_lending(active: bool, percent: Optional[int] = None, message: Optional[str] = None):
         if broadcast_fn and loop:
             asyncio.run_coroutine_threadsafe(
                 broadcast_fn({
@@ -190,6 +190,7 @@ def run_separation_job_for_peer(
                         "active": active, "task": "separate",
                         "requester_name": requester_name, "title_name": title_name,
                         "episode_number": episode_number,
+                        "percent": percent, "message": message,
                     },
                 }),
                 loop,
@@ -197,10 +198,13 @@ def run_separation_job_for_peer(
 
     tmp_dir = tempfile.mkdtemp(prefix="rh_power_share_")
     power_logger.info("RUN-SEPARATION-RECEIVED requester=%s title=%s ep=%s model=%s", requester_name, title_name, episode_number, model)
-    _broadcast_lending(True)
+    _broadcast_lending(True, percent=0)
     try:
         output_dir = os.path.join(tmp_dir, "out")
-        stems = separate_file(input_path, output_dir, model, ensemble, model_file=model_file, params=params)
+        stems = separate_file(
+            input_path, output_dir, model, ensemble, model_file=model_file, params=params,
+            on_progress=lambda pct, msg: _broadcast_lending(True, percent=pct, message=msg),
+        )
         # Both stems cross the wire now — the pure-vocal stem is what
         # detect-markers (VAD) needs, and that runs on the REQUESTER's
         # machine, not here, so it has to be transferred back alongside the
@@ -229,7 +233,7 @@ def run_import_job_for_peer(
     processing on the requester's side."""
     from .ffmpeg_service import run_import_ffmpeg_only
 
-    def _broadcast_lending(active: bool):
+    def _broadcast_lending(active: bool, percent: Optional[int] = None, message: Optional[str] = None):
         if broadcast_fn and loop:
             asyncio.run_coroutine_threadsafe(
                 broadcast_fn({
@@ -238,16 +242,20 @@ def run_import_job_for_peer(
                         "active": active, "task": "import",
                         "requester_name": requester_name, "title_name": title_name,
                         "episode_number": episode_number,
+                        "percent": percent, "message": message,
                     },
                 }),
                 loop,
             )
 
     tmp_dir = tempfile.mkdtemp(prefix="rh_power_import_")
-    _broadcast_lending(True)
+    _broadcast_lending(True, percent=0)
     try:
         out_dir = os.path.join(tmp_dir, "out")
-        result = run_import_ffmpeg_only(input_path, out_dir)
+        result = run_import_ffmpeg_only(
+            input_path, out_dir,
+            on_progress=lambda pct, msg: _broadcast_lending(True, percent=pct, message=msg),
+        )
         return result["audio_path"], result, tmp_dir
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -268,7 +276,7 @@ def run_render_job_for_peer(
     time/CPU on the final mux+encode step itself."""
     from .ffmpeg_service import run_mux_ffmpeg_only
 
-    def _broadcast_lending(active: bool):
+    def _broadcast_lending(active: bool, percent: Optional[int] = None, message: Optional[str] = None):
         if broadcast_fn and loop:
             asyncio.run_coroutine_threadsafe(
                 broadcast_fn({
@@ -277,6 +285,7 @@ def run_render_job_for_peer(
                         "active": active, "task": "render",
                         "requester_name": requester_name, "title_name": title_name,
                         "episode_number": episode_number,
+                        "percent": percent, "message": message,
                     },
                 }),
                 loop,
@@ -284,10 +293,13 @@ def run_render_job_for_peer(
 
     tmp_dir = tempfile.mkdtemp(prefix="rh_power_render_")
     power_logger.info("RUN-RENDER-RECEIVED requester=%s title=%s ep=%s", requester_name, title_name, episode_number)
-    _broadcast_lending(True)
+    _broadcast_lending(True, percent=0)
     try:
         out_dir = os.path.join(tmp_dir, "out")
-        result = run_mux_ffmpeg_only(video_path, instrumental_path, out_dir)
+        result = run_mux_ffmpeg_only(
+            video_path, instrumental_path, out_dir,
+            on_progress=lambda pct, msg: _broadcast_lending(True, percent=pct, message=msg),
+        )
         power_logger.info("RUN-RENDER-DONE output=%s audio_output=%s", result["output_path"], result.get("audio_output_path"))
         # The standalone FLAC (see run_mux_ffmpeg_only) rides back alongside
         # the video as a second transfer — same mechanism "separate" already

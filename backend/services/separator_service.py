@@ -175,13 +175,17 @@ MODEL_CHOICES: dict[str, list[tuple[str, str]]] = {
         ("Kim Inst", "Kim_Inst.onnx"),
         ("UVR-MDX-NET Inst 3", "UVR-MDX-NET-Inst_3.onnx"),
     ],
+    # UVR-De-Echo-Normal/Aggressive, UVR-DeEcho-DeReverb, and UVR-DeNoise were
+    # removed 2026-07-26 — they aren't vocal/instrumental separators at all,
+    # they're post-processing cleanup tools (confirmed live: the "VR Arch"
+    # default, UVR-De-Echo-Normal, produces stems literally named "No Echo"/
+    # "Echo", not "Vocals"/"Instrumental" — neither one is vocal-removed, so
+    # the render came out as the full mix with vocals still in it, not an
+    # instrumental). Only 3_HP-Vocal-UVR and 4_HP-Vocal-UVR are genuine
+    # UVR-Architecture vocal/instrumental separation models.
     "VR Arch": [
-        ("UVR-De-Echo-Normal", "UVR-De-Echo-Normal.pth"),
-        ("UVR-De-Echo-Aggressive", "UVR-De-Echo-Aggressive.pth"),
-        ("UVR-DeEcho-DeReverb", "UVR-DeEcho-DeReverb.pth"),
         ("3_HP-Vocal-UVR", "3_HP-Vocal-UVR.pth"),
         ("4_HP-Vocal-UVR", "4_HP-Vocal-UVR.pth"),
-        ("UVR-DeNoise", "UVR-DeNoise.pth"),
     ],
     "Demucs": [
         ("htdemucs_ft", "htdemucs_ft.yaml"),
@@ -353,6 +357,21 @@ def separate_file(
             if "instrumental" in f.lower():
                 instrumental_file = f
                 break
+        if vocal_file is None and instrumental_file is None and output_paths:
+            # Neither filename mentions "vocal" or "instrumental" — this
+            # model's output isn't actually a vocal/instrumental pair at all
+            # (see the VR Arch MODEL_CHOICES comment above for a confirmed
+            # real case: a de-echo model producing "No Echo"/"Echo" stems).
+            # The positional fallback below still runs so separation doesn't
+            # outright fail, but whatever it picks is not guaranteed to be a
+            # real instrumental — flagged loudly so a future bad model
+            # choice shows up in the log instead of silently mislabeling.
+            app_logger.warning(
+                "separate_file: model %s's output has neither 'vocal' nor 'instrumental' "
+                "in any filename (%s) — this model may not be a real vocal separator; "
+                "falling back to a positional guess",
+                mdl, output_paths,
+            )
         if not vocal_file and output_paths:
             vocal_file = output_paths[0]
         if not instrumental_file:
@@ -535,6 +554,15 @@ def separate_file_batch(
         # need to even locate the vocal-only counterpart.
         instrumental_file = next((f for f in output_paths if "instrumental" in f.lower()), None)
         if not instrumental_file and output_paths:
+            # No filename says "instrumental" — this model may not be a real
+            # vocal separator at all (see the VR Arch MODEL_CHOICES comment
+            # above for a confirmed real case). Flagged loudly rather than
+            # silently guessing positionally and shipping the wrong audio.
+            app_logger.warning(
+                "separate_file_batch: %s (%s) produced no filename containing 'instrumental' (%s) — "
+                "falling back to a positional guess; this model may not be a real vocal separator",
+                model_label, method, output_paths,
+            )
             instrumental_file = output_paths[0]
 
         if instrumental_file and os.path.isfile(instrumental_file):

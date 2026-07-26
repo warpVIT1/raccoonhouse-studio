@@ -26,6 +26,7 @@ const EMPTY_SETTINGS: AppSettings = {
 export function SettingsPage() {
   const { get, put, post } = useApi()
   const [settings, setSettings] = useState<AppSettings>(EMPTY_SETTINGS)
+  const [settingsLoaded, setSettingsLoaded] = useState(false)
   const [editingModel, setEditingModel] = useState(false)
   const [editingReaper, setEditingReaper] = useState(false)
   const [gpuError, setGpuError] = useState<string | null>(null)
@@ -36,8 +37,32 @@ export function SettingsPage() {
     (j) => j.type === 'install_gpu_runtime' && j.status === 'running'
   )
 
+  // EMPTY_SETTINGS.gpu_available is false, same as "genuinely no GPU" — so a
+  // failed/slow first fetch (e.g. opened right as the backend was still
+  // starting up) used to render "NVIDIA GPU not found" and the install
+  // button stayed hidden until some unrelated save() happened to refetch
+  // real data. Retrying here instead of silently giving up, and gating the
+  // GPU row's text on settingsLoaded below, fixes both the false negative
+  // and the need for an unrelated click to "unstick" it.
   useEffect(() => {
-    get<AppSettings>('/settings').then(setSettings).catch(() => {})
+    let cancelled = false
+    let retryTimer: ReturnType<typeof setTimeout>
+    const fetchSettings = () => {
+      get<AppSettings>('/settings')
+        .then((s) => {
+          if (cancelled) return
+          setSettings(s)
+          setSettingsLoaded(true)
+        })
+        .catch(() => {
+          if (!cancelled) retryTimer = setTimeout(fetchSettings, 1500)
+        })
+    }
+    fetchSettings()
+    return () => {
+      cancelled = true
+      clearTimeout(retryTimer)
+    }
   }, [get])
 
   // Once the install job completes, the backend has already flipped
@@ -118,7 +143,9 @@ export function SettingsPage() {
           <div className="flex-1 min-w-0">
             <div className="text-[12.5px] font-bold">GPU-прискорення (усі моделі)</div>
             <div className="font-mono text-[11px] text-rh-text-dim mt-0.5">
-              {!settings.gpu_available
+              {!settingsLoaded
+                ? 'Перевірка…'
+                : !settings.gpu_available
                 ? 'NVIDIA GPU не знайдено на цьому комп\'ютері'
                 : gpuInstallJob
                   ? gpuInstallJob.message || 'Встановлення…'
@@ -138,7 +165,7 @@ export function SettingsPage() {
             )}
             {gpuError && <div className="text-[11px] text-[#FF6B70] mt-1">{gpuError}</div>}
           </div>
-          {settings.gpu_available && !gpuInstallJob && (
+          {settingsLoaded && settings.gpu_available && !gpuInstallJob && (
             settings.gpu_enabled ? (
               <button
                 onClick={() => save({ gpu_enabled: false })}

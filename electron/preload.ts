@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getBackendPort: () => ipcRenderer.invoke('get:backendPort'),
   getAppVersion: () => ipcRenderer.invoke('get:appVersion'),
   openPath: (filePath: string) => ipcRenderer.invoke('shell:openPath', filePath),
+  openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url),
   platform: process.platform,
 
   // Window controls
@@ -22,5 +23,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     const listener = (_event: unknown, status: Record<string, unknown>) => callback(status)
     ipcRenderer.on('update:status', listener)
     return () => ipcRenderer.removeListener('update:status', listener)
+  },
+  onBetaAvailable: (callback: (info: Record<string, unknown>) => void) => {
+    const listener = (_event: unknown, info: Record<string, unknown>) => callback(info)
+    ipcRenderer.on('update:beta-available', listener)
+    return () => ipcRenderer.removeListener('update:beta-available', listener)
   },
 })

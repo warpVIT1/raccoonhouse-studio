@@ -8,6 +8,7 @@ import { TitleBar } from './components/layout/TitleBar'
 import { PowerShareConsentPopup } from './components/PowerShareConsentPopup'
 import { PowerShareLendingBanner } from './components/PowerShareLendingBanner'
 import { UpdateDialog } from './components/UpdateDialog'
+import { BetaAvailableBanner } from './components/BetaAvailableBanner'
 import { useAppStore } from './stores/appStore'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useApi } from './hooks/useApi'
@@ -86,6 +87,7 @@ export default function App() {
       <PowerShareConsentPopup />
       <PowerShareLendingBanner />
       <UpdateDialog />
+      <BetaAvailableBanner />
     </div>
   )
 }

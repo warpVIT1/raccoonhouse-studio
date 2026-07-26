@@ -201,15 +201,16 @@ def run_separation_job_for_peer(
     try:
         output_dir = os.path.join(tmp_dir, "out")
         stems = separate_file(input_path, output_dir, model, ensemble, model_file=model_file, params=params)
-        # Only the instrumental crosses the wire — the pure-vocal stem (VAD
-        # marker detection input) stays local to whichever machine actually
-        # runs detect-markers, which for a power-shared separation is the
-        # requester, not this responder. A remotely separated episode simply
-        # has no vocal_only_stem_path, same as any other episode that hasn't
-        # had markers detected yet.
+        # Both stems cross the wire now — the pure-vocal stem is what
+        # detect-markers (VAD) needs, and that runs on the REQUESTER's
+        # machine, not here, so it has to be transferred back alongside the
+        # instrumental (see discovery_service._handle_job_request, which
+        # uploads meta["vocal_only_path"] as a second transfer when present).
         final_vocal = stems["vocal_stem_path"]
-        power_logger.info("RUN-SEPARATION-DONE final_vocal=%s", final_vocal)
-        return final_vocal, {}, tmp_dir
+        final_vocal_only = stems.get("vocal_only_stem_path")
+        power_logger.info("RUN-SEPARATION-DONE final_vocal=%s vocal_only=%s", final_vocal, final_vocal_only)
+        meta = {"vocal_only_path": final_vocal_only} if final_vocal_only else {}
+        return final_vocal, meta, tmp_dir
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
@@ -248,6 +249,51 @@ def run_import_job_for_peer(
         out_dir = os.path.join(tmp_dir, "out")
         result = run_import_ffmpeg_only(input_path, out_dir)
         return result["audio_path"], result, tmp_dir
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    finally:
+        _broadcast_lending(False)
+
+
+def run_render_job_for_peer(
+    video_path: str, instrumental_path: str,
+    requester_name: str, title_name: str, episode_number: int,
+    broadcast_fn=None, loop=None,
+) -> tuple[str, dict, str]:
+    """Runs on the RESPONDER machine — muxes someone else's already-downloaded
+    original video against their already-separated instrumental (received as
+    FLAC — see request_remote_render). Returns (output_video_path, metadata,
+    tmp_dir); meant for a requester whose own PC would rather not spend the
+    time/CPU on the final mux+encode step itself."""
+    from .ffmpeg_service import run_mux_ffmpeg_only
+
+    def _broadcast_lending(active: bool):
+        if broadcast_fn and loop:
+            asyncio.run_coroutine_threadsafe(
+                broadcast_fn({
+                    "type": "power_share_lending",
+                    "data": {
+                        "active": active, "task": "render",
+                        "requester_name": requester_name, "title_name": title_name,
+                        "episode_number": episode_number,
+                    },
+                }),
+                loop,
+            )
+
+    tmp_dir = tempfile.mkdtemp(prefix="rh_power_render_")
+    power_logger.info("RUN-RENDER-RECEIVED requester=%s title=%s ep=%s", requester_name, title_name, episode_number)
+    _broadcast_lending(True)
+    try:
+        out_dir = os.path.join(tmp_dir, "out")
+        result = run_mux_ffmpeg_only(video_path, instrumental_path, out_dir)
+        power_logger.info("RUN-RENDER-DONE output=%s audio_output=%s", result["output_path"], result.get("audio_output_path"))
+        # The standalone FLAC (see run_mux_ffmpeg_only) rides back alongside
+        # the video as a second transfer — same mechanism "separate" already
+        # uses for the pure-vocal stem (see discovery_service._handle_job_request).
+        meta = {"audio_output_path": result["audio_output_path"]} if result.get("audio_output_path") else {}
+        return result["output_path"], meta, tmp_dir
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
@@ -480,15 +526,25 @@ def _request_remote_power(episode_id: int, model: str, ensemble: bool, db: Sessi
     discovery_service.download_transfer(result["result_transfer_id"], final_vocal)
     discovery_service.delete_transfer(result["result_transfer_id"])
 
+    final_vocal_only = None
+    vocal_only_transfer_id = result.get("vocal_only_transfer_id")
+    if vocal_only_transfer_id:
+        if reporter:
+            reporter.update(95, "Отримую чистий вокальний стем (для авто-маркерів)…")
+        final_vocal_only = str(output_dir / "vocal_only.wav")
+        discovery_service.download_transfer(vocal_only_transfer_id, final_vocal_only)
+        discovery_service.delete_transfer(vocal_only_transfer_id)
+
     ep.vocal_stem_path = final_vocal
+    ep.vocal_only_stem_path = final_vocal_only
     ep.status = "vocal_isolated"
     bump_title_in_progress(db, ep.title_id)
     db.commit()
 
-    power_logger.info("DONE peer=%s title=%s ep=%s", chosen["id"], title.name_ua, ep.number)
+    power_logger.info("DONE peer=%s title=%s ep=%s vocal_only=%s", chosen["id"], title.name_ua, ep.number, bool(final_vocal_only))
     if reporter:
         reporter.update(100, f"Готово — вокал відокремлено на {chosen['name']}")
-    return {"vocal_stem_path": final_vocal, "peer": chosen["name"]}
+    return {"vocal_stem_path": final_vocal, "vocal_only_stem_path": final_vocal_only, "peer": chosen["name"]}
 
 
 def request_remote_import(episode_id: int, file_path: str, reporter=None) -> dict:
@@ -573,3 +629,118 @@ def _request_remote_import(episode_id: int, file_path: str, db: Session, reporte
     if reporter:
         reporter.update(100, f"Готово — аудіо отримано з {chosen['name']}")
     return {"audio_path": audio_out, "peer": chosen["name"]}
+
+
+def request_remote_render(episode_id: int, output_dir: Optional[str] = None, reporter=None) -> dict:
+    """Requester side for the final render: negotiates a peer, uploads the
+    ORIGINAL video and the episode's own instrumental (converted to FLAC
+    first, to shrink the upload — see ffmpeg_service.convert_to_flac) to the
+    transfer relay, and stores back the finished dub video the peer muxed.
+
+    Opens its own DB session — see request_remote_power's docstring for why."""
+    db = SessionLocal()
+    try:
+        return _request_remote_render(episode_id, output_dir, db, reporter)
+    finally:
+        db.close()
+
+
+def _request_remote_render(episode_id: int, output_dir: Optional[str], db: Session, reporter=None) -> dict:
+    from . import discovery_service
+    from .ffmpeg_service import convert_to_flac
+
+    ep = db.get(Episode, episode_id)
+    if not ep:
+        raise ValueError("Episode not found")
+    title = db.get(Title, ep.title_id)
+    if not title:
+        raise ValueError("Title not found")
+    if not ep.vocal_stem_path or not os.path.isfile(ep.vocal_stem_path):
+        raise ValueError("Інструментал не знайдено — виконайте ізоляцію вокалу спочатку")
+    if not ep.original_file_path or not os.path.isfile(ep.original_file_path):
+        raise ValueError("Оригінальне відео не знайдено")
+
+    chosen = _acquire_peer(title.id, title.name_ua, ep.number, "render", reporter, db)
+
+    tmp_dir = tempfile.mkdtemp(prefix="rh_render_upload_")
+    try:
+        if reporter:
+            reporter.update(15, "Конвертую інструментал у FLAC для передачі…")
+        instrumental_flac = os.path.join(tmp_dir, "instrumental.flac")
+        convert_to_flac(ep.vocal_stem_path, instrumental_flac)
+
+        video_size = os.path.getsize(ep.original_file_path)
+        video_transfer_id = str(uuid.uuid4())
+
+        def on_video_progress(pct):
+            if reporter:
+                reporter.update(pct, f"Надсилаю відео на {chosen['name']}…")
+
+        stream = _ProgressFile(ep.original_file_path, video_size, on_video_progress, pct_lo=20, pct_hi=55)
+        try:
+            power_logger.info("DISPATCH-RENDER peer=%s title=%s ep=%s size=%s", chosen["id"], title.name_ua, ep.number, video_size)
+            discovery_service.upload_transfer(video_transfer_id, stream, video_size)
+        finally:
+            stream.close()
+
+        audio_size = os.path.getsize(instrumental_flac)
+        audio_transfer_id = str(uuid.uuid4())
+
+        def on_audio_progress(pct):
+            if reporter:
+                reporter.update(pct, f"Надсилаю інструментал (FLAC) на {chosen['name']}…")
+
+        audio_stream = _ProgressFile(instrumental_flac, audio_size, on_audio_progress, pct_lo=55, pct_hi=70)
+        try:
+            discovery_service.upload_transfer(audio_transfer_id, audio_stream, audio_size)
+        finally:
+            audio_stream.close()
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if reporter:
+        reporter.update(72, f"{chosen['name']} рендерить…")
+
+    result = discovery_service.call_peer(chosen["id"], {
+        "kind": "job_request",
+        "task": "render",
+        "transfer_id": video_transfer_id,
+        "filename": os.path.basename(ep.original_file_path),
+        "audio_transfer_id": audio_transfer_id,
+        "audio_filename": "instrumental.flac",
+        "requester_name": _active_profile_name(db),
+        "title_name": title.name_ua,
+        "episode_number": ep.number,
+    }, timeout=3600)
+    power_logger.info("DISPATCH-RENDER-RESPONSE peer=%s result=%s", chosen["id"], result.get("kind", "job_done"))
+
+    if result.get("kind") == "job_error" or not result.get("result_transfer_id"):
+        raise ValueError(f"Помилка на {chosen['name']}: {result.get('reason', 'невідома помилка')}")
+
+    if reporter:
+        reporter.update(92, "Зберігаю фінальне відео…")
+
+    out_dir = Path(output_dir) if output_dir else Path(DATA_DIR) / "episodes" / str(episode_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_name = Path(ep.original_file_path).stem + "_dub" + Path(ep.original_file_path).suffix
+    final_output = str(out_dir / out_name)
+    discovery_service.download_transfer(result["result_transfer_id"], final_output)
+    discovery_service.delete_transfer(result["result_transfer_id"])
+
+    final_audio_output = None
+    audio_output_transfer_id = result.get("audio_output_transfer_id")
+    if audio_output_transfer_id:
+        if reporter:
+            reporter.update(96, "Отримую окремий FLAC-файл аудіо…")
+        flac_name = Path(ep.original_file_path).stem + "_dub.flac"
+        final_audio_output = str(out_dir / flac_name)
+        discovery_service.download_transfer(audio_output_transfer_id, final_audio_output)
+        discovery_service.delete_transfer(audio_output_transfer_id)
+
+    ep.status = "ready"
+    db.commit()
+
+    power_logger.info("DONE-RENDER peer=%s title=%s ep=%s audio_output=%s", chosen["id"], title.name_ua, ep.number, bool(final_audio_output))
+    if reporter:
+        reporter.update(100, f"Готово — відрендерено на {chosen['name']}")
+    return {"output_path": final_output, "audio_output_path": final_audio_output, "peer": chosen["name"]}

@@ -41,6 +41,19 @@ silero-vad==5.1
 # actually load). separator_service.py's _add_nvidia_dll_dirs() puts these
 # packages' bin/ dirs on PATH at runtime — required in addition to having
 # them installed, since nothing else does this for a CPU-only torch.
+# librosa's audio.py imports samplerate AND resampy as optional resampling
+# backends, picked depending on the exact resample call — the VR Arch models
+# (vr_separator) hit whichever one librosa happens to pick at runtime, and
+# either can be needed depending on the input audio's actual sample rate
+# (confirmed live 2026-07-25 twice: a synthetic 44.1kHz test clip only
+# needed samplerate, a real episode's audio needed resampy instead — same
+# "No module named ..." crash, different module). Both present by default in
+# a fresh venv (pulled in transitively) but PyInstaller's static analysis
+# doesn't see librosa's lazy/optional imports, so it silently drops them from
+# the packaged build unless pinned here AND added as --hidden-import (see
+# build-backend.py).
+samplerate==0.1.0
+resampy==0.4.3
 audio-separator==0.44.3
 torch==2.13.0
 onnxruntime-gpu==1.20.1

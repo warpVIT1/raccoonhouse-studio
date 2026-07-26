@@ -27,13 +27,25 @@ from pathlib import Path
 from typing import Optional
 from sqlalchemy.orm import Session
 
-from ..models import Episode
+from ..models import Episode, Title
 from ..database import SessionLocal
 from ..job_manager import ProgressReporter
 from .power_share_service import app_logger
 from .title_status import bump_title_in_progress
 
 DATA_DIR = os.environ.get("RH_DATA_DIR", os.path.join(os.path.expanduser("~"), ".raccoonhouse"))
+
+_INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _sanitize_filename(name: str) -> str:
+    """Strips characters Windows forbids in file/folder names while keeping
+    everything else — including Cyrillic/Ukrainian title names — intact.
+    Deliberately NOT the old batch-mode approach of an ASCII-only regex,
+    which would have mangled any non-Latin title into a string of
+    underscores."""
+    cleaned = _INVALID_FILENAME_CHARS.sub("_", name).strip().rstrip(".")
+    return cleaned or "untitled"
 
 
 def _add_nvidia_dll_dirs():
@@ -433,23 +445,39 @@ def run_separation(
 def separate_file_batch(
     audio_path: str,
     output_dir: str,
+    title_name: str,
+    season: int,
+    episode_number: int,
     on_progress=None,  # Optional[Callable[[int, str], None]]
     is_cancelled=None,  # Optional[Callable[[], bool]]
 ) -> dict[str, str]:
-    """Runs every model in MODEL_MAP (the same set Ensemble Mode uses) but,
-    unlike Ensemble Mode, keeps each model's own instrumental as a SEPARATE
-    file instead of averaging them into one blended result — for comparing
-    models side by side or rendering with whichever one turns out best
-    per-episode, rather than committing to a single averaged guess. Only the
+    """Runs EVERY model listed under EVERY method in MODEL_CHOICES (not just
+    each method's default) — unlike Ensemble Mode, keeps each one's own
+    instrumental as a SEPARATE file instead of averaging them into one
+    blended result, for comparing models side by side or rendering with
+    whichever one turns out best per-episode, rather than committing to a
+    single averaged guess or a single default-per-method guess. Only the
     instrumental is kept (not the isolated-vocal counterpart) — this mode is
     for picking/comparing a final instrumental track, which is the only
-    thing dubbing actually needs; FLAC, not WAV, to keep 5x the usual output
-    size down to something reasonable while staying lossless.
+    thing dubbing actually needs; FLAC, not WAV, to keep the output size
+    down to something reasonable while staying lossless.
 
-    Returns {model_name: instrumental_flac_path} — deliberately does not
-    touch any Episode column (there's no single "the" result to promote the
-    way normal/ensemble separation has), so the episode's status and
-    vocal_stem_path are left exactly as they were before this ran."""
+    This runs every model the app curates (see MODEL_CHOICES — currently 29
+    across 5 methods), not just 5 — expect this to take roughly 5-6x as long
+    as the old one-model-per-method behavior; GPU acceleration (Налаштування)
+    makes a large difference here.
+
+    Results land in <output_dir>/<title>/<method>/<title>_S..E..(<model>).flac
+    — one subfolder per method (MDX-Net, VR Arch, …) holding every model that
+    method offers, episode tag in the filename so different episodes of the
+    same title never collide, and the specific model's own display name (not
+    just the method) in parentheses so files sharing a method folder stay
+    distinguishable.
+
+    Returns {"<method> — <model>": instrumental_flac_path} — deliberately
+    does not touch any Episode column (there's no single "the" result to
+    promote the way normal/ensemble separation has), so the episode's status
+    and vocal_stem_path are left exactly as they were before this ran."""
     try:
         from audio_separator.separator import Separator
     except ImportError:
@@ -457,24 +485,31 @@ def separate_file_batch(
         raise RuntimeError("audio-separator not installed. Run: pip install audio-separator")
 
     app_logger.info("separate_file_batch: start audio_path=%s output_dir=%s", audio_path, output_dir)
-    os.makedirs(output_dir, exist_ok=True)
-    models_to_run = list(MODEL_MAP.keys())
+    safe_title = _sanitize_filename(title_name)
+    ep_tag = f"S{season:02d}E{episode_number:02d}"
+    jobs = [
+        (method, model_label, model_file)
+        for method, choices in MODEL_CHOICES.items()
+        for model_label, model_file in choices
+    ]
     results: dict[str, str] = {}
 
     def progress(pct, msg):
         if on_progress:
             on_progress(pct, msg)
 
-    for idx, mdl in enumerate(models_to_run):
+    for idx, (method, model_label, uvr_model) in enumerate(jobs):
         if is_cancelled and is_cancelled():
             raise RuntimeError("Скасовано")
 
-        uvr_model = MODEL_MAP[mdl]
-        base_pct = int(idx / len(models_to_run) * 90)
-        progress(base_pct + 2, f"нейромережа: завантаження моделі {mdl}…")
+        base_pct = int(idx / len(jobs) * 90)
+        progress(base_pct + 1, f"нейромережа: завантаження моделі {method} — {model_label}…")
+
+        method_dir = Path(output_dir) / safe_title / _sanitize_filename(method)
+        method_dir.mkdir(parents=True, exist_ok=True)
 
         sep = Separator(
-            output_dir=output_dir,
+            output_dir=str(method_dir),
             output_format="FLAC",
             normalization_threshold=0.9,
             model_file_dir=str(Path(DATA_DIR) / "models"),
@@ -482,17 +517,17 @@ def separate_file_batch(
         try:
             sep.load_model(uvr_model)
         except Exception:
-            app_logger.exception("separate_file_batch: failed to load model %s (file=%s)", mdl, uvr_model)
+            app_logger.exception("separate_file_batch: failed to load model %s (%s, file=%s)", model_label, method, uvr_model)
             raise
 
-        progress(base_pct + int(90 / len(models_to_run) / 2), f"нейромережа: ізоляція вокалу ({mdl})…")
+        progress(base_pct + int(90 / len(jobs) / 2), f"нейромережа: ізоляція вокалу ({method} — {model_label})…")
         try:
             output_files = sep.separate(audio_path)
         except Exception:
-            app_logger.exception("separate_file_batch: sep.separate() failed for model %s", mdl)
+            app_logger.exception("separate_file_batch: sep.separate() failed for %s (%s)", model_label, method)
             raise
         output_paths = [
-            f if os.path.isabs(f) else str(Path(output_dir) / f)
+            f if os.path.isabs(f) else str(method_dir / f)
             for f in output_files
         ]
 
@@ -502,11 +537,15 @@ def separate_file_batch(
         if not instrumental_file and output_paths:
             instrumental_file = output_paths[0]
 
-        safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", mdl)
         if instrumental_file and os.path.isfile(instrumental_file):
-            final_instrumental = str(Path(output_dir) / f"{safe_name}_instrumental.flac")
-            shutil.copy2(instrumental_file, final_instrumental)
-            results[mdl] = final_instrumental
+            file_name = f"{safe_title}_{ep_tag}_{_sanitize_filename(method)}({_sanitize_filename(model_label)}).flac"
+            final_instrumental = str(method_dir / file_name)
+            # move, not copy — a copy would leave audio-separator's own raw
+            # output file sitting right next to the renamed one, doubling
+            # this method's disk usage for no reason (pre-existing bug,
+            # caught while verifying the new folder layout above).
+            shutil.move(instrumental_file, final_instrumental)
+            results[f"{method} — {model_label}"] = final_instrumental
         # Every intermediate file audio-separator wrote for this model
         # (including whichever one WASN'T the instrumental — the isolated
         # vocal stem this mode doesn't keep) is no longer needed once its
@@ -516,7 +555,7 @@ def separate_file_batch(
             if f != instrumental_file and os.path.isfile(f):
                 os.remove(f)
 
-        progress(base_pct + int(90 / len(models_to_run)), f"нейромережа: готово {mdl}")
+        progress(base_pct + int(90 / len(jobs)), f"нейромережа: готово {method} — {model_label}")
 
     progress(100, "нейромережа: всі моделі оброблено")
     app_logger.info("separate_file_batch: done, results=%s", results)
@@ -536,6 +575,8 @@ def run_batch_separation(
         if not ep:
             app_logger.error("run_batch_separation: episode %s not found", episode_id)
             raise ValueError(f"Episode {episode_id} not found")
+        title = db.get(Title, ep.title_id)
+        title_name = title.name_ua if title else "Untitled"
 
         if output_dir:
             output_dir = Path(output_dir)
@@ -545,7 +586,7 @@ def run_batch_separation(
 
         try:
             results = separate_file_batch(
-                audio_path, str(output_dir),
+                audio_path, str(output_dir), title_name, ep.season, ep.number,
                 on_progress=reporter.update, is_cancelled=lambda: reporter.cancelled,
             )
         except Exception:

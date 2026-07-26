@@ -107,3 +107,22 @@ async def request_remote_import(title_id: int, body: dict, db: Session = Depends
 
     from .episodes import _episode_out
     return {"job_id": job.id, "episode": _episode_out(ep, db)}
+
+
+@router.post("/episodes/{ep_id}/request-remote-render")
+async def request_remote_render_endpoint(ep_id: int, body: dict, db: Session = Depends(get_db)):
+    """Mirrors POST /episodes/{id}/mux-audio, except the final ffmpeg mux
+    itself runs on a peer instead of locally — sends the original video and
+    the episode's own instrumental (as FLAC, to shrink the upload) to a peer,
+    gets back the finished dub video."""
+    ep = db.get(Episode, ep_id)
+    if not ep:
+        raise HTTPException(404)
+    output_dir = body.get("output_dir")
+
+    job = job_manager.create_job("request_remote_render", episode_id=ep_id)
+    loop = asyncio.get_event_loop()
+    asyncio.create_task(
+        job_manager.run_job(loop, job, lambda r: pss.request_remote_render(ep_id, output_dir, r))
+    )
+    return {"job_id": job.id}

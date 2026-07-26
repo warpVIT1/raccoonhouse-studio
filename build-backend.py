@@ -47,6 +47,19 @@ def main():
         "--hidden-import", "librosa",
         "--collect-all", "audio_separator",
         "--collect-all", "silero_vad",
+        # librosa's optional resampling backends — only imported lazily
+        # inside a code path VR Arch models hit (which one depends on the
+        # input's actual sample rate). A plain --hidden-import isn't enough
+        # for either: samplerate is CFFI-based (needs its compiled
+        # extension + data bundled, not just the import recognized) and
+        # resampy has its own PyInstaller hook that only grabbed its data/
+        # filter-coefficients folder, not the actual .py source, when only
+        # hidden-imported (confirmed live 2026-07-26 — _internal/resampy
+        # existed but contained nothing but a data/ subfolder, and
+        # _internal/samplerate didn't exist at all). --collect-all forces
+        # the whole package in, same as audio_separator/silero_vad above.
+        "--collect-all", "samplerate",
+        "--collect-all", "resampy",
         # onnxruntime's CPU pieces (onnxruntime.dll, provider bridge, Python
         # bindings) ship in the installer so CPU mode always works out of the
         # box. The CUDA provider DLL itself (~712MB) is deliberately EXCLUDED

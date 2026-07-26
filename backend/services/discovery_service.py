@@ -322,24 +322,62 @@ def _handle_job_request(from_id: str, payload: dict):
                 model_file=payload.get("model_file"), params=payload.get("params"),
                 broadcast_fn=_broadcast_fn, loop=_main_loop,
             )
+        elif task == "render":
+            # Final render needs a SECOND input (the instrumental, sent as
+            # FLAC — see power_share_service.request_remote_render) on top of
+            # the video every other task already downloads as `input_path`.
+            audio_filename = payload.get("audio_filename") or "instrumental.flac"
+            audio_transfer_id = payload.get("audio_transfer_id")
+            audio_path = os.path.join(tmp_dir, audio_filename)
+            download_transfer(audio_transfer_id, audio_path)
+            delete_transfer(audio_transfer_id)
+            result_path, meta, work_dir = pss.run_render_job_for_peer(
+                input_path, audio_path, requester_name, title_name, episode_number,
+                broadcast_fn=_broadcast_fn, loop=_main_loop,
+            )
         else:
             result_path, meta, work_dir = pss.run_import_job_for_peer(
                 input_path, requester_name, title_name, episode_number,
                 broadcast_fn=_broadcast_fn, loop=_main_loop,
             )
 
+        # Some tasks carry back a SECOND file alongside the primary result —
+        # "separate" sends the pure-vocal stem (meta["vocal_only_path"],
+        # needed by detect-markers on the requester's side, see
+        # power_share_service.run_separation_job_for_peer), "render" sends
+        # the standalone FLAC audio (meta["audio_output_path"], see
+        # run_mux_ffmpeg_only / run_render_job_for_peer). The existing
+        # protocol only ever moves one file per job, so this rides alongside
+        # as a second, separate transfer rather than replacing it.
+        _EXTRA_FILE_KEY_BY_TASK = {"separate": "vocal_only_path", "render": "audio_output_path"}
+
         try:
             result_transfer_id = str(uuid.uuid4())
             result_size = os.path.getsize(result_path)
             with open(result_path, "rb") as f:
                 upload_transfer(result_transfer_id, f, result_size)
+
+            extra_transfer_id = None
+            extra_key = _EXTRA_FILE_KEY_BY_TASK.get(task)
+            extra_path = meta.pop(extra_key, None) if (extra_key and isinstance(meta, dict)) else None
+            if extra_path and os.path.isfile(extra_path):
+                extra_transfer_id = str(uuid.uuid4())
+                extra_size = os.path.getsize(extra_path)
+                with open(extra_path, "rb") as f:
+                    upload_transfer(extra_transfer_id, f, extra_size)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
-        pss.power_logger.info("JOB-REQUEST-DONE from=%s task=%s result_transfer=%s", from_id, task, result_transfer_id)
+        pss.power_logger.info(
+            "JOB-REQUEST-DONE from=%s task=%s result_transfer=%s extra_transfer=%s",
+            from_id, task, result_transfer_id, extra_transfer_id,
+        )
         send_relay(from_id, {
             "kind": "job_done", "request_id": request_id,
-            "result_transfer_id": result_transfer_id, "meta": meta,
+            "result_transfer_id": result_transfer_id,
+            "vocal_only_transfer_id": extra_transfer_id if task == "separate" else None,
+            "audio_output_transfer_id": extra_transfer_id if task == "render" else None,
+            "meta": meta,
         })
     except Exception as exc:
         pss.power_logger.exception("JOB-REQUEST-ERROR from=%s task=%s", from_id, task)

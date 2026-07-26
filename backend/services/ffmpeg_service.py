@@ -203,6 +203,120 @@ def run_import_pipeline(
         db.close()
 
 
+def run_mux_ffmpeg_only(
+    original_video_path: str,
+    mixed_audio_path: str,
+    out_dir: str,
+    duration: Optional[float] = None,
+    on_progress=None,   # Optional[Callable[[int, str], None]] — no DB/job coupling
+    is_cancelled=None,  # Optional[Callable[[], bool]]
+) -> dict:
+    """Core ffmpeg mux routine, independent of any Episode/DB — used both for
+    local render (run_mux_pipeline below) and a power-shared render request
+    run entirely on a peer machine (which has no record of this episode at
+    all — see power_share_service.run_render_job_for_peer). Mirrors
+    run_import_ffmpeg_only's split between a pure-ffmpeg core and a DB-aware
+    wrapper for the same reason."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    def progress(pct, msg):
+        if on_progress:
+            on_progress(pct, msg)
+
+    progress(5, "ffmpeg: аналіз оригінального відео…")
+    probe = _probe(original_video_path)
+
+    # Find original audio stream info
+    audio_streams = [s for s in probe.get("streams", []) if s.get("codec_type") == "audio"]
+    orig_codec = audio_streams[0].get("codec_name", "aac") if audio_streams else "aac"
+    orig_bitrate = str(int(audio_streams[0].get("bit_rate", "192000")) // 1000) + "k" if audio_streams else "192k"
+    if not duration:
+        duration = float(probe.get("format", {}).get("duration", 0)) or 0
+
+    progress(15, "ffmpeg: мультиплексую фінальне відео…")
+
+    out_name = Path(original_video_path).stem + "_dub" + Path(original_video_path).suffix
+    out_path = str(Path(out_dir) / out_name)
+
+    cmd = [
+        _ffmpeg_bin(), "-y",
+        "-i", original_video_path,
+        "-i", mixed_audio_path,
+        "-map", "0:v",          # video from original
+        "-map", "1:a",          # audio from mixed
+        "-c:v", "copy",         # no re-encode video
+        "-c:a", orig_codec,
+        "-b:a", orig_bitrate,
+        out_path,
+    ]
+
+    app_logger.info("run_mux_ffmpeg_only: running ffmpeg: %s", " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd, stderr=subprocess.PIPE, text=True,
+        encoding="utf-8", errors="replace",
+    )
+    stderr_tail: list[str] = []
+    for line in proc.stderr:
+        stderr_tail.append(line)
+        if len(stderr_tail) > 200:
+            stderr_tail.pop(0)
+        if is_cancelled and is_cancelled():
+            proc.kill()
+            raise RuntimeError("Скасовано")
+        if "time=" in line and duration:
+            try:
+                t = _parse_time(line)
+                pct = min(90, int(15 + 75 * t / duration))
+                progress(pct, "ffmpeg: мультиплексую фінальне відео…")
+            except Exception:
+                pass
+    proc.wait()
+    if proc.returncode != 0:
+        app_logger.error(
+            "run_mux_ffmpeg_only: ffmpeg exited with code %s, last output:\n%s",
+            proc.returncode, "".join(stderr_tail),
+        )
+        raise RuntimeError("ffmpeg mux failed")
+
+    # Alongside the muxed video, also keep a standalone lossless FLAC of the
+    # exact same audio that went into it — the video's own audio track gets
+    # re-encoded above to match the ORIGINAL container's codec (often lossy,
+    # e.g. AAC), so this is the only copy of the final dub audio that stays
+    # bit-for-bit lossless, useful on its own (Reaper, archival) without
+    # needing to re-extract it from the video.
+    progress(95, "ffmpeg: зберігаю аудіо окремим FLAC-файлом…")
+    flac_out_path = str(Path(out_dir) / (Path(original_video_path).stem + "_dub.flac"))
+    _ensure_flac_copy(mixed_audio_path, flac_out_path)
+
+    progress(100, "Готово")
+    return {"output_path": out_path, "audio_output_path": flac_out_path}
+
+
+def convert_to_flac(input_path: str, output_path: str) -> str:
+    """Lossless re-encode to FLAC — used to shrink an uncompressed instrumental
+    WAV before uploading it to a power-share peer for a remote render (see
+    power_share_service.request_remote_render); FLAC roughly halves a PCM
+    WAV's size losslessly, cutting transfer time without touching quality."""
+    cmd = [_ffmpeg_bin(), "-y", "-i", input_path, "-c:a", "flac", "-compression_level", "5", output_path]
+    app_logger.info("convert_to_flac: running ffmpeg: %s", " ".join(cmd))
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        app_logger.error("convert_to_flac: ffmpeg exited with code %s: %s", result.returncode, result.stderr[-2000:])
+        raise RuntimeError("ffmpeg FLAC conversion failed")
+    return output_path
+
+
+def _ensure_flac_copy(source_path: str, dest_path: str) -> str:
+    """Produces a FLAC file at dest_path from source_path — a plain copy if
+    source is already FLAC (a power-share render's instrumental always is,
+    see power_share_service.request_remote_render), otherwise a lossless
+    ffmpeg re-encode (a local render's instrumental is WAV)."""
+    if Path(source_path).suffix.lower() == ".flac":
+        shutil.copy2(source_path, dest_path)
+        return dest_path
+    return convert_to_flac(source_path, dest_path)
+
+
 def run_mux_pipeline(
     episode_id: int,
     original_video_path: str,
@@ -239,65 +353,16 @@ def _run_mux_pipeline(
     # User-picked destination (native folder dialog) if given, otherwise the
     # episode's own data-dir folder as before.
     out_dir = Path(output_dir) if output_dir else Path(DATA_DIR) / "episodes" / str(episode_id)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    reporter.update(5, "ffmpeg: аналіз оригінального відео…")
-    probe = _probe(original_video_path)
-
-    # Find original audio stream info
-    audio_streams = [s for s in probe.get("streams", []) if s.get("codec_type") == "audio"]
-    orig_codec = audio_streams[0].get("codec_name", "aac") if audio_streams else "aac"
-    orig_bitrate = str(int(audio_streams[0].get("bit_rate", "192000")) // 1000) + "k" if audio_streams else "192k"
-
-    reporter.update(15, "ffmpeg: мультиплексую фінальне відео…")
-
-    out_name = Path(original_video_path).stem + "_dub" + Path(original_video_path).suffix
-    out_path = str(out_dir / out_name)
-
-    cmd = [
-        _ffmpeg_bin(), "-y",
-        "-i", original_video_path,
-        "-i", mixed_audio_path,
-        "-map", "0:v",          # video from original
-        "-map", "1:a",          # audio from mixed
-        "-c:v", "copy",         # no re-encode video
-        "-c:a", orig_codec,
-        "-b:a", orig_bitrate,
-        out_path,
-    ]
-
-    duration = ep.duration or 0
-    app_logger.info("_run_mux_pipeline: running ffmpeg: %s", " ".join(cmd))
-    proc = subprocess.Popen(
-        cmd, stderr=subprocess.PIPE, text=True,
-        encoding="utf-8", errors="replace",
+    result = run_mux_ffmpeg_only(
+        original_video_path, mixed_audio_path, str(out_dir), duration=ep.duration,
+        on_progress=reporter.update, is_cancelled=lambda: reporter.cancelled,
     )
-    stderr_tail: list[str] = []
-    for line in proc.stderr:
-        stderr_tail.append(line)
-        if len(stderr_tail) > 200:
-            stderr_tail.pop(0)
-        if "time=" in line and duration:
-            try:
-                t = _parse_time(line)
-                pct = min(90, int(15 + 75 * t / duration))
-                reporter.update(pct, "ffmpeg: мультиплексую фінальне відео…")
-            except Exception:
-                pass
-    proc.wait()
-    if proc.returncode != 0:
-        app_logger.error(
-            "_run_mux_pipeline: ffmpeg exited with code %s, last output:\n%s",
-            proc.returncode, "".join(stderr_tail),
-        )
-        raise RuntimeError("ffmpeg mux failed")
 
     ep.status = "ready"
     db.commit()
-    app_logger.info("_run_mux_pipeline: episode %s done, output=%s", episode_id, out_path)
-
-    reporter.update(100, "Готово")
-    return {"output_path": out_path}
+    app_logger.info("_run_mux_pipeline: episode %s done, output=%s", episode_id, result["output_path"])
+    return result
 
 
 def get_waveform_samples(audio_path: str, num_samples: int = 2000) -> tuple[list[float], float, int]:

@@ -20,12 +20,14 @@ zero peers are online/willing, or if the episode is too short to usefully
 split — "distributed" is strictly additive, never a harder requirement than
 the normal path.
 
-Known limitation (shared with single-peer power-share, not new here): only
-the instrumental crosses the wire from a peer, never the pure-vocal stem (see
-run_separation_job_for_peer's docstring) — so vocal_only_stem_path is left
-unset whenever any chunk was processed remotely, exactly like today's
-single-peer flow. detect-markers already has a clear error message for this
-case (see episodes.py's detect_markers endpoint).
+Each chunk's pure-vocal stem (needed by detect-markers) crosses the wire
+alongside its instrumental now, same as single-peer power-share (see
+run_separation_job_for_peer's docstring) — so vocal_only_stem_path gets
+stitched together and set here too, as long as every chunk actually produced
+one; if any chunk's vocal-only stem is missing for any reason, the whole
+episode's vocal_only_stem_path is left unset rather than stitched from a
+partial/misaligned set of chunks (detect-markers already has a clear error
+message for that case — see episodes.py's detect_markers endpoint).
 """
 import os
 import shutil
@@ -305,6 +307,7 @@ def run_distributed_separation(
         output_dir.mkdir(parents=True, exist_ok=True)
 
         results: dict[int, str] = {}   # chunk_index -> instrumental wav path
+        vocal_only_results: dict[int, Optional[str]] = {}  # chunk_index -> pure-vocal wav path
         errors: dict[int, str] = {}
         peer_assignments = list(zip(accepted_peers, bounds[1:]))  # chunk 0 stays local
 
@@ -316,6 +319,7 @@ def run_distributed_separation(
                 reporter.update(25, "Обробляю свій кусок локально…")
             stems = separator_service.separate_file(chunk_audio, str(work_dir / "out_0"), model, ensemble, model_file=model_file, params=params)
             results[0] = stems["vocal_stem_path"]
+            vocal_only_results[0] = stems.get("vocal_only_stem_path")
 
         def process_peer_chunk(idx: int, peer: dict, start: float, end: float):
             try:
@@ -340,6 +344,14 @@ def run_distributed_separation(
                 discovery_service.download_transfer(result["result_transfer_id"], chunk_out)
                 discovery_service.delete_transfer(result["result_transfer_id"])
                 results[idx] = chunk_out
+
+                vocal_only_transfer_id = result.get("vocal_only_transfer_id")
+                if vocal_only_transfer_id:
+                    chunk_vocal_only = str(work_dir / f"peer_vocal_only_{idx}.wav")
+                    discovery_service.download_transfer(vocal_only_transfer_id, chunk_vocal_only)
+                    discovery_service.delete_transfer(vocal_only_transfer_id)
+                    vocal_only_results[idx] = chunk_vocal_only
+
                 power_logger.info("DISTRIBUTED-DONE chunk=%s peer=%s", idx, peer["id"])
             except Exception as exc:
                 power_logger.exception("DISTRIBUTED chunk=%s peer=%s failed, will redo locally", idx, peer["id"])
@@ -363,6 +375,7 @@ def run_distributed_separation(
                 _cut_audio_chunk(audio_path, start, end, chunk_audio)
                 stems = separator_service.separate_file(chunk_audio, str(work_dir / f"out_{idx}"), model, ensemble, model_file=model_file, params=params)
                 results[idx] = stems["vocal_stem_path"]
+                vocal_only_results[idx] = stems.get("vocal_only_stem_path")
 
         if reporter:
             reporter.update(85, "Склеюю результат…")
@@ -371,10 +384,14 @@ def run_distributed_separation(
         final_instrumental = str(output_dir / "vocal_isolated.wav")
         _crossfade_stitch(ordered, bounds, total_duration, OVERLAP_SECONDS, final_instrumental)
 
+        final_vocal_only = None
+        if all(vocal_only_results.get(i) for i in range(num_chunks)):
+            ordered_vocal_only = [vocal_only_results[i] for i in range(num_chunks)]
+            final_vocal_only = str(output_dir / "vocal_only.wav")
+            _crossfade_stitch(ordered_vocal_only, bounds, total_duration, OVERLAP_SECONDS, final_vocal_only)
+
         ep.vocal_stem_path = final_instrumental
-        # Only the instrumental ever crosses the wire from a peer (see module
-        # docstring) — same limitation single-peer power-share already has.
-        ep.vocal_only_stem_path = None
+        ep.vocal_only_stem_path = final_vocal_only
         ep.status = "vocal_isolated"
         bump_title_in_progress(db, ep.title_id)
         db.commit()
@@ -383,7 +400,7 @@ def run_distributed_separation(
 
         if reporter:
             reporter.update(100, f"Готово — оброблено на {num_chunks} машинах")
-        power_logger.info("DISTRIBUTED-COMPLETE episode=%s chunks=%s", episode_id, num_chunks)
-        return {"vocal_stem_path": final_instrumental, "vocal_only_stem_path": None, "chunks": num_chunks}
+        power_logger.info("DISTRIBUTED-COMPLETE episode=%s chunks=%s vocal_only=%s", episode_id, num_chunks, bool(final_vocal_only))
+        return {"vocal_stem_path": final_instrumental, "vocal_only_stem_path": final_vocal_only, "chunks": num_chunks}
     finally:
         db.close()

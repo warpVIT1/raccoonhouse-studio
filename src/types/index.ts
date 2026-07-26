@@ -74,7 +74,7 @@ export interface Marker {
 
 export interface JobStatus {
   id: string
-  type: 'import_video' | 'import_video_remote' | 'separate_vocals' | 'batch_separate_vocals' | 'distributed_separate_vocals' | 'request_remote_separation' | 'detect_markers' | 'export_srt' | 'mux_audio' | 'install_gpu_runtime'
+  type: 'import_video' | 'import_video_remote' | 'separate_vocals' | 'batch_separate_vocals' | 'distributed_separate_vocals' | 'request_remote_separation' | 'detect_markers' | 'export_srt' | 'mux_audio' | 'request_remote_render' | 'install_gpu_runtime'
   status: 'pending' | 'running' | 'complete' | 'error' | 'cancelled'
   percent: number
   message: string
@@ -131,13 +131,13 @@ export interface PowerShareRequestPayload {
   requester_name: string
   title_name: string
   episode_number: number
-  task: 'separate' | 'import'
+  task: 'separate' | 'import' | 'render'
   timeout_seconds: number
 }
 
 export interface PowerShareLendingPayload {
   active: boolean
-  task: 'separate' | 'import'
+  task: 'separate' | 'import' | 'render'
   requester_name: string
   title_name: string
   episode_number: number

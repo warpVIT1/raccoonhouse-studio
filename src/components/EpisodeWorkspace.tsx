@@ -65,6 +65,8 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
 
   // Final render/mux
   const [rendering, setRendering] = useState(false)
+  const [requestingRender, setRequestingRender] = useState(false)
+  const [renderError, setRenderError] = useState<string | null>(null)
 
   // ASS import
   const assInputRef = useRef<HTMLInputElement>(null)
@@ -120,6 +122,8 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
             setSeparationError(job.message || 'Не вдалося виконати ізоляцію вокалу')
           } else if (job.type === 'detect_markers') {
             setMarkersError(job.message || 'Не вдалося виявити маркери')
+          } else if (job.type === 'mux_audio' || job.type === 'request_remote_render') {
+            setRenderError(job.message || 'Не вдалося відрендерити фінальне відео')
           }
         }
         continue
@@ -644,6 +648,38 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     }
   }
 
+  // Same as handleRender, but the final ffmpeg mux itself runs on a peer:
+  // sends the original video AND the instrumental (converted to FLAC first
+  // on the backend, to shrink the upload) instead of doing it locally.
+  async function handleRequestRemoteRender() {
+    if (!backendReady) return
+    let outputDir: string | null = null
+    if (window.electronAPI?.openDirectory) {
+      outputDir = await window.electronAPI.openDirectory()
+      if (!outputDir) return
+    }
+    setRequestingRender(true)
+    setRenderError(null)
+    try {
+      const result = await post<{ job_id: string }>(`/episodes/${episodeId}/request-remote-render`, {
+        output_dir: outputDir,
+      })
+      upsertJob({
+        id: result.job_id,
+        type: 'request_remote_render',
+        status: 'running',
+        percent: 0,
+        message: 'Шукаю доступні ПК онлайн…',
+        episode_id: episodeId,
+      })
+    } catch (err) {
+      console.error('[request-remote-render] request failed:', err)
+      setRenderError(err instanceof Error ? err.message : 'Не вдалося надіслати запит на рендер')
+    } finally {
+      setRequestingRender(false)
+    }
+  }
+
   const episodeJob = [...activeJobs.values()].find(
     (j) => j.episode_id === episodeId && j.status === 'running'
   )
@@ -694,6 +730,18 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
             <span className="truncate">{markersError}</span>
             <button
               onClick={() => setMarkersError(null)}
+              className="w-4 h-4 rounded-full flex items-center justify-center text-red-300/70 hover:text-white hover:bg-red-400/20 leading-none flex-shrink-0"
+            >
+              ✕
+            </button>
+          </span>
+        )}
+
+        {renderError && (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-red-900/30 text-red-300 max-w-[420px]">
+            <span className="truncate">{renderError}</span>
+            <button
+              onClick={() => setRenderError(null)}
               className="w-4 h-4 rounded-full flex items-center justify-center text-red-300/70 hover:text-white hover:bg-red-400/20 leading-none flex-shrink-0"
             >
               ✕
@@ -753,9 +801,20 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
           {!vocalIsolated && (
             <span className="text-xs text-rh-muted">Виконайте відокремлення вокалу, щоб рендерити</span>
           )}
+          {powerShareEnabled && (
+            <button
+              onClick={handleRequestRemoteRender}
+              disabled={!vocalIsolated || requestingRender || rendering}
+              className="rh-btn-outline text-xs"
+              title="Надіслати відео та інструментал (FLAC) на потужніший ПК для фінального рендеру"
+            >
+              {requestingRender ? <Spinner size={12} /> : null}
+              Запросити потужність
+            </button>
+          )}
           <button
             onClick={handleRender}
-            disabled={!vocalIsolated || rendering}
+            disabled={!vocalIsolated || rendering || requestingRender}
             className={`text-xs font-bold rounded-lg px-4 py-2 transition-all
               ${vocalIsolated
                 ? 'bg-rh-accent text-white hover:bg-[#F03238] hover:shadow-[0_0_20px_rgba(229,33,40,0.3)]'
@@ -800,10 +859,10 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
               <button onClick={() => setBatchResults(null)} className="text-rh-muted hover:text-white text-lg leading-none px-1">✕</button>
             </div>
             <p className="text-xs text-rh-muted">
-              Кожен метод дав окремий файл у теці, яка щойно відкрилась. Оберіть той, що звучить найкраще —
+              Кожна модель дала окремий файл у теці, яка щойно відкрилась. Оберіть той, що звучить найкраще —
               він стане інструменталом цієї серії для рендеру.
             </p>
-            <div className="flex flex-col gap-1.5">
+            <div className="flex flex-col gap-1.5 max-h-[60vh] overflow-y-auto pr-1">
               {batchResults.items.map((r) => (
                 <div key={r.model} className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-rh-border">
                   <span className="text-xs font-medium">{r.model}</span>

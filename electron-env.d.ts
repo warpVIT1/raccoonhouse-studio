@@ -17,6 +17,7 @@ interface Window {
     getBackendPort: () => Promise<number>
     getAppVersion: () => Promise<string>
     openPath: (path: string) => Promise<void>
+    openExternal: (url: string) => Promise<void>
     platform: string
     minimize: () => void
     maximize: () => void
@@ -25,5 +26,6 @@ interface Window {
     downloadUpdate: () => Promise<void>
     installUpdate: () => Promise<void>
     onUpdateStatus: (callback: (status: Record<string, unknown>) => void) => () => void
+    onBetaAvailable: (callback: (info: Record<string, unknown>) => void) => () => void
   }
 }

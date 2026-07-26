@@ -305,16 +305,17 @@ async def detect_markers(ep_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404)
     # VAD needs an actual voice signal to find speech gaps in — vocal_stem_path
     # is the instrumental (vocal removed) now, so this must read
-    # vocal_only_stem_path instead. Episodes separated on a peer machine via
-    # power-share never get this field populated (only the instrumental
-    # crosses the wire), so they need a clear error rather than silently
-    # running VAD against the wrong (or missing) file.
+    # vocal_only_stem_path instead. Power-share/distributed separation now
+    # transfers both stems back, so this should only ever trigger for an
+    # episode that hasn't had vocal separation run at all yet, or one
+    # separated by an older app version (pre-dual-stem-transfer) or a peer
+    # still running one.
     if not ep.vocal_only_stem_path or not os.path.isfile(ep.vocal_only_stem_path):
         app_logger.warning(
             "detect-markers: episode %s has no vocal-only stem (vocal_only_stem_path=%r)",
             ep_id, ep.vocal_only_stem_path,
         )
-        raise HTTPException(400, "Vocal-only stem not found — run vocal isolation first (locally, not via power-share)")
+        raise HTTPException(400, "Vocal-only stem not found — run vocal isolation first")
     app_logger.info("detect-markers: episode=%s", ep_id)
 
     job = job_manager.create_job("detect_markers", episode_id=ep_id)

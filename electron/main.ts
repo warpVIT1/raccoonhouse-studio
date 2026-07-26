@@ -471,9 +471,66 @@ function initAutoUpdater() {
 
   const check = () => autoUpdater.checkForUpdates().catch((err) => logLine('ERROR', 'updater', 'check failed', err))
   check()
+  checkForBetaAvailable()
   // Nobody has to remember to click "Перевірити зараз" — this keeps checking
   // in the background for as long as the app stays open.
   setInterval(check, AUTO_CHECK_INTERVAL_MS)
+  setInterval(checkForBetaAvailable, AUTO_CHECK_INTERVAL_MS)
+}
+
+// --- Beta channel nudge (separate from the main auto-update flow above) ---
+//
+// electron-updater's own "allowPrerelease" already defaults to false for a
+// stable-tagged running version (no "-beta" suffix) and true for a
+// prerelease-tagged one — so the MAIN update flow already does the right
+// thing on its own: a stable install only ever auto-updates to a newer
+// stable release, a beta install only ever auto-updates to a newer beta.
+// What's missing is visibility: someone running stable never finds out a
+// beta exists at all. This is a second, independent, much lighter-weight
+// check straight against the GitHub Releases API (not electron-updater) that
+// just surfaces "a beta is out" as a small dismissible notice — never
+// auto-downloaded, never silently installed, purely opt-in via a manual
+// click that opens the release page in the browser.
+const GITHUB_RELEASES_API = 'https://api.github.com/repos/warpVIT1/raccoonhouse-studio/releases?per_page=10'
+
+function parseVersionTriplet(v: string): [number, number, number] {
+  const m = v.replace(/^v/, '').match(/^(\d+)\.(\d+)\.(\d+)/)
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : [0, 0, 0]
+}
+
+// Major.minor.patch only — deliberately ignores the "-beta" suffix itself,
+// since the point here is "is this beta's version LINE ahead of what I'm
+// running", not a full semver prerelease-precedence comparison.
+function isNewerVersion(a: string, b: string): boolean {
+  const [aMaj, aMin, aPatch] = parseVersionTriplet(a)
+  const [bMaj, bMin, bPatch] = parseVersionTriplet(b)
+  if (aMaj !== bMaj) return aMaj > bMaj
+  if (aMin !== bMin) return aMin > bMin
+  return aPatch > bPatch
+}
+
+async function checkForBetaAvailable() {
+  if (!app.isPackaged) return
+  const currentVersion = app.getVersion()
+  if (/-\w/.test(currentVersion)) return // already running a beta — the main channel above already covers newer betas
+  try {
+    const resp = await fetch(GITHUB_RELEASES_API)
+    if (!resp.ok) return
+    const releases = (await resp.json()) as Array<{ tag_name: string; prerelease: boolean; html_url: string; body: string | null }>
+    const beta = releases.find((r) => r.prerelease)
+    if (!beta) return
+    const betaVersion = beta.tag_name.replace(/^v/, '')
+    if (isNewerVersion(betaVersion, currentVersion)) {
+      win?.webContents.send('update:beta-available', {
+        version: betaVersion,
+        url: beta.html_url,
+        notes: beta.body || '',
+      })
+    }
+  } catch (err) {
+    // Non-fatal by design — worst case, nobody sees the beta nudge this cycle.
+    logLine('INFO', 'updater', 'beta check failed (non-fatal)', err)
+  }
 }
 
 function formatReleaseNotes(notes: string | { version: string; note: string | null }[] | null | undefined): string {
@@ -518,6 +575,11 @@ ipcMain.handle('dialog:openDirectory', async () => {
 
 ipcMain.handle('get:backendPort', () => BACKEND_PORT)
 ipcMain.handle('get:appVersion', () => app.getVersion())
+
+ipcMain.handle('shell:openExternal', async (_event, url: string) => {
+  if (!/^https:\/\/github\.com\//.test(url)) return // only ever used for the beta-release-page link above
+  await shell.openExternal(url)
+})
 
 ipcMain.handle('shell:openPath', async (_event, filePath: string) => {
   await shell.openPath(filePath)

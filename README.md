@@ -10,7 +10,7 @@
 
 <p align="center">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white">
-  <img alt="release" src="https://img.shields.io/github/v/release/warpVIT1/raccoonhouse-studio?label=версія&color=E52128">
+  <img alt="release" src="https://img.shields.io/github/v/release/warpVIT1/raccoonhouse-studio?label=%D0%B2%D0%B5%D1%80%D1%81%D1%96%D1%8F&color=E52128">
   <img alt="electron" src="https://img.shields.io/badge/Electron-%2B-47848F?logo=electron&logoColor=white">
   <img alt="fastapi" src="https://img.shields.io/badge/backend-FastAPI-009688?logo=fastapi&logoColor=white">
 </p>

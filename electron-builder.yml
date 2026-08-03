@@ -43,6 +43,15 @@ win:
   icon: resources/icon.ico
 
 nsis:
+  # Fixed name (no ${version}, electron-builder's own default) — lets
+  # README.md link to .../releases/latest/download/RaccoonHouse-Studio-Setup.exe,
+  # which GitHub always resolves to whatever the CURRENT latest release's
+  # asset of that exact name is. This is the only way a plain static link can
+  # "auto-update" — GitHub has no /latest/ resolution for a filename that
+  # embeds the version, so a versioned name always means hand-editing the
+  # link on every release. electron-updater itself doesn't care either way —
+  # it reads the exact filename out of latest.yml, not this pattern.
+  artifactName: RaccoonHouse-Studio-Setup.exe
   oneClick: false
   allowElevation: true
   allowToChangeInstallationDirectory: true

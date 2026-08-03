@@ -523,6 +523,16 @@ function initAutoUpdater() {
   // time the app quits normally.
   autoUpdater.autoDownload = false
   autoUpdater.autoInstallOnAppQuit = true
+  // electron-updater normally refuses to "update" to a release whose
+  // version number is lower than what's already installed — but this
+  // project has already reset its version scheme once before (went from
+  // 1.1.9-beta back down to 1.0.0), and may again. With this on,
+  // electron-updater stops gating on version-number ordering entirely and
+  // just takes whatever GitHub's own "latest release" currently is —
+  // which GitHub always determines by publish date, not by parsing the
+  // version string — so a future reset still gets picked up as an update
+  // instead of being silently ignored as a "downgrade."
+  autoUpdater.allowDowngrade = true
 
   autoUpdater.on('checking-for-update', () => sendUpdateStatus('checking'))
   autoUpdater.on('update-available', (info) => sendUpdateStatus('available', {

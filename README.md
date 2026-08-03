@@ -10,7 +10,7 @@
 
 <p align="center">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white">
-  <a href="https://github.com/warpVIT1/raccoonhouse-studio/releases/latest">
+  <a href="https://github.com/warpVIT1/raccoonhouse-studio/releases/download/v1.0.2/RaccoonHouse-Studio-Setup-1.0.2.exe">
     <img alt="release" src="https://img.shields.io/github/v/release/warpVIT1/raccoonhouse-studio?label=%D0%B2%D0%B5%D1%80%D1%81%D1%96%D1%8F&color=E52128">
   </a>
   <img alt="electron" src="https://img.shields.io/badge/Electron-%2B-47848F?logo=electron&logoColor=white">

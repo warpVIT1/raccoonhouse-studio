@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { Title, Episode, JobStatus, WsMessage, Profile, PowerShareRequestPayload, PowerShareLendingPayload } from '../types'
+import type { Title, Episode, JobStatus, WsMessage, Profile, PowerShareRequestPayload, PowerShareLendingPayload, PowerShareModelDownloadPayload, PowerShareBorrowingPayload } from '../types'
 
 interface AppState {
   backendPort: number
@@ -8,10 +8,14 @@ interface AppState {
   selectedTitleId: number | null
   selectedEpisodeId: number | null
   showSettings: boolean
+  showModelBrowser: boolean
   activeJobs: Map<string, JobStatus>
   activeProfile: Profile | null
   incomingPowerShareRequest: PowerShareRequestPayload | null
+  incomingModelDownloadRequest: PowerShareModelDownloadPayload | null
   lendingStatus: PowerShareLendingPayload | null
+  borrowingStatus: PowerShareBorrowingPayload | null
+  forceUpdateNotice: { from_name: string } | null
 
   setBackendPort: (port: number) => void
   setBackendReady: (ready: boolean) => void
@@ -19,8 +23,11 @@ interface AppState {
   setSelectedTitle: (id: number | null) => void
   setSelectedEpisode: (id: number | null) => void
   setShowSettings: (show: boolean) => void
+  setShowModelBrowser: (show: boolean) => void
   setActiveProfile: (profile: Profile | null) => void
   clearIncomingPowerShareRequest: () => void
+  clearIncomingModelDownloadRequest: () => void
+  clearForceUpdateNotice: () => void
   upsertJob: (job: JobStatus) => void
   removeJob: (jobId: string) => void
   reconcileActiveJobs: (liveJobIds: string[]) => void
@@ -34,19 +41,34 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectedTitleId: null,
   selectedEpisodeId: null,
   showSettings: false,
+  showModelBrowser: false,
   activeJobs: new Map(),
   activeProfile: null,
   incomingPowerShareRequest: null,
+  incomingModelDownloadRequest: null,
   lendingStatus: null,
+  borrowingStatus: null,
+  forceUpdateNotice: null,
 
   setBackendPort: (port) => set({ backendPort: port }),
   setBackendReady: (ready) => set({ backendReady: ready }),
   setTitles: (titles) => set({ titles }),
-  setSelectedTitle: (id) => set({ selectedTitleId: id, selectedEpisodeId: null, showSettings: false }),
+  setSelectedTitle: (id) => set({ selectedTitleId: id, selectedEpisodeId: null, showSettings: false, showModelBrowser: false }),
   setSelectedEpisode: (id) => set({ selectedEpisodeId: id }),
-  setShowSettings: (show) => set({ showSettings: show }),
+  setShowSettings: (show) => set((state) => ({
+    showSettings: show,
+    showModelBrowser: show ? false : state.showModelBrowser,
+  })),
+  setShowModelBrowser: (show) => set((state) => ({
+    showModelBrowser: show,
+    showSettings: show ? false : state.showSettings,
+    selectedTitleId: show ? null : state.selectedTitleId,
+    selectedEpisodeId: show ? null : state.selectedEpisodeId,
+  })),
   setActiveProfile: (profile) => set({ activeProfile: profile }),
   clearIncomingPowerShareRequest: () => set({ incomingPowerShareRequest: null }),
+  clearIncomingModelDownloadRequest: () => set({ incomingModelDownloadRequest: null }),
+  clearForceUpdateNotice: () => set({ forceUpdateNotice: null }),
 
   upsertJob: (job) => set((state) => {
     const jobs = new Map(state.activeJobs)
@@ -86,9 +108,22 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ incomingPowerShareRequest: msg.data as unknown as PowerShareRequestPayload })
       return
     }
+    if (msg.type === 'power_share_model_download_request') {
+      set({ incomingModelDownloadRequest: msg.data as unknown as PowerShareModelDownloadPayload })
+      return
+    }
     if (msg.type === 'power_share_lending') {
       const data = msg.data as unknown as PowerShareLendingPayload
       set({ lendingStatus: data.active ? data : null })
+      return
+    }
+    if (msg.type === 'power_share_borrowing') {
+      const data = msg.data as unknown as PowerShareBorrowingPayload
+      set({ borrowingStatus: data.active ? data : null })
+      return
+    }
+    if (msg.type === 'force_update_request') {
+      set({ forceUpdateNotice: msg.data as unknown as { from_name: string } })
       return
     }
     if (!msg.job_id) return

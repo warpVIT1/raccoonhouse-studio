@@ -16,6 +16,16 @@
       "bucket_name": "raccoonhouse-transfers"
     }
   ],
+  "d1_databases": [
+    {
+      "binding": "MODELS_DB",
+      "database_name": "raccoonhouse-models",
+      "database_id": "696a7018-3b52-402d-803a-d2aafccddd1a"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
   "migrations": [
     {
       "tag": "v1",

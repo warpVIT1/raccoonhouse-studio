@@ -250,9 +250,16 @@ async def use_batch_result(ep_id: int, request: Request, db: Session = Depends(g
     if not os.path.isfile(path):
         raise HTTPException(400, "Файл більше не існує")
 
+    # Unconditional, same as a normal (non-batch) separation run (see
+    # run_separation in separator_service.py) — picking a batch result
+    # changes vocal_stem_path just as much as any other separation does, so
+    # it needs to downgrade an already-"marked"/"ready" episode the same
+    # way. Previously guarded against downgrading, which left the tile
+    # showing "Готово" (or "Промарковано") after swapping in a different
+    # batch model even though the final render (or markers) on file were
+    # now stale for the newly picked instrumental.
     ep.vocal_stem_path = path
-    if ep.status not in ("marked", "ready"):
-        ep.status = "vocal_isolated"
+    ep.status = "vocal_isolated"
     bump_title_in_progress(db, ep.title_id)
     db.commit()
     app_logger.info("use-batch-result: episode %s now uses %s", ep_id, path)

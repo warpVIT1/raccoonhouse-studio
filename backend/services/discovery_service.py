@@ -20,6 +20,7 @@ RaccoonHouse instances need nothing in common except both being connected to
 the same Worker, so there's no "different network" or "VPN mesh doesn't
 relay broadcast" case left to work around.
 """
+import asyncio
 import json
 import os
 import shutil
@@ -110,6 +111,15 @@ def set_broadcast(loop, broadcast_fn):
     _broadcast_fn = broadcast_fn
 
 
+def broadcast_local(message: dict):
+    """Pushes straight to THIS machine's own frontend over its local /ws —
+    used by power_share_service's requester-side code to dismiss the
+    'Вам допомагає X' banner once its call_peer(...) round trip resolves,
+    without reaching into this module's private _broadcast_fn/_main_loop."""
+    if _broadcast_fn and _main_loop:
+        asyncio.run_coroutine_threadsafe(_broadcast_fn(message), _main_loop)
+
+
 def get_discovered_peers() -> list[dict]:
     now = time.time()
     with _registry_lock:
@@ -117,6 +127,21 @@ def get_discovered_peers() -> list[dict]:
             info for info in _registry.values()
             if now - info["last_seen"] <= STALE_AFTER_SECONDS
         ]
+
+
+def broadcast_force_update_request(from_name: str) -> int:
+    """Admin action — nudges every currently-online peer to go check for an
+    update, regardless of what version each one happens to be running (the
+    admin may know a release is out that the auto-updater's own periodic
+    check hasn't caught yet, or just wants everyone reminded). Fire-and-
+    forget to every peer's own relay id, no reply expected — this is a
+    notice, not a request/response call. Returns how many peers were sent it."""
+    peers = get_discovered_peers()
+    sent = 0
+    for peer in peers:
+        if send_relay(peer["id"], {"kind": "force_update_request", "from_name": from_name}):
+            sent += 1
+    return sent
 
 
 def start(backend_port: int):
@@ -218,6 +243,219 @@ def delete_transfer(transfer_id: str) -> None:
         pass
 
 
+# --- "Suggestions & complaints" inbox (plain HTTPS to the Worker's /feedback
+# routes — see cloudflare-signaling/src/index.ts) ---
+
+def submit_feedback(nickname: str, message: str) -> str:
+    base = get_https_base()
+    if not base:
+        raise ValueError("Онлайн-сигналізація не налаштована — вкажіть URL сервера у Налаштуваннях")
+    resp = requests.post(f"{base}/feedback", json={"nickname": nickname, "message": message}, timeout=15)
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+def list_feedback() -> list[dict]:
+    base = get_https_base()
+    if not base:
+        raise ValueError("Онлайн-сигналізація не налаштована — вкажіть URL сервера у Налаштуваннях")
+    resp = requests.get(f"{base}/feedback", timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def delete_feedback(feedback_id: str) -> None:
+    base = get_https_base()
+    if not base:
+        return
+    try:
+        requests.delete(f"{base}/feedback/{feedback_id}", timeout=15)
+    except Exception:
+        pass
+
+
+# --- Separation-run reports for the admin (plain HTTPS to the Worker's
+# /reports routes — see cloudflare-signaling/src/index.ts) ---
+
+def submit_report(report: dict) -> "str | None":
+    base = get_https_base()
+    if not base:
+        return None
+    resp = requests.post(f"{base}/reports", json=report, timeout=15)
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+def list_reports() -> list[dict]:
+    base = get_https_base()
+    if not base:
+        raise ValueError("Онлайн-сигналізація не налаштована — вкажіть URL сервера у Налаштуваннях")
+    resp = requests.get(f"{base}/reports", timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def delete_report(report_id: str) -> None:
+    base = get_https_base()
+    if not base:
+        return
+    try:
+        requests.delete(f"{base}/reports/{report_id}", timeout=15)
+    except Exception:
+        pass
+
+
+# --- Апекс line-up sync (plain HTTPS to the Worker's /apex-models — see
+# cloudflare-signaling/src/index.ts) ---
+
+def push_apex_models(lineup: list[dict]) -> None:
+    """Best-effort — called after the admin adds/removes a model locally
+    (see routers/separation_models.py). Never raises: a failed push here
+    would otherwise turn a successful local edit into a request error for
+    no reason, and the next successful push (or the next puller's own read)
+    reconciles things anyway."""
+    base = get_https_base()
+    if not base:
+        return
+    try:
+        requests.put(f"{base}/apex-models", json=lineup, timeout=15)
+    except Exception:
+        pass
+
+
+def submit_model_rating(rating: dict) -> None:
+    """Best-effort — called right after a rating is saved locally (see
+    routers/model_browser.py). Never raises, same reasoning as
+    push_apex_models above: the local save already succeeded, and the next
+    successful push (by this install or the rater re-rating later) or the
+    next puller's own read reconciles things regardless. The Worker's
+    /model-ratings PUT key is deterministic (method+filename+profile_name),
+    so this naturally overwrites this profile's own prior rating for the
+    same model rather than accumulating duplicates."""
+    base = get_https_base()
+    if not base:
+        return
+    try:
+        requests.put(f"{base}/model-ratings", json=rating, timeout=15)
+    except Exception:
+        pass
+
+
+def list_model_ratings() -> list[dict]:
+    """Unlike list_feedback/list_reports, returns [] rather than raising when
+    unreachable — the Model Browser should stay usable (showing whatever's
+    cached locally) even with the Worker offline, not hard-fail the whole
+    panel over a supplementary feature like ratings."""
+    base = get_https_base()
+    if not base:
+        return []
+    try:
+        resp = requests.get(f"{base}/model-ratings", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return []
+
+
+# --- Model Browser catalog (models added via "add by URL", stored server-
+# side in the Worker's D1 database rather than any per-install SQLite — see
+# cloudflare-signaling/schema.sql and routers/model_browser.py) ---
+
+def auto_configure_model(url: str) -> dict:
+    """Asks the Worker's Workers-AI-backed /models/auto-configure to figure
+    out method/arch/filename/download_url/config_yaml_url from a repository
+    URL — raises on failure (unlike the best-effort functions below) because
+    the caller needs to show the user a real error, not silently do nothing,
+    when they've just pasted a link and are waiting for a result."""
+    base = get_https_base()
+    if not base:
+        raise ValueError("Онлайн-сигналізація не налаштована — вкажіть URL сервера у Налаштуваннях")
+    resp = requests.post(f"{base}/models/auto-configure", json={"url": url}, timeout=45)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def add_browsable_model(item: dict) -> dict:
+    base = get_https_base()
+    if not base:
+        raise ValueError("Онлайн-сигналізація не налаштована — вкажіть URL сервера у Налаштуваннях")
+    resp = requests.post(f"{base}/models", json=item, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def list_browsable_models(method: "str | None" = None) -> list[dict]:
+    """[] on any failure (offline, unconfigured, Worker down) — the browser
+    should still show the local audio-separator registry even when the
+    shared community catalog is unreachable, not hard-fail the whole panel."""
+    base = get_https_base()
+    if not base:
+        return []
+    try:
+        params = {"method": method} if method else {}
+        resp = requests.get(f"{base}/models", params=params, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return []
+
+
+def get_browsable_model(model_id: str) -> "dict | None":
+    base = get_https_base()
+    if not base:
+        return None
+    try:
+        resp = requests.get(f"{base}/models/{model_id}", timeout=15)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return None
+
+
+def delete_browsable_model(model_id: str) -> None:
+    base = get_https_base()
+    if not base:
+        return
+    try:
+        requests.delete(f"{base}/models/{model_id}", timeout=15)
+    except Exception:
+        pass
+
+
+def delete_model_ratings(method: str, filename: str) -> None:
+    """Best-effort — called right after a catalog entry is removed (see
+    routers/model_browser.py's delete_catalog_entry), since ratings are
+    keyed by (method, filename) rather than the catalog row's own id and
+    would otherwise silently outlive the model they were rating: re-adding
+    the same file later would resurrect its old star ratings as if they'd
+    never been deleted — confirmed live as a real report."""
+    base = get_https_base()
+    if not base:
+        return
+    try:
+        requests.delete(f"{base}/model-ratings", params={"method": method, "filename": filename}, timeout=15)
+    except Exception:
+        pass
+
+
+def pull_apex_models() -> "list[dict] | None":
+    """None means "couldn't reach the Worker" (offline, not configured, or
+    genuinely down) — distinct from an empty list, which means the Worker
+    answered and no one has ever pushed a line-up yet. Callers use None to
+    mean "keep whatever's local," not "the shared line-up is empty."""
+    base = get_https_base()
+    if not base:
+        return None
+    try:
+        resp = requests.get(f"{base}/apex-models", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return None
+
+
 # --- Relay messaging (consent handshake + job control) ---
 
 def send_relay(target_id: str, payload: dict) -> bool:
@@ -231,14 +469,64 @@ def send_relay(target_id: str, payload: dict) -> bool:
             return False
 
 
-def call_peer(target_id: str, payload: dict, timeout: float = RELAY_CALL_DEFAULT_TIMEOUT) -> dict:
+# Only these three — never an arbitrary client-supplied path — are exposed
+# to a peer's "view logs" admin feature (see _handle_log_fetch_request).
+LOG_FILENAMES = ["app.log", "power_share.log", "electron.log"]
+LOG_TAIL_BYTES = 200_000
+
+
+def fetch_peer_log(peer_id: str, filename: str) -> str:
+    """Requester side of the admin log viewer — blocks for the peer's reply,
+    same call_peer round trip every other power-share feature uses."""
+    if filename not in LOG_FILENAMES:
+        raise ValueError(f"Невідомий файл журналу: {filename}")
+    result = call_peer(peer_id, {"kind": "log_fetch_request", "filename": filename}, timeout=20)
+    if result.get("error"):
+        raise ValueError(result["error"])
+    return result.get("content", "")
+
+
+def _handle_log_fetch_request(from_id: str, payload: dict):
+    """Runs on the machine WHOSE logs are being viewed — reads a bounded tail
+    (not the whole file — electron.log has no rotation cap, and even the
+    rotated Python logs can be a few MB across their backups) straight off
+    disk and relays it back. Read-only by construction: there is no matching
+    'write'/'edit' relay kind anywhere in this module."""
+    filename = payload.get("filename", "")
+    request_id = payload.get("request_id", "")
+    if filename not in LOG_FILENAMES:
+        send_relay(from_id, {"kind": "log_fetch_response", "request_id": request_id, "error": "Невідомий файл журналу"})
+        return
+    path = os.path.join(pss.LOG_DIR, filename)
+    try:
+        if not os.path.isfile(path):
+            content = ""
+        else:
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                if size > LOG_TAIL_BYTES:
+                    f.seek(size - LOG_TAIL_BYTES)
+                content = f.read().decode("utf-8", errors="replace")
+        send_relay(from_id, {"kind": "log_fetch_response", "request_id": request_id, "content": content})
+    except Exception as exc:
+        send_relay(from_id, {"kind": "log_fetch_response", "request_id": request_id, "error": str(exc)})
+
+
+def call_peer(target_id: str, payload: dict, timeout: float = RELAY_CALL_DEFAULT_TIMEOUT, context: "dict | None" = None) -> dict:
     """Sends a relay message carrying its own request_id and blocks until the
     matching reply relay message arrives (or times out) — the requester
-    side of both the consent handshake and job dispatch."""
+    side of both the consent handshake and job dispatch.
+
+    `context` is stashed alongside the pending entry (NOT sent over the
+    wire) purely so an intermediate, non-resolving relay message for this
+    same request_id — a `job_progress` tick, see _handle_job_progress below
+    — can look up who/what this call was for (peer name, task, title) without
+    a second round trip. Progress ticks never pop/resolve this entry; only
+    job_done/job_error/consent_response do (see _resolve_call)."""
     request_id = payload.setdefault("request_id", str(uuid.uuid4()))
     event = threading.Event()
     with _pending_lock:
-        _pending_calls[request_id] = {"event": event, "result": None}
+        _pending_calls[request_id] = {"event": event, "result": None, "context": context or {}}
     if not send_relay(target_id, payload):
         with _pending_lock:
             _pending_calls.pop(request_id, None)
@@ -259,6 +547,38 @@ def _resolve_call(request_id: str, result: dict):
             entry["event"].set()
 
 
+def _handle_job_progress(payload: dict):
+    """Runs on the REQUESTER machine — a live percent tick relayed from the
+    peer actually doing the work (see power_share_service's _broadcast_lending
+    closures, which now relay every tick here in addition to updating the
+    peer's own 'lending' banner). Mirrors that banner on the requester's side
+    ('Вам допомагає X…') so the person who ASKED for power sees the same live
+    progress the person LENDING it does, not just a blind wait — pulls peer
+    name/task/title back out of the pending call's stashed context rather
+    than resending all of it on every tick."""
+    request_id = payload.get("request_id", "")
+    with _pending_lock:
+        entry = _pending_calls.get(request_id)
+        ctx = dict(entry["context"]) if entry and entry.get("context") else None
+    if not ctx or not _broadcast_fn or not _main_loop:
+        return
+    asyncio.run_coroutine_threadsafe(
+        _broadcast_fn({
+            "type": "power_share_borrowing",
+            "data": {
+                "active": True,
+                "task": ctx.get("task"),
+                "peer_name": ctx.get("peer_name"),
+                "title_name": ctx.get("title_name"),
+                "episode_number": ctx.get("episode_number"),
+                "percent": payload.get("percent"),
+                "message": payload.get("message"),
+            },
+        }),
+        _main_loop,
+    )
+
+
 def _handle_relay(from_id: str, payload: dict):
     kind = payload.get("kind")
 
@@ -270,8 +590,24 @@ def _handle_relay(from_id: str, payload: dict):
         _resolve_call(payload.get("request_id", ""), payload)
         return
 
+    if kind == "job_progress":
+        _handle_job_progress(payload)
+        return
+
     if kind == "job_request":
         threading.Thread(target=_handle_job_request, args=(from_id, payload), daemon=True).start()
+        return
+
+    if kind == "log_fetch_request":
+        threading.Thread(target=_handle_log_fetch_request, args=(from_id, payload), daemon=True).start()
+        return
+
+    if kind == "log_fetch_response":
+        _resolve_call(payload.get("request_id", ""), payload)
+        return
+
+    if kind == "force_update_request":
+        broadcast_local({"type": "force_update_request", "data": {"from_name": payload.get("from_name", "Адмін")}})
         return
 
 
@@ -316,11 +652,17 @@ def _handle_job_request(from_id: str, payload: dict):
 
         work_dir = None
         if task == "separate":
+            pss.ensure_model_for_peer_job(
+                payload.get("model", "MDX-Net"), payload.get("model_file"),
+                requester_name, title_name, episode_number,
+                broadcast_fn=_broadcast_fn, loop=_main_loop,
+            )
             result_path, meta, work_dir = pss.run_separation_job_for_peer(
                 input_path, payload.get("model", "MDX-Net"), bool(payload.get("ensemble")),
                 requester_name, title_name, episode_number,
                 model_file=payload.get("model_file"), params=payload.get("params"),
                 broadcast_fn=_broadcast_fn, loop=_main_loop,
+                relay_to=from_id, relay_request_id=request_id,
             )
         elif task == "render":
             # Final render needs a SECOND input (the instrumental, sent as
@@ -334,11 +676,13 @@ def _handle_job_request(from_id: str, payload: dict):
             result_path, meta, work_dir = pss.run_render_job_for_peer(
                 input_path, audio_path, requester_name, title_name, episode_number,
                 broadcast_fn=_broadcast_fn, loop=_main_loop,
+                relay_to=from_id, relay_request_id=request_id,
             )
         else:
             result_path, meta, work_dir = pss.run_import_job_for_peer(
                 input_path, requester_name, title_name, episode_number,
                 broadcast_fn=_broadcast_fn, loop=_main_loop,
+                relay_to=from_id, relay_request_id=request_id,
             )
 
         # Some tasks carry back a SECOND file alongside the primary result —

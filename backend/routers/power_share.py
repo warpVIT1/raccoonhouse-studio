@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from .. import job_manager
 from ..database import get_db
-from ..models import AppSettings, Episode, Title
+from ..models import AppSettings, Episode, Title, Profile
 from ..schemas import PowerShareRespondIn
 from ..services import power_share_service as pss
 from ..services import discovery_service
@@ -52,6 +52,46 @@ def consent_respond(body: PowerShareRespondIn):
     if not ok:
         raise HTTPException(404, "Запит вже завершено або не знайдено")
     return {"ok": True}
+
+
+@router.post("/power-share/respond-model-download")
+def model_download_respond(body: PowerShareRespondIn):
+    ok = pss.respond_to_model_download_request(body.request_id, body.approved)
+    if not ok:
+        raise HTTPException(404, "Запит вже завершено або не знайдено")
+    return {"ok": True}
+
+
+@router.post("/power-share/broadcast-force-update")
+def broadcast_force_update(db: Session = Depends(get_db)):
+    # Admin-only nudge, not an actual forced download/install (an admin
+    # forcibly restarting someone else's app mid-render would destroy active
+    # work) — just a dismissible "go check for an update" notice pushed to
+    # every currently-online peer over the relay.
+    settings = db.get(AppSettings, 1)
+    profile = db.get(Profile, settings.active_profile_id) if settings and settings.active_profile_id else None
+    if not profile or not profile.is_admin:
+        raise HTTPException(403, "Лише адмін може надсилати це всім")
+    sent = discovery_service.broadcast_force_update_request(profile.name)
+    return {"sent": sent}
+
+
+@router.get("/power-share/peers/{peer_id}/log")
+def get_peer_log(peer_id: str, filename: str, db: Session = Depends(get_db)):
+    # Admin-only — read-only view of a PEER's own log files (view/download/
+    # copy in the UI), never this machine's, never editable: there is no
+    # corresponding PUT/POST anywhere in this router or the relay protocol.
+    settings = db.get(AppSettings, 1)
+    profile = db.get(Profile, settings.active_profile_id) if settings and settings.active_profile_id else None
+    if not profile or not profile.is_admin:
+        raise HTTPException(403, "Лише адмін може переглядати журнали інших ПК")
+    try:
+        content = discovery_service.fetch_peer_log(peer_id, filename)
+    except TimeoutError:
+        raise HTTPException(504, "ПК не відповів вчасно")
+    except ValueError as e:
+        raise HTTPException(502, str(e))
+    return {"content": content}
 
 
 @router.post("/episodes/{ep_id}/request-remote-separation")

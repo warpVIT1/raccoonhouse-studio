@@ -267,140 +267,148 @@ def run_distributed_separation(
                 model_file=model_file, params=params,
             )
 
-        # --- Chunk boundaries: N roughly-equal spans, but each INTERNAL cut
-        # point is nudged to the quietest nearby instant (see
-        # _find_quiet_point) rather than sitting at a raw fixed timestamp —
-        # otherwise a cut could land in the middle of a spoken word/line.
-        # Each edge is then extended by half the overlap into its neighbor's
-        # territory for the crossfade. ---
-        base_len = total_duration / num_chunks
-        if reporter:
-            reporter.update(15, "Шукаю паузи між репліками для розрізів…")
-
-        lines = (
-            db.query(SubtitleLine)
-            .filter(SubtitleLine.episode_id == episode_id)
-            .order_by(SubtitleLine.start_ms)
-            .all()
-        )
-        subtitle_gaps = [
-            (a.end_ms + b.start_ms) / 2 / 1000
-            for a, b in zip(lines, lines[1:])
-            if b.start_ms > a.end_ms
-        ]
-
-        cut_points = [0.0]
-        for i in range(1, num_chunks):
-            nominal = i * base_len
-            cut_points.append(_find_cut_point(subtitle_gaps, audio_path, nominal, CUT_SEARCH_RADIUS_SECONDS, total_duration))
-        cut_points.append(total_duration)
-
-        bounds: list[tuple[float, float]] = []
-        for i in range(num_chunks):
-            start = max(0.0, cut_points[i] - OVERLAP_SECONDS / 2) if i > 0 else 0.0
-            end = min(total_duration, cut_points[i + 1] + OVERLAP_SECONDS / 2) if i < num_chunks - 1 else total_duration
-            bounds.append((start, end))
-
-        work_dir = Path(tempfile.mkdtemp(prefix="rh_distributed_"))
-        ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
-        output_dir = ep_dir / "stems"
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        results: dict[int, str] = {}   # chunk_index -> instrumental wav path
-        vocal_only_results: dict[int, Optional[str]] = {}  # chunk_index -> pure-vocal wav path
-        errors: dict[int, str] = {}
-        peer_assignments = list(zip(accepted_peers, bounds[1:]))  # chunk 0 stays local
-
-        def process_local_chunk():
-            start, end = bounds[0]
-            chunk_audio = str(work_dir / "chunk_0.wav")
-            _cut_audio_chunk(audio_path, start, end, chunk_audio)
+        with separator_service._report_separation_run(episode_id, model, ensemble, distributed=True) as report_ctx:
+            # --- Chunk boundaries: N roughly-equal spans, but each INTERNAL
+            # cut point is nudged to the quietest nearby instant (see
+            # _find_quiet_point) rather than sitting at a raw fixed
+            # timestamp — otherwise a cut could land in the middle of a
+            # spoken word/line. Each edge is then extended by half the
+            # overlap into its neighbor's territory for the crossfade. ---
+            base_len = total_duration / num_chunks
             if reporter:
-                reporter.update(25, "Обробляю свій кусок локально…")
-            stems = separator_service.separate_file(chunk_audio, str(work_dir / "out_0"), model, ensemble, model_file=model_file, params=params)
-            results[0] = stems["vocal_stem_path"]
-            vocal_only_results[0] = stems.get("vocal_only_stem_path")
+                reporter.update(15, "Шукаю паузи між репліками для розрізів…")
 
-        def process_peer_chunk(idx: int, peer: dict, start: float, end: float):
-            try:
-                chunk_audio = str(work_dir / f"chunk_{idx}.wav")
+            lines = (
+                db.query(SubtitleLine)
+                .filter(SubtitleLine.episode_id == episode_id)
+                .order_by(SubtitleLine.start_ms)
+                .all()
+            )
+            subtitle_gaps = [
+                (a.end_ms + b.start_ms) / 2 / 1000
+                for a, b in zip(lines, lines[1:])
+                if b.start_ms > a.end_ms
+            ]
+
+            cut_points = [0.0]
+            for i in range(1, num_chunks):
+                nominal = i * base_len
+                cut_points.append(_find_cut_point(subtitle_gaps, audio_path, nominal, CUT_SEARCH_RADIUS_SECONDS, total_duration))
+            cut_points.append(total_duration)
+
+            bounds: list[tuple[float, float]] = []
+            for i in range(num_chunks):
+                start = max(0.0, cut_points[i] - OVERLAP_SECONDS / 2) if i > 0 else 0.0
+                end = min(total_duration, cut_points[i + 1] + OVERLAP_SECONDS / 2) if i < num_chunks - 1 else total_duration
+                bounds.append((start, end))
+
+            work_dir = Path(tempfile.mkdtemp(prefix="rh_distributed_"))
+            ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
+            output_dir = ep_dir / "stems"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            results: dict[int, str] = {}   # chunk_index -> instrumental wav path
+            vocal_only_results: dict[int, Optional[str]] = {}  # chunk_index -> pure-vocal wav path
+            errors: dict[int, str] = {}
+            peer_assignments = list(zip(accepted_peers, bounds[1:]))  # chunk 0 stays local
+
+            def process_local_chunk():
+                start, end = bounds[0]
+                chunk_audio = str(work_dir / "chunk_0.wav")
                 _cut_audio_chunk(audio_path, start, end, chunk_audio)
-                file_size = os.path.getsize(chunk_audio)
-                transfer_id = str(uuid.uuid4())
-                with open(chunk_audio, "rb") as fh:
-                    discovery_service.upload_transfer(transfer_id, fh, file_size)
                 if reporter:
-                    reporter.update(30, f"{peer['name']} обробляє свій кусок…")
-                power_logger.info("DISTRIBUTED-DISPATCH chunk=%s peer=%s title=%s", idx, peer["id"], title_name)
-                result = discovery_service.call_peer(peer["id"], {
-                    "kind": "job_request", "task": "separate",
-                    "transfer_id": transfer_id, "filename": os.path.basename(chunk_audio),
-                    "model": model, "ensemble": bool(ensemble), "model_file": model_file, "params": params,
-                    "requester_name": requester_name, "title_name": title_name, "episode_number": ep_number,
-                }, timeout=3600)
-                if result.get("kind") == "job_error" or not result.get("result_transfer_id"):
-                    raise ValueError(result.get("reason", "невідома помилка"))
-                chunk_out = str(work_dir / f"peer_out_{idx}.wav")
-                discovery_service.download_transfer(result["result_transfer_id"], chunk_out)
-                discovery_service.delete_transfer(result["result_transfer_id"])
-                results[idx] = chunk_out
+                    reporter.update(25, "Обробляю свій кусок локально…")
+                stems = separator_service.separate_file(chunk_audio, str(work_dir / "out_0"), model, ensemble, model_file=model_file, params=params)
+                results[0] = stems["vocal_stem_path"]
+                vocal_only_results[0] = stems.get("vocal_only_stem_path")
 
-                vocal_only_transfer_id = result.get("vocal_only_transfer_id")
-                if vocal_only_transfer_id:
-                    chunk_vocal_only = str(work_dir / f"peer_vocal_only_{idx}.wav")
-                    discovery_service.download_transfer(vocal_only_transfer_id, chunk_vocal_only)
-                    discovery_service.delete_transfer(vocal_only_transfer_id)
-                    vocal_only_results[idx] = chunk_vocal_only
+            def process_peer_chunk(idx: int, peer: dict, start: float, end: float):
+                try:
+                    chunk_audio = str(work_dir / f"chunk_{idx}.wav")
+                    _cut_audio_chunk(audio_path, start, end, chunk_audio)
+                    file_size = os.path.getsize(chunk_audio)
+                    transfer_id = str(uuid.uuid4())
+                    with open(chunk_audio, "rb") as fh:
+                        discovery_service.upload_transfer(transfer_id, fh, file_size)
+                    if reporter:
+                        reporter.update(30, f"{peer['name']} обробляє свій кусок…")
+                    power_logger.info("DISTRIBUTED-DISPATCH chunk=%s peer=%s title=%s", idx, peer["id"], title_name)
+                    result = discovery_service.call_peer(peer["id"], {
+                        "kind": "job_request", "task": "separate",
+                        "transfer_id": transfer_id, "filename": os.path.basename(chunk_audio),
+                        "model": model, "ensemble": bool(ensemble), "model_file": model_file, "params": params,
+                        "requester_name": requester_name, "title_name": title_name, "episode_number": ep_number,
+                    }, timeout=3600)
+                    if result.get("kind") == "job_error" or not result.get("result_transfer_id"):
+                        raise ValueError(result.get("reason", "невідома помилка"))
+                    chunk_out = str(work_dir / f"peer_out_{idx}.wav")
+                    discovery_service.download_transfer(result["result_transfer_id"], chunk_out)
+                    discovery_service.delete_transfer(result["result_transfer_id"])
+                    results[idx] = chunk_out
 
-                power_logger.info("DISTRIBUTED-DONE chunk=%s peer=%s", idx, peer["id"])
-            except Exception as exc:
-                power_logger.exception("DISTRIBUTED chunk=%s peer=%s failed, will redo locally", idx, peer["id"])
-                errors[idx] = str(exc)
+                    vocal_only_transfer_id = result.get("vocal_only_transfer_id")
+                    if vocal_only_transfer_id:
+                        chunk_vocal_only = str(work_dir / f"peer_vocal_only_{idx}.wav")
+                        discovery_service.download_transfer(vocal_only_transfer_id, chunk_vocal_only)
+                        discovery_service.delete_transfer(vocal_only_transfer_id)
+                        vocal_only_results[idx] = chunk_vocal_only
 
-        with ThreadPoolExecutor(max_workers=num_chunks) as pool:
-            futures = [pool.submit(process_local_chunk)]
+                    power_logger.info("DISTRIBUTED-DONE chunk=%s peer=%s", idx, peer["id"])
+                except Exception as exc:
+                    power_logger.exception("DISTRIBUTED chunk=%s peer=%s failed, will redo locally", idx, peer["id"])
+                    errors[idx] = str(exc)
+
+            with ThreadPoolExecutor(max_workers=num_chunks) as pool:
+                futures = [pool.submit(process_local_chunk)]
+                for idx, (peer, (start, end)) in enumerate(peer_assignments, start=1):
+                    futures.append(pool.submit(process_peer_chunk, idx, peer, start, end))
+                for fut in as_completed(futures):
+                    fut.result()  # re-raises if process_local_chunk itself blew up
+
+            # --- Any peer chunk that failed gets redone locally, sequentially,
+            # rather than reassigned to another peer — simpler and still correct,
+            # just means this machine ends up doing more than its 1/N share. ---
             for idx, (peer, (start, end)) in enumerate(peer_assignments, start=1):
-                futures.append(pool.submit(process_peer_chunk, idx, peer, start, end))
-            for fut in as_completed(futures):
-                fut.result()  # re-raises if process_local_chunk itself blew up
+                if idx in errors:
+                    if reporter:
+                        reporter.update(70, f"{peer['name']} не впорався — переробляю кусок {idx} локально…")
+                    chunk_audio = str(work_dir / f"chunk_{idx}.wav")
+                    _cut_audio_chunk(audio_path, start, end, chunk_audio)
+                    stems = separator_service.separate_file(chunk_audio, str(work_dir / f"out_{idx}"), model, ensemble, model_file=model_file, params=params)
+                    results[idx] = stems["vocal_stem_path"]
+                    vocal_only_results[idx] = stems.get("vocal_only_stem_path")
 
-        # --- Any peer chunk that failed gets redone locally, sequentially,
-        # rather than reassigned to another peer — simpler and still correct,
-        # just means this machine ends up doing more than its 1/N share. ---
-        for idx, (peer, (start, end)) in enumerate(peer_assignments, start=1):
-            if idx in errors:
-                if reporter:
-                    reporter.update(70, f"{peer['name']} не впорався — переробляю кусок {idx} локально…")
-                chunk_audio = str(work_dir / f"chunk_{idx}.wav")
-                _cut_audio_chunk(audio_path, start, end, chunk_audio)
-                stems = separator_service.separate_file(chunk_audio, str(work_dir / f"out_{idx}"), model, ensemble, model_file=model_file, params=params)
-                results[idx] = stems["vocal_stem_path"]
-                vocal_only_results[idx] = stems.get("vocal_only_stem_path")
+            # Only peers that actually delivered a usable chunk count as
+            # having helped — one that failed and got silently redone
+            # locally didn't really contribute, even though it was asked.
+            report_ctx["peers_used"] = [
+                peer["name"] for idx, (peer, _bounds) in enumerate(peer_assignments, start=1) if idx not in errors
+            ]
 
-        if reporter:
-            reporter.update(85, "Склеюю результат…")
+            if reporter:
+                reporter.update(85, "Склеюю результат…")
 
-        ordered = [results[i] for i in range(num_chunks)]
-        final_instrumental = str(output_dir / "vocal_isolated.wav")
-        _crossfade_stitch(ordered, bounds, total_duration, OVERLAP_SECONDS, final_instrumental)
+            ordered = [results[i] for i in range(num_chunks)]
+            final_instrumental = str(output_dir / "vocal_isolated.wav")
+            _crossfade_stitch(ordered, bounds, total_duration, OVERLAP_SECONDS, final_instrumental)
 
-        final_vocal_only = None
-        if all(vocal_only_results.get(i) for i in range(num_chunks)):
-            ordered_vocal_only = [vocal_only_results[i] for i in range(num_chunks)]
-            final_vocal_only = str(output_dir / "vocal_only.wav")
-            _crossfade_stitch(ordered_vocal_only, bounds, total_duration, OVERLAP_SECONDS, final_vocal_only)
+            final_vocal_only = None
+            if all(vocal_only_results.get(i) for i in range(num_chunks)):
+                ordered_vocal_only = [vocal_only_results[i] for i in range(num_chunks)]
+                final_vocal_only = str(output_dir / "vocal_only.wav")
+                _crossfade_stitch(ordered_vocal_only, bounds, total_duration, OVERLAP_SECONDS, final_vocal_only)
 
-        ep.vocal_stem_path = final_instrumental
-        ep.vocal_only_stem_path = final_vocal_only
-        ep.status = "vocal_isolated"
-        bump_title_in_progress(db, ep.title_id)
-        db.commit()
+            ep.vocal_stem_path = final_instrumental
+            ep.vocal_only_stem_path = final_vocal_only
+            ep.status = "vocal_isolated"
+            bump_title_in_progress(db, ep.title_id)
+            db.commit()
 
-        shutil.rmtree(work_dir, ignore_errors=True)
+            shutil.rmtree(work_dir, ignore_errors=True)
 
-        if reporter:
-            reporter.update(100, f"Готово — оброблено на {num_chunks} машинах")
-        power_logger.info("DISTRIBUTED-COMPLETE episode=%s chunks=%s vocal_only=%s", episode_id, num_chunks, bool(final_vocal_only))
-        return {"vocal_stem_path": final_instrumental, "vocal_only_stem_path": final_vocal_only, "chunks": num_chunks}
+            if reporter:
+                reporter.update(100, f"Готово — оброблено на {num_chunks} машинах")
+            power_logger.info("DISTRIBUTED-COMPLETE episode=%s chunks=%s vocal_only=%s", episode_id, num_chunks, bool(final_vocal_only))
+            return {"vocal_stem_path": final_instrumental, "vocal_only_stem_path": final_vocal_only, "chunks": num_chunks}
     finally:
         db.close()

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, shell, Menu } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, shell, Menu, Tray, nativeImage } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
@@ -87,6 +87,67 @@ process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL
 const BACKEND_PORT = 8765
 let backendProcess: ChildProcess | null = null
 let win: BrowserWindow | null = null
+
+// --- Background mode (tray) ---
+//
+// Purely a native window-management preference, not application data — kept
+// as its own small local JSON file rather than a column in the Python
+// backend's AppSettings (which drives actual app behavior: models, GPU,
+// power share), so it's readable/writable from the main process alone with
+// no dependency on the backend being up at all, and doesn't need to survive
+// across different studio PCs the way AppSettings does.
+let tray: Tray | null = null
+let backgroundModeEnabled = false
+// Distinguishes a real quit (tray "Вийти", autoUpdater install, OS shutdown)
+// from the user clicking the window's own close (X) button — only the
+// latter should be turned into a hide-to-tray when background mode is on.
+let isQuittingForReal = false
+
+const WINDOW_PREFS_FILE = path.join(app.getPath('userData'), 'window-prefs.json')
+
+function loadWindowPrefs(): { backgroundMode: boolean } {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(WINDOW_PREFS_FILE, 'utf-8'))
+    return { backgroundMode: !!parsed.backgroundMode }
+  } catch {
+    return { backgroundMode: false }
+  }
+}
+
+function saveWindowPrefs(prefs: { backgroundMode: boolean }) {
+  try {
+    fs.writeFileSync(WINDOW_PREFS_FILE, JSON.stringify(prefs))
+  } catch (err) {
+    logLine('ERROR', 'main', 'Failed to save window prefs:', err)
+  }
+}
+
+function showMainWindow() {
+  if (!win || win.isDestroyed()) {
+    createWindow()
+    return
+  }
+  win.show()
+  win.focus()
+}
+
+function createTray() {
+  if (tray) return
+  const icon = nativeImage.createFromPath(path.join(process.env.VITE_PUBLIC!, 'icon.png'))
+  tray = new Tray(icon.resize({ width: 16, height: 16 }))
+  tray.setToolTip('RaccoonHouse Studio')
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Відкрити RaccoonHouse Studio', click: () => showMainWindow() },
+    { type: 'separator' },
+    { label: 'Вийти', click: () => { isQuittingForReal = true; app.quit() } },
+  ]))
+  tray.on('double-click', () => showMainWindow())
+}
+
+function destroyTray() {
+  tray?.destroy()
+  tray = null
+}
 
 // If a previous run's backend was ever orphaned (e.g. the Electron parent
 // was killed via Task Manager, or crashed hard enough to skip both
@@ -395,6 +456,13 @@ function createWindow() {
     icon: path.join(process.env.VITE_PUBLIC!, 'icon.png'),
   })
 
+  win.on('close', (e) => {
+    if (backgroundModeEnabled && !isQuittingForReal) {
+      e.preventDefault()
+      win?.hide()
+    }
+  })
+
   win.webContents.on('did-finish-load', () => {
     win?.webContents.send('main-process-message', new Date().toISOString())
   })
@@ -552,7 +620,20 @@ ipcMain.handle('update:install', () => {
   // (isSilent, isForceRunAfter) — isSilent=true skips the NSIS installer's
   // own wizard UI entirely (runs with the standard silent-install flag), so
   // clicking this just closes the app, installs invisibly, and reopens it.
+  // Must count as a real quit even with background mode on — otherwise the
+  // window's own close interception would just hide it instead of letting
+  // the update actually install.
+  isQuittingForReal = true
   autoUpdater.quitAndInstall(true, true)
+})
+
+// Background mode (tray) — see the state/helpers declared above createWindow().
+ipcMain.handle('get:backgroundMode', () => backgroundModeEnabled)
+ipcMain.handle('set:backgroundMode', (_event, enabled: boolean) => {
+  backgroundModeEnabled = !!enabled
+  saveWindowPrefs({ backgroundMode: backgroundModeEnabled })
+  if (backgroundModeEnabled) createTray()
+  else destroyTray()
 })
 
 // IPC Handlers
@@ -628,4 +709,7 @@ app.whenReady().then(() => {
   startBackend().catch((err) => logLine('ERROR', 'main', 'startBackend() crashed:', err))
   createWindow()
   initAutoUpdater()
+
+  backgroundModeEnabled = loadWindowPrefs().backgroundMode
+  if (backgroundModeEnabled) createTray()
 })

@@ -10,6 +10,8 @@ import os
 import subprocess
 import json
 import shutil
+import threading
+import time
 from typing import Optional
 from pathlib import Path
 from sqlalchemy.orm import Session
@@ -20,6 +22,30 @@ from ..job_manager import ProgressReporter
 from .power_share_service import app_logger
 
 DATA_DIR = os.environ.get("RH_DATA_DIR", os.path.join(os.path.expanduser("~"), ".raccoonhouse"))
+
+
+def _spawn_cancel_watcher(proc: "subprocess.Popen", is_cancelled) -> "threading.Event | None":
+    """Kills `proc` the moment is_cancelled() flips true, polling on its own
+    timer rather than relying on the stderr-reading loop to notice — that
+    loop only checks between lines, so a subprocess that goes quiet for a
+    stretch (no fresh 'time=' output, e.g. near the very end of a fast
+    '-c:v copy' remux) kept running to completion after Cancel was clicked:
+    the job was marked cancelled, but the ffmpeg process itself was not
+    (confirmed live: progress froze at the percent shown when Cancel was
+    hit, yet the render finished on disk anyway)."""
+    if not is_cancelled:
+        return None
+    stop = threading.Event()
+
+    def _watch():
+        while not stop.is_set():
+            if is_cancelled():
+                proc.kill()
+                return
+            stop.wait(0.3)
+
+    threading.Thread(target=_watch, daemon=True).start()
+    return stop
 
 
 def _ffmpeg_bin() -> str:
@@ -115,22 +141,29 @@ def run_import_ffmpeg_only(
             cmd_audio, stderr=subprocess.PIPE, text=True,
             encoding="utf-8", errors="replace",
         )
-        stderr_tail: list[str] = []
-        for line in proc.stderr:
-            stderr_tail.append(line)
-            if len(stderr_tail) > 200:
-                stderr_tail.pop(0)
-            if is_cancelled and is_cancelled():
-                proc.kill()
-                raise RuntimeError("Скасовано")
-            if "time=" in line and duration:
-                try:
-                    t = _parse_time(line)
-                    pct = min(95, int(10 + 85 * t / duration))
-                    progress(pct, "ffmpeg: витягую лосслес-аудіо (FLAC)…")
-                except Exception:
-                    pass
-        proc.wait()
+        watcher = _spawn_cancel_watcher(proc, is_cancelled)
+        try:
+            stderr_tail: list[str] = []
+            for line in proc.stderr:
+                stderr_tail.append(line)
+                if len(stderr_tail) > 200:
+                    stderr_tail.pop(0)
+                if is_cancelled and is_cancelled():
+                    proc.kill()
+                    raise RuntimeError("Скасовано")
+                if "time=" in line and duration:
+                    try:
+                        t = _parse_time(line)
+                        pct = min(95, int(10 + 85 * t / duration))
+                        progress(pct, "ffmpeg: витягую лосслес-аудіо (FLAC)…")
+                    except Exception:
+                        pass
+            proc.wait()
+        finally:
+            if watcher:
+                watcher.set()
+        if is_cancelled and is_cancelled():
+            raise RuntimeError("Скасовано")
         if proc.returncode != 0:
             app_logger.error(
                 "run_import_ffmpeg_only: ffmpeg exited with code %s, last output:\n%s",
@@ -255,22 +288,29 @@ def run_mux_ffmpeg_only(
         cmd, stderr=subprocess.PIPE, text=True,
         encoding="utf-8", errors="replace",
     )
-    stderr_tail: list[str] = []
-    for line in proc.stderr:
-        stderr_tail.append(line)
-        if len(stderr_tail) > 200:
-            stderr_tail.pop(0)
-        if is_cancelled and is_cancelled():
-            proc.kill()
-            raise RuntimeError("Скасовано")
-        if "time=" in line and duration:
-            try:
-                t = _parse_time(line)
-                pct = min(90, int(15 + 75 * t / duration))
-                progress(pct, "ffmpeg: мультиплексую фінальне відео…")
-            except Exception:
-                pass
-    proc.wait()
+    watcher = _spawn_cancel_watcher(proc, is_cancelled)
+    try:
+        stderr_tail: list[str] = []
+        for line in proc.stderr:
+            stderr_tail.append(line)
+            if len(stderr_tail) > 200:
+                stderr_tail.pop(0)
+            if is_cancelled and is_cancelled():
+                proc.kill()
+                raise RuntimeError("Скасовано")
+            if "time=" in line and duration:
+                try:
+                    t = _parse_time(line)
+                    pct = min(90, int(15 + 75 * t / duration))
+                    progress(pct, "ffmpeg: мультиплексую фінальне відео…")
+                except Exception:
+                    pass
+        proc.wait()
+    finally:
+        if watcher:
+            watcher.set()
+    if is_cancelled and is_cancelled():
+        raise RuntimeError("Скасовано")
     if proc.returncode != 0:
         app_logger.error(
             "run_mux_ffmpeg_only: ffmpeg exited with code %s, last output:\n%s",

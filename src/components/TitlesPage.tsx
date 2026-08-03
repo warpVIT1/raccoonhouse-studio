@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react'
 import { useApi } from '../hooks/useApi'
 import { useAppStore } from '../stores/appStore'
+import { useBackdropClose } from '../hooks/useBackdropClose'
 import { TitleBadge } from './ui/Badge'
 import { Spinner } from './ui/Spinner'
 import { PosterSearch } from './PosterSearch'
@@ -256,6 +257,7 @@ interface AddTitleModalProps {
   onAdded: (title: Title) => void
 }
 function AddTitleModal({ onClose, onAdded }: AddTitleModalProps) {
+  const backdrop = useBackdropClose(onClose)
   const { post } = useApi()
   const backendReady = useAppStore((s) => s.backendReady)
   const [nameUa, setNameUa] = useState('')
@@ -304,7 +306,7 @@ function AddTitleModal({ onClose, onAdded }: AddTitleModalProps) {
   }
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={onClose}>
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" {...backdrop}>
       <div
         className="rh-card w-[440px] max-h-[85vh] overflow-y-auto p-6 flex flex-col gap-4 shadow-2xl"
         onClick={(e) => e.stopPropagation()}

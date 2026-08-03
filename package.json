@@ -1,6 +1,6 @@
 {
   "name": "raccoonhouse-studio",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "RaccoonHouse Anime Dubbing Studio",
   "main": "dist-electron/main.js",
   "scripts": {

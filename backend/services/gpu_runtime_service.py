@@ -22,6 +22,7 @@ does anything right after an update replaced the install directory.
 import os
 import shutil
 import subprocess
+import threading
 import zipfile
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -90,36 +91,56 @@ def _onnxruntime_capi_dir() -> Path:
     return Path(onnxruntime.__file__).parent / "capi"
 
 
+_placement_lock = threading.Lock()
+
+
 def ensure_gpu_provider_placed() -> None:
     """Re-links the cached runtime files into onnxruntime's own capi/
     directory if they're not already there — cheap no-op after the first
     call following any given install/update. Safe to call unconditionally;
-    does nothing if the runtime was never downloaded."""
+    does nothing if the runtime was never downloaded.
+
+    Serialized via a lock — this runs once per Separator() instantiation,
+    and separation jobs run on a thread pool (job_manager._executor), so two
+    jobs starting close together (e.g. a model-download validation load
+    right before the real separation job) can both reach the dst.exists()
+    check before either has created dst, then both attempt os.link()
+    concurrently. Confirmed live: the loser raised FileExistsError from
+    os.link(), and shutil.copy2()'s own fallback then hit the same file
+    mid-write from the winner's link and raised again — swallowing both
+    with the lock removed is safer than trying to make the fallback path
+    itself perfectly race-proof against a concurrent linker."""
     if not is_gpu_runtime_installed():
         return
-    capi_dir = _onnxruntime_capi_dir()
-    capi_dir.mkdir(parents=True, exist_ok=True)
-    for src in GPU_RUNTIME_DIR.iterdir():
-        if src.name.startswith("."):
-            continue
-        # GPU_RUNTIME_DIR also holds the torch-cuda/ subdirectory (see
-        # TORCH_CUDA_DIR below) once torch's CUDA build has been installed —
-        # this loop only wants the flat onnxruntime CUDA provider DLLs sitting
-        # directly in GPU_RUNTIME_DIR, so a directory here must be skipped.
-        # Without this check, os.link()/shutil.copy2() below would try to
-        # hardlink/copy torch-cuda/ itself as if it were a file and crash with
-        # PermissionError — confirmed live: this made EVERY separation attempt
-        # fail immediately once a user had both GPU runtimes installed,
-        # regardless of which model was selected.
-        if src.is_dir():
-            continue
-        dst = capi_dir / src.name
-        if dst.exists():
-            continue
-        try:
-            os.link(src, dst)
-        except OSError:
-            shutil.copy2(src, dst)
+    with _placement_lock:
+        capi_dir = _onnxruntime_capi_dir()
+        capi_dir.mkdir(parents=True, exist_ok=True)
+        for src in GPU_RUNTIME_DIR.iterdir():
+            if src.name.startswith("."):
+                continue
+            # GPU_RUNTIME_DIR also holds the torch-cuda/ subdirectory (see
+            # TORCH_CUDA_DIR below) once torch's CUDA build has been installed —
+            # this loop only wants the flat onnxruntime CUDA provider DLLs sitting
+            # directly in GPU_RUNTIME_DIR, so a directory here must be skipped.
+            # Without this check, os.link()/shutil.copy2() below would try to
+            # hardlink/copy torch-cuda/ itself as if it were a file and crash with
+            # PermissionError — confirmed live: this made EVERY separation attempt
+            # fail immediately once a user had both GPU runtimes installed,
+            # regardless of which model was selected.
+            if src.is_dir():
+                continue
+            dst = capi_dir / src.name
+            if dst.exists():
+                continue
+            try:
+                os.link(src, dst)
+            except OSError:
+                if dst.exists():
+                    # Another process/an earlier partial attempt already put
+                    # a file here between our check and this fallback — the
+                    # goal (dst present) is already met, nothing left to do.
+                    continue
+                shutil.copy2(src, dst)
 
 
 def install_gpu_runtime(on_progress=None) -> None:

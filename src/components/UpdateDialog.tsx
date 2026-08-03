@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { Spinner } from './ui/Spinner'
+import { useBackdropClose } from '../hooks/useBackdropClose'
 
 interface UpdateState {
   status: string
@@ -18,6 +19,7 @@ export function UpdateDialog() {
   const [state, setState] = useState<UpdateState>({ status: 'idle' })
   const [dismissed, setDismissed] = useState(false)
   const [autoInstall, setAutoInstall] = useState(false)
+  const backdrop = useBackdropClose(() => setDismissed(true))
 
   useEffect(() => {
     if (!window.electronAPI?.onUpdateStatus) return
@@ -43,7 +45,7 @@ export function UpdateDialog() {
   }
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[200]" onClick={() => setDismissed(true)}>
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[200]" {...backdrop}>
       <div className="rh-card w-[440px] max-h-[70vh] overflow-y-auto p-6 flex flex-col gap-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div>
           <h2 className="text-base font-semibold">Доступне оновлення {state.version}</h2>

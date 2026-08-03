@@ -53,9 +53,9 @@ if gpu_runtime_service.is_gpu_enabled_setting() and gpu_runtime_service.is_torch
 
 from backend.database import init_db, SessionLocal
 from backend import job_manager
-from backend.routers import titles, episodes, characters, subtitles, markers, jobs, settings, hikka, profiles, power_share
+from backend.routers import titles, episodes, characters, subtitles, markers, jobs, settings, hikka, profiles, power_share, separation_models, feedback, reports, model_browser
 from backend.services.ffmpeg_service import get_waveform_samples
-from backend.services import discovery_service
+from backend.services import discovery_service, separator_service
 from backend.services.power_share_service import app_logger
 from backend.models import AppSettings, Profile
 from backend.schemas import WaveformResponse
@@ -115,6 +115,39 @@ async def lifespan(app: FastAPI):
     # very first Settings page load would block on nvidia-smi's own latency
     # instead of getting an instant answer (see that function's docstring).
     gpu_runtime_service.has_nvidia_gpu()
+    # Fire-and-forget (NOT awaited) in a worker thread — audio-separator's
+    # registry (backing the Model Browser's /models/browse) is lazily
+    # imported on first use for exactly the reason gpu_detection is (see
+    # separator_service.py's _ensure_separator_patches docstring: importing
+    # torch/audio-separator/scipy costs ~20s, and doing that at module-import
+    # time used to block the whole app's startup). But that means the FIRST
+    # person to open the Model Browser after launch eats that 20s as a
+    # seemingly-frozen page. Since it's read-only and idempotent, kicking it
+    # off here lets it finish in the background while the user is still
+    # looking at Titles/switching screens, so by the time they actually open
+    # the Browser it's usually already warm — without reintroducing the
+    # original blocking-startup problem this was split out to avoid.
+    asyncio.get_event_loop().run_in_executor(None, separator_service.registry_entries_for_method, "MDX-Net")
+
+    async def _batch_library_cleanup_loop():
+        # Runs once shortly after launch and then every few hours for the
+        # rest of the app's lifetime — deletes per-episode batch-separation
+        # "listen and pick" libraries (every curated model's own FLAC output)
+        # once they're a few days old, so trying out all the models doesn't
+        # quietly accumulate multi-GB folders per episode forever. See
+        # separator_service.cleanup_stale_batch_libraries's docstring.
+        while True:
+            try:
+                removed = await asyncio.get_event_loop().run_in_executor(
+                    None, separator_service.cleanup_stale_batch_libraries
+                )
+                if removed:
+                    app_logger.info("batch-library-cleanup: removed %s stale episode librar%s", removed, "y" if removed == 1 else "ies")
+            except Exception:
+                app_logger.exception("batch-library-cleanup: failed")
+            await asyncio.sleep(6 * 3600)
+
+    asyncio.create_task(_batch_library_cleanup_loop())
     yield
 
 
@@ -176,6 +209,10 @@ app.include_router(settings.router, prefix="/api")
 app.include_router(hikka.router, prefix="/api")
 app.include_router(profiles.router, prefix="/api")
 app.include_router(power_share.router, prefix="/api")
+app.include_router(separation_models.router, prefix="/api")
+app.include_router(feedback.router, prefix="/api")
+app.include_router(reports.router, prefix="/api")
+app.include_router(model_browser.router, prefix="/api")
 
 
 @app.websocket("/ws")

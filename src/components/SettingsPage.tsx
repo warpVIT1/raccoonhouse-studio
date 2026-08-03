@@ -2,7 +2,10 @@ import React, { useEffect, useState } from 'react'
 import { useApi } from '../hooks/useApi'
 import { useAppStore } from '../stores/appStore'
 import { PowerSharePanel } from './PowerSharePanel'
+import { FeedbackPanel } from './FeedbackPanel'
+import { ReportsPanel } from './ReportsPanel'
 import { UpdatePanel } from './UpdatePanel'
+import { Toggle } from './ui/Toggle'
 import type { AppSettings } from '../types'
 
 const EMPTY_SETTINGS: AppSettings = {
@@ -18,6 +21,7 @@ const EMPTY_SETTINGS: AppSettings = {
   power_share_auto_approve: false,
   online_signaling_enabled: true,
   online_signaling_url: 'wss://raccoonhouse-signaling.raccoonhause.workers.dev/',
+  show_feedback_inbox: false,
   gpu_enabled: false,
   gpu_available: false,
   gpu_runtime_installed: false,
@@ -30,6 +34,12 @@ export function SettingsPage() {
   const [editingModel, setEditingModel] = useState(false)
   const [editingReaper, setEditingReaper] = useState(false)
   const [gpuError, setGpuError] = useState<string | null>(null)
+  // Local Electron window preference (tray hide-on-close), not part of the
+  // backend's AppSettings — read/written straight through electronAPI, not
+  // the /settings PUT flow (see electron/main.ts). Absent entirely in a
+  // plain browser/dev context with no electronAPI.
+  const [backgroundModeSupported, setBackgroundModeSupported] = useState(false)
+  const [backgroundMode, setBackgroundMode] = useState(false)
   const activeJobs = useAppStore((s) => s.activeJobs)
   const upsertJob = useAppStore((s) => s.upsertJob)
 
@@ -77,6 +87,21 @@ export function SettingsPage() {
     }
   }, [activeJobs, get])
 
+  useEffect(() => {
+    if (!window.electronAPI?.getBackgroundMode) return
+    setBackgroundModeSupported(true)
+    window.electronAPI.getBackgroundMode().then(setBackgroundMode).catch(() => {})
+  }, [])
+
+  const toggleBackgroundMode = async (v: boolean) => {
+    setBackgroundMode(v)
+    try {
+      await window.electronAPI?.setBackgroundMode(v)
+    } catch {
+      /* main process logs the failure; toggle stays optimistic */
+    }
+  }
+
   const installGpuRuntime = async () => {
     setGpuError(null)
     try {
@@ -120,6 +145,21 @@ export function SettingsPage() {
       <h1 className="m-0 mb-3.5 text-lg font-black">Налаштування</h1>
 
       <div className="bg-rh-card border border-rh-border rounded-2xl overflow-hidden">
+        {/* Background mode — local Electron window preference, not synced
+            anywhere (see electron/main.ts's tray/close-interception logic).
+            Hidden entirely outside Electron (no electronAPI). */}
+        {backgroundModeSupported && (
+          <div className="flex items-center gap-3 py-3.5 px-4 border-b border-rh-border/70">
+            <div className="flex-1">
+              <div className="text-[12.5px] font-bold">Фоновий режим</div>
+              <div className="font-mono text-[11px] text-rh-text-dim mt-0.5">
+                Закриття вікна ховає програму в трей замість виходу — бекенд і Power Share продовжують працювати
+              </div>
+            </div>
+            <Toggle checked={backgroundMode} onChange={toggleBackgroundMode} className="flex-shrink-0" />
+          </div>
+        )}
+
         {/* Reaper path */}
         <Row
           label="Шлях до Reaper"
@@ -236,7 +276,13 @@ export function SettingsPage() {
         onlineSignalingUrl={settings.online_signaling_url}
         onSaveOnlineSignaling={(enabled, url) => save({ online_signaling_enabled: enabled, online_signaling_url: url })}
       />
-      <UpdatePanel />
+      <FeedbackPanel
+        showInbox={settings.show_feedback_inbox}
+        onToggleInbox={(v) => save({ show_feedback_inbox: v })}
+        isAdmin={!!settings.active_profile?.is_admin}
+      />
+      {settings.active_profile?.is_admin && <ReportsPanel />}
+      <UpdatePanel isAdmin={!!settings.active_profile?.is_admin} />
     </main>
   )
 }

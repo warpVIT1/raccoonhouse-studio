@@ -74,7 +74,7 @@ export interface Marker {
 
 export interface JobStatus {
   id: string
-  type: 'import_video' | 'import_video_remote' | 'separate_vocals' | 'batch_separate_vocals' | 'distributed_separate_vocals' | 'request_remote_separation' | 'detect_markers' | 'export_srt' | 'mux_audio' | 'request_remote_render' | 'install_gpu_runtime'
+  type: 'import_video' | 'import_video_remote' | 'separate_vocals' | 'batch_separate_vocals' | 'distributed_separate_vocals' | 'request_remote_separation' | 'detect_markers' | 'export_srt' | 'mux_audio' | 'request_remote_render' | 'install_gpu_runtime' | 'download_model'
   status: 'pending' | 'running' | 'complete' | 'error' | 'cancelled'
   percent: number
   message: string
@@ -83,7 +83,7 @@ export interface JobStatus {
 }
 
 export interface WsMessage {
-  type: 'progress' | 'complete' | 'error' | 'cancelled' | 'status' | 'power_share_request' | 'power_share_lending'
+  type: 'progress' | 'complete' | 'error' | 'cancelled' | 'status' | 'power_share_request' | 'power_share_lending' | 'power_share_model_download_request' | 'power_share_borrowing' | 'force_update_request'
   job_id?: string
   percent?: number
   message?: string
@@ -114,9 +114,34 @@ export interface AppSettings {
   power_share_auto_approve: boolean
   online_signaling_enabled: boolean
   online_signaling_url: string | null
+  show_feedback_inbox: boolean
   gpu_enabled: boolean
   gpu_available: boolean
   gpu_runtime_installed: boolean
+}
+
+export interface FeedbackItem {
+  id: string
+  nickname: string
+  message: string
+  created_at: string
+}
+
+export interface SeparationReport {
+  id: string
+  profile_name: string
+  user_timezone: string
+  episode_label: string
+  model: string
+  ensemble: boolean
+  distributed: boolean
+  peers_used: string[]
+  duration_seconds: number
+  status: string
+  error_message: string | null
+  warnings: string[]
+  started_at_utc: string
+  created_at: string
 }
 
 export interface Profile {
@@ -124,6 +149,10 @@ export interface Profile {
   name: string
   role: string
   color: string
+  // Only ever true when set via ProfileModal's "type admin as your role"
+  // password flow — see backend Profile.is_admin's comment for why this
+  // lives per-profile rather than as a single install-wide flag.
+  is_admin: boolean
 }
 
 export interface PowerShareRequestPayload {
@@ -135,6 +164,15 @@ export interface PowerShareRequestPayload {
   timeout_seconds: number
 }
 
+export interface PowerShareModelDownloadPayload {
+  request_id: string
+  requester_name: string
+  title_name: string
+  episode_number: number
+  filename: string
+  timeout_seconds: number
+}
+
 export interface PowerShareLendingPayload {
   active: boolean
   task: 'separate' | 'import' | 'render'
@@ -143,6 +181,84 @@ export interface PowerShareLendingPayload {
   episode_number: number
   percent?: number | null
   message?: string | null
+}
+
+export interface PowerShareBorrowingPayload {
+  active: boolean
+  task?: 'separate' | 'import' | 'render'
+  peer_name?: string
+  title_name?: string
+  episode_number?: number
+  percent?: number | null
+  message?: string | null
+}
+
+export interface ModelChoice {
+  label: string
+  file: string
+  custom: boolean
+  id?: number | null
+}
+
+export interface ModelsConfig {
+  methods: string[]
+  choices: Record<string, ModelChoice[]>
+}
+
+export interface ApexModelItem {
+  id: number
+  method: string
+  label: string
+  filename: string
+  arch: string
+}
+
+export interface RegistryEntry {
+  label: string
+  filename: string
+  stems: string[]
+  is_vocal_separator: boolean | null
+}
+
+// A model added to the shared Model Browser catalog via "add by URL" (see
+// backend/routers/model_browser.py's /catalog, backed by Cloudflare D1 —
+// NOT audio-separator's own registry, see RegistryEntry above for that).
+export interface CatalogModel {
+  id: string
+  method: string
+  filename: string
+  label: string
+  arch: string
+  download_url: string
+  config_yaml_url: string | null
+  source_url: string
+  added_by: string
+  notes: string | null
+  created_at: string
+}
+
+// The AI's proposed configuration for a submitted repo URL, before the user
+// reviews/edits and confirms it into the shared catalog (see /models/submit
+// and /models/confirm).
+export interface ModelProposal {
+  method: string
+  arch: string
+  filename: string
+  download_url: string | null
+  config_yaml_url: string | null
+  label: string
+  stems: string[]
+  confidence: 'high' | 'medium' | 'low'
+  source_url: string
+  download_url_ok: boolean
+  config_yaml_url_ok: boolean
+}
+
+export interface ModelRating {
+  method: string
+  filename: string
+  profile_name: string
+  rating: number
 }
 
 export interface HikkaAnimeResult {

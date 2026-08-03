@@ -98,11 +98,33 @@ async def run_job(
     def _task():
         try:
             result = fn(reporter)
-            if not job.cancel_flag:
-                job.status = "complete"
-                job.percent = 100
-                job.result = result or {}
-                app_logger.info("job complete id=%s type=%s episode_id=%s", job.id, job.type, job.episode_id)
+            if job.cancel_flag:
+                # fn() returned normally despite a cancel request — happens
+                # whenever the underlying work has no cooperative cancel
+                # checkpoint between its last one and actually finishing (a
+                # single-model vocal separation has no callback INSIDE
+                # audio-separator's own separate() call, only between
+                # ensemble models). Without this branch, no WS event was ever
+                # sent for this job: the frontend's copy of the job object
+                # never left status "running", so its progress chip stayed
+                # frozen at whatever percent it showed when Cancel was
+                # clicked — looking exactly like a hang, forever — even
+                # though the backend's own job record already said
+                # "cancelled" (confirmed live: percent frozen at 38%, no
+                # further WS traffic for that job at all).
+                app_logger.info(
+                    "job cancelled (ran to completion after cancel) id=%s type=%s episode_id=%s",
+                    job.id, job.type, job.episode_id,
+                )
+                asyncio.run_coroutine_threadsafe(
+                    _broadcast({"type": "cancelled", "job_id": job.id}),
+                    loop,
+                )
+                return None
+            job.status = "complete"
+            job.percent = 100
+            job.result = result or {}
+            app_logger.info("job complete id=%s type=%s episode_id=%s", job.id, job.type, job.episode_id)
             return result
         except Exception as exc:
             # A user-cancelled job surfaces here too — either as this

@@ -69,6 +69,123 @@ power_logger = _make_logger("power_share", "power_share.log", also_write_to="app
 _pending: dict[str, dict] = {}
 _pending_lock = threading.Lock()
 
+# --- Responder side: pending "also download this model?" prompts — a SECOND,
+# narrower consent than the lend-compute one above, asked only once the actual
+# job_request reveals the requester's checkpoint isn't already on this peer's
+# disk (see discovery_service._handle_job_request / ensure_model_for_peer_job
+# below). Skipped entirely when this peer has power_share_auto_approve on,
+# same trust level already granted for lending compute at all.
+_pending_model_downloads: dict[str, dict] = {}
+
+
+def handle_model_download_request(
+    requester_name: str, title_name: str, episode_number: int, filename: str,
+    auto_approve: bool, broadcast_fn=None, loop=None,
+) -> bool:
+    if auto_approve:
+        power_logger.info("MODEL-DOWNLOAD-AUTO-APPROVE filename=%s", filename)
+        return True
+
+    request_id = str(uuid.uuid4())
+    event = threading.Event()
+    with _pending_lock:
+        _pending_model_downloads[request_id] = {"event": event, "approved": False}
+
+    power_logger.info(
+        "MODEL-DOWNLOAD-ASK requester=%s title=%s filename=%s request_id=%s",
+        requester_name, title_name, filename, request_id,
+    )
+    if broadcast_fn and loop:
+        asyncio.run_coroutine_threadsafe(
+            broadcast_fn({
+                "type": "power_share_model_download_request",
+                "data": {
+                    "request_id": request_id,
+                    "requester_name": requester_name,
+                    "title_name": title_name,
+                    "episode_number": episode_number,
+                    "filename": filename,
+                    "timeout_seconds": CONSENT_TIMEOUT_SECONDS,
+                },
+            }),
+            loop,
+        )
+
+    answered = event.wait(timeout=CONSENT_TIMEOUT_SECONDS)
+    with _pending_lock:
+        entry = _pending_model_downloads.pop(request_id, {"approved": False})
+    if not answered:
+        power_logger.info("MODEL-DOWNLOAD-TIMEOUT filename=%s", filename)
+        return False
+    return entry["approved"]
+
+
+def respond_to_model_download_request(request_id: str, approved: bool) -> bool:
+    """Called when the local user clicks Так/Ні on the incoming model-download popup."""
+    with _pending_lock:
+        entry = _pending_model_downloads.get(request_id)
+        if not entry:
+            return False
+        entry["approved"] = approved
+        entry["event"].set()
+    return True
+
+
+class _NoopReporter:
+    def update(self, percent, message=""):
+        pass
+
+
+def ensure_model_for_peer_job(
+    model: str, model_file: Optional[str], requester_name: str, title_name: str,
+    episode_number: int, broadcast_fn=None, loop=None,
+) -> None:
+    """Runs on the RESPONDER machine right before actually separating someone
+    else's audio — if the requester picked a checkpoint this peer doesn't have
+    on disk yet, either downloads it silently (auto-approve on) or asks first
+    via handle_model_download_request, since a peer's bandwidth/disk shouldn't
+    be spent on an unfamiliar community model without at least one Так/Ні —
+    the same trust gate already used for lending compute at all. Raises if the
+    model is declined, times out, or can't be found anywhere (neither on disk,
+    nor in audio-separator's own registry, nor in the shared Model Browser
+    catalog)."""
+    from . import separator_service, discovery_service
+
+    if not model_file or model_file in separator_service.downloaded_model_filenames():
+        return
+
+    found_in_registry, _, _ = separator_service.check_registry_model(model, model_file)
+
+    db = SessionLocal()
+    try:
+        settings = db.get(AppSettings, 1)
+        auto_approve = bool(settings and settings.power_share_auto_approve)
+    finally:
+        db.close()
+
+    approved = handle_model_download_request(
+        requester_name, title_name, episode_number, model_file, auto_approve, broadcast_fn, loop,
+    )
+    if not approved:
+        raise ValueError(f"Відхилено завантаження моделі {model_file} на віддаленому ПК")
+
+    if found_in_registry:
+        return  # separate_file's own Separator.download_model_files handles this on demand
+
+    catalog_entry = next(
+        (m for m in discovery_service.list_browsable_models() if m.get("filename") == model_file), None,
+    )
+    if not catalog_entry:
+        raise ValueError(f"Модель {model_file} не знайдено ні локально, ні у спільному каталозі")
+
+    power_logger.info("MODEL-DOWNLOAD-START filename=%s", model_file)
+    separator_service.download_custom_model(
+        catalog_entry["method"], catalog_entry["filename"], catalog_entry["label"],
+        catalog_entry["arch"], catalog_entry["download_url"], catalog_entry.get("config_yaml_url"),
+        _NoopReporter(),
+    )
+    power_logger.info("MODEL-DOWNLOAD-DONE filename=%s", model_file)
+
 
 def handle_incoming_consent_request(body: dict, broadcast_fn=None, loop=None) -> tuple[bool, str]:
     """Runs on the machine being ASKED for power. Returns (approved, reason)."""
@@ -168,10 +285,28 @@ def respond_to_request(request_id: str, approved: bool) -> bool:
 
 # --- Responder side: actually running a dispatched job locally ---
 
+def _relay_progress(relay_to: Optional[str], relay_request_id: Optional[str], task: str, percent: Optional[int], message: Optional[str]):
+    """Mirrors a lending-progress tick back to the ORIGINAL requester over the
+    relay, so their UI can show the same live percent this machine's own
+    'lending' banner shows instead of a blind wait (see
+    discovery_service._handle_job_progress on the requester's side). Skipped
+    for the final active=False call (percent is None there) — the requester
+    already dismisses its own banner once the job_done/job_error round trip
+    resolves, no separate 'stop' tick needed."""
+    if not relay_to or not relay_request_id or percent is None:
+        return
+    from . import discovery_service
+    discovery_service.send_relay(relay_to, {
+        "kind": "job_progress", "request_id": relay_request_id,
+        "task": task, "percent": percent, "message": message,
+    })
+
+
 def run_separation_job_for_peer(
     input_path: str, model: str, ensemble: bool,
     requester_name: str, title_name: str, episode_number: int,
     model_file: Optional[str] = None, params: Optional[dict] = None, broadcast_fn=None, loop=None,
+    relay_to: Optional[str] = None, relay_request_id: Optional[str] = None,
 ) -> tuple[str, dict, str]:
     """Runs on the RESPONDER machine — separates someone else's (already
     downloaded) audio file locally. Returns (vocal_stem_path, meta, tmp_dir);
@@ -195,6 +330,7 @@ def run_separation_job_for_peer(
                 }),
                 loop,
             )
+        _relay_progress(relay_to, relay_request_id, "separate", percent, message)
 
     tmp_dir = tempfile.mkdtemp(prefix="rh_power_share_")
     power_logger.info("RUN-SEPARATION-RECEIVED requester=%s title=%s ep=%s model=%s", requester_name, title_name, episode_number, model)
@@ -225,6 +361,7 @@ def run_separation_job_for_peer(
 def run_import_job_for_peer(
     input_path: str, requester_name: str, title_name: str, episode_number: int,
     broadcast_fn=None, loop=None,
+    relay_to: Optional[str] = None, relay_request_id: Optional[str] = None,
 ) -> tuple[str, dict, str]:
     """Runs on the RESPONDER machine — extracts audio locally from someone
     else's (already downloaded) ORIGINAL video file. Returns (audio_path,
@@ -247,6 +384,7 @@ def run_import_job_for_peer(
                 }),
                 loop,
             )
+        _relay_progress(relay_to, relay_request_id, "import", percent, message)
 
     tmp_dir = tempfile.mkdtemp(prefix="rh_power_import_")
     _broadcast_lending(True, percent=0)
@@ -268,6 +406,7 @@ def run_render_job_for_peer(
     video_path: str, instrumental_path: str,
     requester_name: str, title_name: str, episode_number: int,
     broadcast_fn=None, loop=None,
+    relay_to: Optional[str] = None, relay_request_id: Optional[str] = None,
 ) -> tuple[str, dict, str]:
     """Runs on the RESPONDER machine — muxes someone else's already-downloaded
     original video against their already-separated instrumental (received as
@@ -290,6 +429,7 @@ def run_render_job_for_peer(
                 }),
                 loop,
             )
+        _relay_progress(relay_to, relay_request_id, "render", percent, message)
 
     tmp_dir = tempfile.mkdtemp(prefix="rh_power_render_")
     power_logger.info("RUN-RENDER-RECEIVED requester=%s title=%s ep=%s", requester_name, title_name, episode_number)
@@ -510,19 +650,25 @@ def _request_remote_power(episode_id: int, model: str, ensemble: bool, db: Sessi
     if reporter:
         reporter.update(46, f"{chosen['name']} обробляє…")
 
-    result = discovery_service.call_peer(chosen["id"], {
-        "kind": "job_request",
-        "task": "separate",
-        "transfer_id": transfer_id,
-        "filename": os.path.basename(ep.audio_stem_path),
-        "model": model,
-        "ensemble": bool(ensemble),
-        "model_file": model_file,
-        "params": params,
-        "requester_name": _active_profile_name(db),
-        "title_name": title.name_ua,
-        "episode_number": ep.number,
-    }, timeout=3600)
+    try:
+        result = discovery_service.call_peer(chosen["id"], {
+            "kind": "job_request",
+            "task": "separate",
+            "transfer_id": transfer_id,
+            "filename": os.path.basename(ep.audio_stem_path),
+            "model": model,
+            "ensemble": bool(ensemble),
+            "model_file": model_file,
+            "params": params,
+            "requester_name": _active_profile_name(db),
+            "title_name": title.name_ua,
+            "episode_number": ep.number,
+        }, timeout=3600, context={
+            "task": "separate", "peer_name": chosen["name"],
+            "title_name": title.name_ua, "episode_number": ep.number,
+        })
+    finally:
+        discovery_service.broadcast_local({"type": "power_share_borrowing", "data": {"active": False}})
     power_logger.info("DISPATCH-RESPONSE peer=%s result=%s", chosen["id"], result.get("kind", "job_done"))
 
     if result.get("kind") == "job_error" or not result.get("result_transfer_id"):
@@ -602,15 +748,21 @@ def _request_remote_import(episode_id: int, file_path: str, db: Session, reporte
     finally:
         stream.close()
 
-    result = discovery_service.call_peer(chosen["id"], {
-        "kind": "job_request",
-        "task": "import",
-        "transfer_id": transfer_id,
-        "filename": filename,
-        "requester_name": _active_profile_name(db),
-        "title_name": title.name_ua,
-        "episode_number": ep.number,
-    }, timeout=3600)
+    try:
+        result = discovery_service.call_peer(chosen["id"], {
+            "kind": "job_request",
+            "task": "import",
+            "transfer_id": transfer_id,
+            "filename": filename,
+            "requester_name": _active_profile_name(db),
+            "title_name": title.name_ua,
+            "episode_number": ep.number,
+        }, timeout=3600, context={
+            "task": "import", "peer_name": chosen["name"],
+            "title_name": title.name_ua, "episode_number": ep.number,
+        })
+    finally:
+        discovery_service.broadcast_local({"type": "power_share_borrowing", "data": {"active": False}})
 
     if result.get("kind") == "job_error" or not result.get("result_transfer_id"):
         raise ValueError(f"Помилка на {chosen['name']}: {result.get('reason', 'невідома помилка')}")
@@ -713,17 +865,23 @@ def _request_remote_render(episode_id: int, output_dir: Optional[str], db: Sessi
     if reporter:
         reporter.update(72, f"{chosen['name']} рендерить…")
 
-    result = discovery_service.call_peer(chosen["id"], {
-        "kind": "job_request",
-        "task": "render",
-        "transfer_id": video_transfer_id,
-        "filename": os.path.basename(ep.original_file_path),
-        "audio_transfer_id": audio_transfer_id,
-        "audio_filename": "instrumental.flac",
-        "requester_name": _active_profile_name(db),
-        "title_name": title.name_ua,
-        "episode_number": ep.number,
-    }, timeout=3600)
+    try:
+        result = discovery_service.call_peer(chosen["id"], {
+            "kind": "job_request",
+            "task": "render",
+            "transfer_id": video_transfer_id,
+            "filename": os.path.basename(ep.original_file_path),
+            "audio_transfer_id": audio_transfer_id,
+            "audio_filename": "instrumental.flac",
+            "requester_name": _active_profile_name(db),
+            "title_name": title.name_ua,
+            "episode_number": ep.number,
+        }, timeout=3600, context={
+            "task": "render", "peer_name": chosen["name"],
+            "title_name": title.name_ua, "episode_number": ep.number,
+        })
+    finally:
+        discovery_service.broadcast_local({"type": "power_share_borrowing", "data": {"active": False}})
     power_logger.info("DISPATCH-RENDER-RESPONSE peer=%s result=%s", chosen["id"], result.get("kind", "job_done"))
 
     if result.get("kind") == "job_error" or not result.get("result_transfer_id"):

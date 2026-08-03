@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react'
 import { useApi } from '../hooks/useApi'
 import { useAppStore } from '../stores/appStore'
+import { useBackdropClose } from '../hooks/useBackdropClose'
 import { EpisodeBadge } from './ui/Badge'
 import { ProgressBar } from './ui/ProgressBar'
 import { Spinner } from './ui/Spinner'
@@ -347,6 +348,7 @@ interface PosterModalProps {
   onSaved: (title: Title) => void
 }
 function PosterModal({ titleId, defaultQuery, onClose, onSaved }: PosterModalProps) {
+  const backdrop = useBackdropClose(onClose)
   const { post } = useApi()
   const [selected, setSelected] = useState<HikkaAnimeResult | null>(null)
   const [saving, setSaving] = useState(false)
@@ -365,7 +367,7 @@ function PosterModal({ titleId, defaultQuery, onClose, onSaved }: PosterModalPro
   }
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={onClose}>
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" {...backdrop}>
       <div className="rh-card w-[440px] max-h-[85vh] overflow-y-auto p-6 flex flex-col gap-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <h2 className="text-base font-semibold">Постер тайтлу</h2>
         <PosterSearch defaultQuery={defaultQuery} selected={selected} onSelect={setSelected} />
@@ -387,6 +389,7 @@ interface ImportReviewModalProps {
   onConfirm: (items: PendingImport[]) => void
 }
 function ImportReviewModal({ items, onCancel, onConfirm }: ImportReviewModalProps) {
+  const backdrop = useBackdropClose(onCancel)
   const [rows, setRows] = useState(items)
 
   function update(idx: number, patch: Partial<PendingImport>) {
@@ -394,7 +397,7 @@ function ImportReviewModal({ items, onCancel, onConfirm }: ImportReviewModalProp
   }
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={onCancel}>
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" {...backdrop}>
       <div className="rh-card w-[520px] max-h-[85vh] overflow-y-auto p-6 flex flex-col gap-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div>
           <h2 className="text-base font-semibold">Номери серій</h2>

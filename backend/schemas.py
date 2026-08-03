@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict
 from pydantic import BaseModel
 
 
@@ -211,6 +211,7 @@ class AppSettingsOut(BaseModel):
     power_share_auto_approve: bool = False
     online_signaling_enabled: bool = True
     online_signaling_url: Optional[str] = None
+    show_feedback_inbox: bool = False
     gpu_enabled: bool = False
     # Read-only, computed — not stored, just reported for the Settings UI to
     # decide what to show (hide the toggle entirely with no NVIDIA GPU;
@@ -233,6 +234,7 @@ class AppSettingsUpdate(BaseModel):
     power_share_auto_approve: Optional[bool] = None
     online_signaling_enabled: Optional[bool] = None
     online_signaling_url: Optional[str] = None
+    show_feedback_inbox: Optional[bool] = None
     gpu_enabled: Optional[bool] = None
 
 
@@ -240,6 +242,12 @@ class ProfileBase(BaseModel):
     name: str
     role: str = "Звукорежисер"
     color: str = "#E52128"
+    # Only ever True when set via ProfileModal's admin-password flow — see
+    # Profile.is_admin's comment for why this lives per-profile, not on
+    # AppSettings. Present here (rather than only on ProfileOut) so
+    # ProfileCreate can carry it through Profile(**body.model_dump()) in
+    # routers/profiles.py with no extra plumbing.
+    is_admin: bool = False
 
 
 class ProfileCreate(ProfileBase):
@@ -270,6 +278,113 @@ class HikkaAnimeResult(BaseModel):
 
 class PosterFromUrlRequest(BaseModel):
     image_url: str
+
+
+class ApexModelCreate(BaseModel):
+    method: str
+    label: str
+    filename: str
+
+
+class ApexModelOut(BaseModel):
+    id: int
+    method: str
+    label: str
+    filename: str
+    arch: str
+
+    model_config = {"from_attributes": True}
+
+
+class ModelChoiceOut(BaseModel):
+    label: str
+    file: str
+    custom: bool = False
+    id: Optional[int] = None
+
+
+class ModelsOut(BaseModel):
+    methods: List[str]
+    choices: Dict[str, List[ModelChoiceOut]]
+
+
+class RegistryEntryOut(BaseModel):
+    label: str
+    filename: str
+    stems: List[str]
+    is_vocal_separator: Optional[bool] = None
+
+
+class ModelDownloadRequest(BaseModel):
+    method: str
+    filename: str
+    source: str = "registry"  # "registry" | "custom"
+    label: Optional[str] = None
+    arch: Optional[str] = None
+    download_url: Optional[str] = None
+    config_yaml_url: Optional[str] = None
+
+
+class ModelSubmitRequest(BaseModel):
+    url: str
+
+
+class ModelConfirmRequest(BaseModel):
+    method: str
+    filename: str
+    label: str
+    arch: str
+    download_url: str
+    config_yaml_url: Optional[str] = None
+    source_url: str
+    notes: Optional[str] = None
+
+
+class ModelRatingIn(BaseModel):
+    method: str
+    filename: str
+    rating: int
+
+
+class ModelRatingOut(BaseModel):
+    method: str
+    filename: str
+    profile_name: str
+    rating: int
+
+    model_config = {"from_attributes": True}
+
+
+class AdminUnlockRequest(BaseModel):
+    password: str
+
+
+class FeedbackCreate(BaseModel):
+    message: str
+
+
+class FeedbackOut(BaseModel):
+    id: str
+    nickname: str
+    message: str
+    created_at: str
+
+
+class SeparationReportOut(BaseModel):
+    id: str
+    profile_name: str
+    user_timezone: str
+    episode_label: str
+    model: str
+    ensemble: bool
+    distributed: bool
+    peers_used: List[str]
+    duration_seconds: float
+    status: str
+    error_message: Optional[str] = None
+    warnings: List[str] = []
+    started_at_utc: str
+    created_at: str
 
 
 AppSettingsOut.model_rebuild()

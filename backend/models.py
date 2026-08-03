@@ -164,6 +164,14 @@ class AppSettings(Base):
     online_signaling_url: Mapped[Optional[str]] = mapped_column(
         String(512), nullable=True, default="wss://raccoonhouse-signaling.raccoonhause.workers.dev/"
     )
+    # Local-only opt-in — shows the incoming "Пропозиції та скарги" inbox in
+    # Settings on THIS install. Every install can still submit feedback
+    # regardless of this flag; it only gates who sees what others submitted.
+    # No server-side auth backs this (matching every other Power Share
+    # endpoint's trust model — see cloudflare-signaling/src/index.ts), so
+    # this is the only thing standing between a teammate's install and the
+    # incoming list, same posture as power_share_auto_approve above.
+    show_feedback_inbox: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class Profile(Base):
@@ -175,6 +183,19 @@ class Profile(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     role: Mapped[str] = mapped_column(String(128), nullable=False, default="Звукорежисер")
     color: Mapped[str] = mapped_column(String(32), nullable=False, default="#E52128")
+    # Set only via ProfileModal's "type admin as your role → enter password"
+    # flow (see routers/settings.py's verify-admin-password endpoint) — gates
+    # seeing the feedback inbox and editing Апекс's line-up. Deliberately a
+    # property of THIS profile, not a single install-wide flag: it used to
+    # live on AppSettings, which meant unlocking it once stayed unlocked for
+    # every profile on the same install, even after switching to a non-admin
+    # one — confirmed live as a real gap, not just theoretical. Reading
+    # AppSettings.active_profile.is_admin instead fixes that, since switching
+    # the active profile now genuinely changes what's visible. This is a
+    # convenience gate for a closed trusted circle, explicitly NOT real
+    # security — anyone with local access to this machine's own backend API
+    # could set it directly; the password only stops a casual click.
+    is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class PowerShareConsent(Base):
@@ -191,3 +212,62 @@ class PowerShareConsent(Base):
     title_id: Mapped[int] = mapped_column(Integer, ForeignKey("titles.id"), nullable=False)
     granted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     decided_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ApexModel(Base):
+    """The current line-up for "Апекс" (see separator_service.py's
+    APEX_MODELS_DEFAULT) — DB-backed rather than hardcoded so the curator
+    (whoever runs this install) can add/remove which models Апекс averages
+    without a full PyInstaller rebuild + redeploy, which used to be the only
+    way to change this. Seeded once from APEX_MODELS_DEFAULT the first time
+    it's read (see separator_service._load_apex_models) if this table is
+    still empty — existing installs keep today's line-up until edited.
+    Order doesn't affect the result (Апекс unweighted-averages every entry),
+    so there's no explicit position column to manage."""
+    __tablename__ = "apex_models"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    method: Mapped[str] = mapped_column(String(32), nullable=False)  # one of MODEL_CHOICES's keys — needed to derive arch
+    label: Mapped[str] = mapped_column(String(255), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    arch: Mapped[str] = mapped_column(String(16), nullable=False)  # "mdx" | "vr" | "demucs" | "mdxc"
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ModelRating(Base):
+    """One profile's 1-5 star opinion on one registry model (see the Model
+    Browser — routers/model_browser.py). One row per (method, filename,
+    profile_name); re-rating updates the existing row rather than adding a
+    new one. Synced across every install via the same Cloudflare Worker
+    feedback/reports/Апекс already use (see discovery_service's
+    submit_model_rating/list_model_ratings) — the point of a shared browser
+    is the whole studio's opinion on a model, not just this one install's."""
+    __tablename__ = "model_ratings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    method: Mapped[str] = mapped_column(String(32), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    profile_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    rating: Mapped[int] = mapped_column(Integer, nullable=False)  # 1-5
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class DownloadedCustomModel(Base):
+    """Local record of one Model Browser catalog entry (the shared,
+    server-side catalog itself lives in Cloudflare D1 — see
+    routers/model_browser.py's /models/catalog, not this table) that has
+    actually been downloaded onto THIS install. Exists so separation can
+    resolve a custom model's architecture/config file at job time without a
+    network round-trip to the Worker — works fully offline once downloaded,
+    same as every built-in model. Replaces the old install-local-only
+    CustomSeparationModel table, which this Model Browser feature supersedes
+    entirely (see git history for the removed /models/custom endpoints)."""
+    __tablename__ = "downloaded_custom_models"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    method: Mapped[str] = mapped_column(String(32), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    label: Mapped[str] = mapped_column(String(255), nullable=False)
+    arch: Mapped[str] = mapped_column(String(16), nullable=False)  # "mdx" | "vr" | "demucs" | "mdxc"
+    config_yaml_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)

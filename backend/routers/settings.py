@@ -6,11 +6,17 @@ from sqlalchemy.orm import Session
 from .. import job_manager
 from ..database import SessionLocal, get_db
 from ..models import AppSettings, Profile
-from ..schemas import AppSettingsOut, AppSettingsUpdate, ProfileOut
+from ..schemas import AdminUnlockRequest, AppSettingsOut, AppSettingsUpdate, ProfileOut
 from ..services import gpu_runtime_service
 from ..services.separator_service import MODEL_MAP
 
 router = APIRouter(tags=["settings"])
+
+# Deliberately trivial and hardcoded — this is a convenience gate for a
+# closed trusted circle (see Profile.is_admin's comment), not real security.
+# Change here if the password ever needs to change; no config UI for it
+# since there's exactly one person who's meant to know it.
+ADMIN_PASSWORD = "0"
 
 
 def _get_or_create(db: Session) -> AppSettings:
@@ -71,6 +77,18 @@ def _install_gpu_runtime_job(reporter):
         db.commit()
     finally:
         db.close()
+
+
+@router.post("/settings/verify-admin-password")
+def verify_admin_password(body: AdminUnlockRequest):
+    # Stateless on purpose — this only checks the password; ProfileModal
+    # applies is_admin=True to the specific profile being created/activated
+    # via the normal /profiles endpoints, not here (see Profile.is_admin's
+    # comment for why it lives per-profile rather than as a single
+    # install-wide flag on AppSettings).
+    if body.password != ADMIN_PASSWORD:
+        raise HTTPException(400, "Невірний пароль")
+    return {"ok": True}
 
 
 @router.post("/settings/install-gpu-runtime")

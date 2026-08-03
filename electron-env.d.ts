@@ -22,6 +22,8 @@ interface Window {
     minimize: () => void
     maximize: () => void
     close: () => void
+    getBackgroundMode: () => Promise<boolean>
+    setBackgroundMode: (enabled: boolean) => Promise<void>
     checkForUpdate: () => Promise<void>
     downloadUpdate: () => Promise<void>
     installUpdate: () => Promise<void>

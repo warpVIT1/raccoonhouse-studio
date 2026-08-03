@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useApi } from '../hooks/useApi'
 import { useAppStore } from '../stores/appStore'
+import { useBackdropClose } from '../hooks/useBackdropClose'
 import { VideoPlayer, type VideoPlayerHandle } from './workspace/VideoPlayer'
 import { WaveformViewer } from './workspace/WaveformViewer'
 import { SubtitleGrid } from './workspace/SubtitleGrid'
@@ -59,6 +60,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   const [separationError, setSeparationError] = useState<string | null>(null)
   const [batchRendering, setBatchRendering] = useState(false)
   const [batchResults, setBatchResults] = useState<{ jobId: string; items: { model: string; path: string }[] } | null>(null)
+  const batchResultsBackdrop = useBackdropClose(() => setBatchResults(null))
   const [usingBatchResult, setUsingBatchResult] = useState<string | null>(null)
   const [distributedRunning, setDistributedRunning] = useState(false)
   const [markersError, setMarkersError] = useState<string | null>(null)
@@ -761,12 +763,12 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
           </button>
           <input ref={assInputRef} type="file" accept=".ass" className="hidden" onChange={(e) => { if (e.target.files) handleAssImport(e.target.files) }} />
 
-          {/* Export SRT */}
+          {/* Export SRT (per actor) + one combined full ASS, zipped together — see srt_exporter.py */}
           <button onClick={handleExportSrt} className="rh-btn-outline text-xs" disabled={!backendReady}>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
             </svg>
-            Експорт SRT
+            Експорт SRT + ASS
           </button>
 
           {/* Separate vocals */}
@@ -852,27 +854,36 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
           without this picker "Рендерити фінальну доріжку" stays disabled
           forever after a batch run even though usable output files exist. */}
       {batchResults && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setBatchResults(null)}>
-          <div className="rh-card w-[420px] p-5 flex flex-col gap-3 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" {...batchResultsBackdrop}>
+          <div className="rh-card w-[480px] p-5 flex flex-col gap-3 shadow-2xl" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between">
               <h2 className="text-sm font-semibold">Пакетний рендер готовий — обрати результат</h2>
               <button onClick={() => setBatchResults(null)} className="text-rh-muted hover:text-white text-lg leading-none px-1">✕</button>
             </div>
             <p className="text-xs text-rh-muted">
-              Кожна модель дала окремий файл у теці, яка щойно відкрилась. Оберіть той, що звучить найкраще —
-              він стане інструменталом цієї серії для рендеру.
+              Кожна модель дала окремий файл — прослухайте прямо тут і оберіть той, що звучить найкраще:
+              він стане інструменталом цієї серії для рендеру. Ця бібліотека тимчасова — застарілі файли
+              автоматично видаляються за кілька днів, щоб не займати місце.
             </p>
             <div className="flex flex-col gap-1.5 max-h-[60vh] overflow-y-auto pr-1">
               {batchResults.items.map((r) => (
-                <div key={r.model} className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-rh-border">
-                  <span className="text-xs font-medium">{r.model}</span>
-                  <button
-                    onClick={() => handleUseBatchResult(batchResults.jobId, r.path)}
-                    disabled={usingBatchResult === r.path}
-                    className="rh-btn-outline text-[11px] px-2.5 py-1"
-                  >
-                    {usingBatchResult === r.path ? <Spinner size={11} /> : 'Обрати'}
-                  </button>
+                <div key={r.model} className="flex flex-col gap-1.5 px-3 py-2 rounded-lg border border-rh-border">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium truncate">{r.model}</span>
+                    <button
+                      onClick={() => handleUseBatchResult(batchResults.jobId, r.path)}
+                      disabled={usingBatchResult === r.path}
+                      className="rh-btn-outline text-[11px] px-2.5 py-1 flex-shrink-0"
+                    >
+                      {usingBatchResult === r.path ? <Spinner size={11} /> : 'Обрати'}
+                    </button>
+                  </div>
+                  <audio
+                    controls
+                    preload="none"
+                    src={`http://localhost:${backendPort}/api/stream?path=${encodeURIComponent(r.path)}`}
+                    className="w-full h-8"
+                  />
                 </div>
               ))}
             </div>

@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { Spinner } from './ui/Spinner'
+import { useApi } from '../hooks/useApi'
 
 interface UpdateState {
   status: string
@@ -8,9 +9,29 @@ interface UpdateState {
   message?: string
 }
 
-export function UpdatePanel() {
+interface UpdatePanelProps {
+  isAdmin?: boolean
+}
+
+export function UpdatePanel({ isAdmin }: UpdatePanelProps) {
   const [state, setState] = useState<UpdateState>({ status: 'idle' })
   const available = Boolean(window.electronAPI?.onUpdateStatus)
+  const { post } = useApi()
+  const [broadcasting, setBroadcasting] = useState(false)
+  const [broadcastResult, setBroadcastResult] = useState<string | null>(null)
+
+  async function broadcastForceUpdate() {
+    setBroadcasting(true)
+    setBroadcastResult(null)
+    try {
+      const r = await post<{ sent: number }>('/power-share/broadcast-force-update', {})
+      setBroadcastResult(r.sent > 0 ? `Надіслано ${r.sent} ПК` : 'Немає нікого онлайн зараз')
+    } catch (e) {
+      setBroadcastResult(e instanceof Error ? e.message : 'Не вдалося надіслати')
+    } finally {
+      setBroadcasting(false)
+    }
+  }
 
   useEffect(() => {
     if (!window.electronAPI?.onUpdateStatus) return
@@ -75,6 +96,24 @@ export function UpdatePanel() {
           </button>
         )}
       </div>
+      {isAdmin && (
+        <div className="flex items-center gap-3 py-3 px-4 border-t border-rh-border/70">
+          <div className="flex-1">
+            <div className="text-[12px] font-semibold">Попросити всіх оновитись</div>
+            <div className="font-mono text-[10.5px] text-rh-text-dim mt-0.5">
+              {broadcastResult ?? 'Надсилає нагадування кожному ПК, що зараз онлайн'}
+            </div>
+          </div>
+          <button
+            onClick={broadcastForceUpdate}
+            disabled={broadcasting}
+            className="rh-btn-outline text-[11px] px-3 py-1.5"
+          >
+            {broadcasting ? <Spinner size={12} /> : null}
+            Надіслати всім
+          </button>
+        </div>
+      )}
     </div>
   )
 }

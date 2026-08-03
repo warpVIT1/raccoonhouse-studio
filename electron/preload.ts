@@ -15,6 +15,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   maximize: () => ipcRenderer.send('window:maximize'),
   close: () => ipcRenderer.send('window:close'),
 
+  // Background mode (tray) — local-only window-management preference, not
+  // part of the backend's AppSettings (see electron/main.ts).
+  getBackgroundMode: () => ipcRenderer.invoke('get:backgroundMode'),
+  setBackgroundMode: (enabled: boolean) => ipcRenderer.invoke('set:backgroundMode', enabled),
+
   // Auto-update
   checkForUpdate: () => ipcRenderer.invoke('update:check'),
   downloadUpdate: () => ipcRenderer.invoke('update:download'),

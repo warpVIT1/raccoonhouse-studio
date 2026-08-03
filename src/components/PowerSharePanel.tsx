@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from 'react'
 import { useApi } from '../hooks/useApi'
+import { useAppStore } from '../stores/appStore'
 import { Spinner } from './ui/Spinner'
 import { Toggle } from './ui/Toggle'
+import { PeerLogViewerModal } from './PeerLogViewerModal'
 
 interface DiscoveredPeer {
   id: string
@@ -136,6 +138,8 @@ function DevicesList({
 }: DevicesListProps) {
   const [editingOnline, setEditingOnline] = useState(false)
   const [onlineUrl, setOnlineUrl] = useState(onlineSignalingUrl ?? '')
+  const isAdmin = !!useAppStore((s) => s.activeProfile)?.is_admin
+  const [viewingLogsFor, setViewingLogsFor] = useState<DiscoveredPeer | null>(null)
 
   return (
     <div className="p-4 flex flex-col gap-2.5">
@@ -160,11 +164,27 @@ function DevicesList({
             <div className="text-xs font-medium truncate">{p.name}</div>
             <div className="font-mono text-[10.5px] text-rh-muted truncate">{p.gpu_name} · {p.vram_gb} ГБ</div>
           </div>
+          {isAdmin && (
+            <button
+              onClick={() => setViewingLogsFor(p)}
+              className="rh-btn-ghost text-[10.5px] px-2 py-1 flex-shrink-0"
+              title="Переглянути журнали цього ПК"
+            >
+              Логи
+            </button>
+          )}
           <span className="text-[10.5px] text-rh-muted flex-shrink-0">
             {p.available ? 'Готовий' : !p.power_share_enabled ? 'Вимкнено на ПК' : 'Не залогінено'}
           </span>
         </div>
       ))}
+      {viewingLogsFor && (
+        <PeerLogViewerModal
+          peerId={viewingLogsFor.id}
+          peerName={viewingLogsFor.name}
+          onClose={() => setViewingLogsFor(null)}
+        />
+      )}
       {overview.peers.length === 0 && (
         <div className="text-xs text-rh-muted">Інших ПК поки не знайдено.</div>
       )}

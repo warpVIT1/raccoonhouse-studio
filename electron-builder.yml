@@ -43,6 +43,14 @@ win:
   icon: resources/icon.ico
 
 nsis:
+  # No ${version} in the name (electron-builder's own default) — a fixed
+  # filename lets README.md link to
+  # .../releases/latest/download/RaccoonHouse-Studio-Setup.exe, which GitHub
+  # always resolves to whatever the current latest release's asset of that
+  # exact name is, so the download link never needs updating by hand again
+  # when the version bumps. electron-updater itself doesn't care either way —
+  # it reads the exact filename out of latest.yml, not this pattern.
+  artifactName: RaccoonHouse-Studio-Setup.exe
   oneClick: false
   allowElevation: true
   allowToChangeInstallationDirectory: true

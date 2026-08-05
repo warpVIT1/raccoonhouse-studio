@@ -3,7 +3,7 @@ import { useApi } from '../hooks/useApi'
 import { useAppStore } from '../stores/appStore'
 import { Spinner } from './ui/Spinner'
 import { useBackdropClose } from '../hooks/useBackdropClose'
-import type { RegistryEntry, ModelRating, CatalogModel, ModelProposal } from '../types'
+import type { RegistryEntry, ModelRating, CatalogModel, ModelProposal, PersonalEnsembleModelItem, ModelDescription } from '../types'
 
 const METHODS = ['MDX-Net', 'VR Arch', 'Demucs', 'MDX23C', 'BS-RoFormer'] as const
 const ARCHS = ['mdx', 'vr', 'demucs', 'mdxc'] as const
@@ -33,7 +33,7 @@ function extractApiError(e: unknown, fallback: string): string {
 // Тайтли/Налаштування), not a modal — the previous popup version made it
 // feel like a one-off dialog rather than a place worth browsing.
 export function ModelBrowserPage() {
-  const { get, post, del } = useApi()
+  const { get, post, put, del } = useApi()
   const activeProfile = useAppStore((s) => s.activeProfile)
   const activeJobs = useAppStore((s) => s.activeJobs)
   const upsertJob = useAppStore((s) => s.upsertJob)
@@ -65,6 +65,27 @@ export function ModelBrowserPage() {
     get<CatalogModel[]>(`/models/catalog?method=${encodeURIComponent(method)}`).then(setCatalog).catch(() => setCatalog([]))
   }
 
+  // "Мій ансамбль" — a personal, per-profile, local ensemble line-up (see
+  // backend's PersonalEnsembleModel) that VocalSeparationModal's "МійАнсамбль"
+  // pseudo-method runs — starts empty for everyone, filled in from here
+  // rather than typed in by hand. Loaded once for the whole page (not per
+  // method) so the ✓/+ state on every row stays correct while switching tabs.
+  const [personalEnsemble, setPersonalEnsemble] = useState<PersonalEnsembleModelItem[]>([])
+  const personalEnsembleFilenames = new Set(personalEnsemble.map((m) => m.filename))
+
+  function loadPersonalEnsemble() {
+    get<PersonalEnsembleModelItem[]>('/models/personal-ensemble').then(setPersonalEnsemble).catch(() => {})
+  }
+
+  async function addToPersonalEnsemble(m: string, filename: string, label: string) {
+    try {
+      const created = await post<PersonalEnsembleModelItem>('/models/personal-ensemble', { method: m, label, filename })
+      setPersonalEnsemble((prev) => [...prev, created])
+    } catch (e) {
+      setError(extractApiError(e, 'Не вдалося додати до свого ансамблю'))
+    }
+  }
+
   function loadDownloaded() {
     get<{ filenames: string[] }>('/models/downloaded')
       .then((r) => setDownloaded(new Set(r.filenames)))
@@ -86,8 +107,28 @@ export function ModelBrowserPage() {
 
   useEffect(() => {
     loadDownloaded()
+    loadPersonalEnsemble()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [get])
+
+  // Shared "pros/cons" note per model — global (one per filename, not
+  // per-method/per-profile), so loaded once for the whole page rather than
+  // refetched on every method switch (see backend's /models/descriptions).
+  const [descriptions, setDescriptions] = useState<ModelDescription[]>([])
+
+  useEffect(() => {
+    get<ModelDescription[]>('/models/descriptions').then(setDescriptions).catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [get])
+
+  function descriptionFor(filename: string): ModelDescription | null {
+    return descriptions.find((d) => d.filename === filename) ?? null
+  }
+
+  async function saveDescription(filename: string, text: string) {
+    const saved = await put<ModelDescription>(`/models/descriptions/${encodeURIComponent(filename)}`, { description: text })
+    setDescriptions((prev) => [...prev.filter((d) => d.filename !== filename), saved])
+  }
 
   // Once a tracked download job completes, drop it from the in-flight map
   // and refresh the on-disk list so that row flips to "Завантажено".
@@ -489,6 +530,18 @@ export function ModelBrowserPage() {
                           Завантажити
                         </button>
                       )}
+                      <button
+                        onClick={() => addToPersonalEnsemble(item.method, item.filename, item.label)}
+                        disabled={personalEnsembleFilenames.has(item.filename)}
+                        className={`text-[11px] px-2 py-1.5 rounded-md border transition-colors ${
+                          personalEnsembleFilenames.has(item.filename)
+                            ? 'text-violet-400 border-violet-500/40 cursor-default'
+                            : 'text-violet-300/80 border-violet-500/30 hover:text-violet-200 hover:border-violet-400/60'
+                        }`}
+                        title={personalEnsembleFilenames.has(item.filename) ? 'Вже у вашому ансамблі' : 'Додати до мого ансамблю'}
+                      >
+                        {personalEnsembleFilenames.has(item.filename) ? '✓' : '+ ансамбль'}
+                      </button>
                       {(isAdmin || item.added_by === activeProfile?.name) && (
                         <button
                           onClick={() => removeCatalogModel(item.id)}
@@ -569,6 +622,18 @@ export function ModelBrowserPage() {
                         Завантажити
                       </button>
                     )}
+                    <button
+                      onClick={() => addToPersonalEnsemble(method, entry.filename, entry.label)}
+                      disabled={personalEnsembleFilenames.has(entry.filename)}
+                      className={`text-[11px] px-2 py-1.5 rounded-md border transition-colors ${
+                        personalEnsembleFilenames.has(entry.filename)
+                          ? 'text-violet-400 border-violet-500/40 cursor-default'
+                          : 'text-violet-300/80 border-violet-500/30 hover:text-violet-200 hover:border-violet-400/60'
+                      }`}
+                      title={personalEnsembleFilenames.has(entry.filename) ? 'Вже у вашому ансамблі' : 'Додати до мого ансамблю'}
+                    >
+                      {personalEnsembleFilenames.has(entry.filename) ? '✓' : '+ ансамбль'}
+                    </button>
                   </div>
                 </div>
               )
@@ -584,9 +649,21 @@ export function ModelBrowserPage() {
             onClick={(e) => e.stopPropagation()}
           >
             {detail.kind === 'registry' ? (
-              <RegistryDetail entry={detail.entry} ratings={ratingsFor(detail.entry.filename).all} onClose={() => setDetail(null)} />
+              <RegistryDetail
+                entry={detail.entry}
+                ratings={ratingsFor(detail.entry.filename).all}
+                description={descriptionFor(detail.entry.filename)}
+                onSaveDescription={(text) => saveDescription(detail.entry.filename, text)}
+                onClose={() => setDetail(null)}
+              />
             ) : (
-              <CatalogDetail item={detail.item} ratings={ratingsFor(detail.item.filename).all} onClose={() => setDetail(null)} />
+              <CatalogDetail
+                item={detail.item}
+                ratings={ratingsFor(detail.item.filename).all}
+                description={descriptionFor(detail.item.filename)}
+                onSaveDescription={(text) => saveDescription(detail.item.filename, text)}
+                onClose={() => setDetail(null)}
+              />
             )}
           </div>
         </div>
@@ -620,7 +697,13 @@ function RatingsBreakdown({ ratings }: { ratings: ModelRating[] }) {
   )
 }
 
-function RegistryDetail({ entry, ratings, onClose }: { entry: RegistryEntry; ratings: ModelRating[]; onClose: () => void }) {
+function RegistryDetail({
+  entry, ratings, description, onSaveDescription, onClose,
+}: {
+  entry: RegistryEntry; ratings: ModelRating[]
+  description: ModelDescription | null; onSaveDescription: (text: string) => Promise<void>
+  onClose: () => void
+}) {
   return (
     <>
       <div className="flex items-start justify-between gap-3">
@@ -636,6 +719,7 @@ function RegistryDetail({ entry, ratings, onClose }: { entry: RegistryEntry; rat
         />
         <DetailRow label="Стеми" value={entry.stems.length ? entry.stems.join(', ') : '—'} />
       </div>
+      <ModelDescriptionEditor description={description} onSave={onSaveDescription} />
       <div>
         <div className="text-[11px] font-semibold text-rh-text-dim mb-1.5">Оцінки студії</div>
         <RatingsBreakdown ratings={ratings} />
@@ -644,7 +728,13 @@ function RegistryDetail({ entry, ratings, onClose }: { entry: RegistryEntry; rat
   )
 }
 
-function CatalogDetail({ item, ratings, onClose }: { item: CatalogModel; ratings: ModelRating[]; onClose: () => void }) {
+function CatalogDetail({
+  item, ratings, description, onSaveDescription, onClose,
+}: {
+  item: CatalogModel; ratings: ModelRating[]
+  description: ModelDescription | null; onSaveDescription: (text: string) => Promise<void>
+  onClose: () => void
+}) {
   return (
     <>
       <div className="flex items-start justify-between gap-3">
@@ -668,11 +758,86 @@ function CatalogDetail({ item, ratings, onClose }: { item: CatalogModel; ratings
           <div className="text-xs text-rh-text-dim">{item.notes}</div>
         </div>
       )}
+      <ModelDescriptionEditor description={description} onSave={onSaveDescription} />
       <div>
         <div className="text-[11px] font-semibold text-rh-text-dim mb-1.5">Оцінки студії</div>
         <RatingsBreakdown ratings={ratings} />
       </div>
     </>
+  )
+}
+
+// Shared, editable-by-anyone "в чому ця модель краща/гірша" note (see
+// backend's /models/descriptions) — a single studio-wide value per
+// filename, last-write-wins, not a per-user comment thread. Starts in
+// read/empty state; clicking in switches to an editable textarea.
+function ModelDescriptionEditor({
+  description, onSave,
+}: { description: ModelDescription | null; onSave: (text: string) => Promise<void> }) {
+  const [editing, setEditing] = useState(false)
+  const [text, setText] = useState(description?.description ?? '')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!editing) setText(description?.description ?? '')
+  }, [description, editing])
+
+  async function save() {
+    setSaving(true)
+    setError(null)
+    try {
+      await onSave(text.trim())
+      setEditing(false)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Не вдалося зберегти опис')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1.5">
+        <div className="text-[11px] font-semibold text-rh-text-dim">Опис — в чому краща/гірша</div>
+        {!editing && (
+          <button onClick={() => setEditing(true)} className="text-[11px] text-rh-accent hover:underline">
+            {description?.description ? 'Редагувати' : '+ Додати опис'}
+          </button>
+        )}
+      </div>
+      {editing ? (
+        <div className="flex flex-col gap-1.5">
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            autoFocus
+            rows={4}
+            placeholder="Наприклад: чистіший результат на високих частотах, але повільніша за Kim Vocal 2…"
+            className="rh-input text-[12px] resize-y"
+          />
+          {error && <span className="text-[11px] text-[#FF6B70]">{error}</span>}
+          <div className="flex gap-2 self-end">
+            <button onClick={() => { setEditing(false); setText(description?.description ?? '') }} className="rh-btn-ghost text-[11px] px-2.5 py-1">
+              Скасувати
+            </button>
+            <button onClick={save} disabled={saving} className="rh-btn-primary text-[11px] px-2.5 py-1">
+              {saving ? <Spinner size={11} /> : null}
+              Зберегти
+            </button>
+          </div>
+        </div>
+      ) : description?.description ? (
+        <>
+          <p className="text-xs text-rh-text-dim whitespace-pre-line leading-relaxed">{description.description}</p>
+          <div className="text-[10px] text-rh-muted mt-1">
+            {description.updated_by} · {new Date(description.updated_at).toLocaleString()}
+          </div>
+        </>
+      ) : (
+        <p className="text-[11px] text-rh-muted">Ще ніхто не залишив опис.</p>
+      )}
+    </div>
   )
 }
 

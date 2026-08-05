@@ -40,3 +40,17 @@ CREATE TABLE IF NOT EXISTS model_ratings (
   created_at TEXT NOT NULL,
   PRIMARY KEY (method, filename, profile_name)
 );
+
+-- Free-text "pros/cons" note per model, shared studio-wide and editable by
+-- ANY profile (unlike ratings, which are per-profile) — a single
+-- last-write-wins row per filename, not a moderated history. Filename alone,
+-- same identity reasoning as idx_models_filename above and covering BOTH
+-- registry models and catalog models (this table is keyed independently of
+-- the `models` table's own id, since registry models have no row there at
+-- all).
+CREATE TABLE IF NOT EXISTS model_descriptions (
+  filename TEXT PRIMARY KEY,
+  description TEXT NOT NULL,
+  updated_by TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);

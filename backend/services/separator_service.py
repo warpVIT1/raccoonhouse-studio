@@ -364,6 +364,32 @@ APEX_MODELS_DEFAULT: list[tuple[str, str, str]] = [
 ]
 
 
+PERSONAL_ENSEMBLE_METHOD = "МійАнсамбль"
+
+
+def _load_personal_ensemble_models(profile_id: Optional[int]) -> list[tuple[str, str, str]]:
+    """Reads ONE profile's own "Мій ансамбль" line-up — unlike Апекс, never
+    seeded with a default: an empty result here means this profile hasn't
+    picked anything yet (see routers/separation_models.py, which the frontend
+    surfaces as "add models to run this")."""
+    if not profile_id:
+        return []
+    from ..database import SessionLocal
+    from ..models import PersonalEnsembleModel
+
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(PersonalEnsembleModel)
+            .filter_by(profile_id=profile_id)
+            .order_by(PersonalEnsembleModel.id)
+            .all()
+        )
+        return [(r.label, r.filename, r.arch) for r in rows]
+    finally:
+        db.close()
+
+
 def _load_apex_models() -> list[tuple[str, str, str]]:
     """Reads Апекс's current line-up from the DB, seeding it from
     APEX_MODELS_DEFAULT on first use if the table is still empty. A short-
@@ -1182,6 +1208,7 @@ def separate_file(
     params: Optional[dict] = None,  # {"mdx"|"vr"|"demucs"|"mdxc": {...}} — see MODEL_ARCH
     on_progress=None,  # Optional[Callable[[int, str], None]] — no DB/job coupling
     is_cancelled=None,  # Optional[Callable[[], bool]]
+    profile_id: Optional[int] = None,  # only consulted for PERSONAL_ENSEMBLE_METHOD — see _load_personal_ensemble_models
 ) -> str:
     """Core separation routine, independent of any Episode/DB — used both for
     local jobs (run_separation below) and for power-shared jobs run on a peer
@@ -1216,6 +1243,12 @@ def separate_file(
         # does for the generic Ensemble Mode above. Line-up is DB-backed
         # (live-editable), not the hardcoded default — see _load_apex_models.
         jobs = _load_apex_models()
+    elif model_name == PERSONAL_ENSEMBLE_METHOD:
+        jobs = _load_personal_ensemble_models(profile_id)
+        if not jobs:
+            raise RuntimeError(
+                "Мій ансамбль порожній — додайте моделі у Браузері моделей перед запуском"
+            )
     else:
         # A specific-checkpoint override only applies to this single-method
         # path — ensemble/Апекс always run their own fixed model set.
@@ -1547,11 +1580,15 @@ def run_separation(
         ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
         output_dir = ep_dir / "stems"
 
+        settings = db.get(AppSettings, 1)
+        profile_id = settings.active_profile_id if settings else None
+
         with _report_separation_run(episode_id, model_name, ensemble, distributed=False):
             try:
                 stems = separate_file(
                     audio_path, str(output_dir), model_name, ensemble, model_file=model_file, params=params,
                     on_progress=reporter.update, is_cancelled=lambda: reporter.cancelled,
+                    profile_id=profile_id,
                 )
             except Exception:
                 app_logger.exception("run_separation: separate_file failed for episode %s", episode_id)

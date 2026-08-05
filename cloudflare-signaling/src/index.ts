@@ -245,6 +245,19 @@ interface ModelRating {
   created_at: string;
 }
 
+// Free-text "what's this model good/bad at" note, shared studio-wide and
+// editable by anyone (unlike ratings, which are per-profile) — keyed by
+// filename alone, same reasoning as the models table's own unique index
+// (see schema.sql): the same physical checkpoint is one model regardless of
+// which method tab it's browsed under. A plain last-write-wins overwrite,
+// not a history/diff — this is a shared note, not a moderated wiki.
+interface ModelDescription {
+  filename: string;
+  description: string;
+  updated_by: string;
+  updated_at: string;
+}
+
 const SUPPORTED_METHODS = ["MDX-Net", "VR Arch", "Demucs", "MDX23C", "BS-RoFormer"] as const;
 const SUPPORTED_ARCHS = ["mdx", "vr", "demucs", "mdxc"] as const;
 
@@ -626,6 +639,39 @@ export default {
       }
       await env.MODELS_DB.prepare("DELETE FROM model_ratings WHERE method = ? AND filename = ?").bind(method, filename).run();
       return new Response(null, { status: 204 });
+    }
+
+    if (url.pathname === "/model-descriptions" && request.method === "PUT") {
+      const body = await request.json().catch(() => null) as Partial<ModelDescription> | null;
+      if (
+        !body ||
+        typeof body.filename !== "string" ||
+        typeof body.description !== "string" ||
+        typeof body.updated_by !== "string"
+      ) {
+        return new Response("filename, description, updated_by are required", { status: 400 });
+      }
+      const item: ModelDescription = {
+        filename: body.filename.slice(0, 255),
+        // Generous but bounded — this is a short "pros/cons" note, not a
+        // free-form document; without a cap, D1's own row-size limits would
+        // be the only thing stopping an unbounded paste.
+        description: body.description.slice(0, 4000),
+        updated_by: body.updated_by.slice(0, 100),
+        updated_at: new Date().toISOString(),
+      };
+      await env.MODELS_DB.prepare(
+        `INSERT INTO model_descriptions (filename, description, updated_by, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(filename)
+         DO UPDATE SET description = excluded.description, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+      ).bind(item.filename, item.description, item.updated_by, item.updated_at).run();
+      return Response.json(item);
+    }
+
+    if (url.pathname === "/model-descriptions" && request.method === "GET") {
+      const { results } = await env.MODELS_DB.prepare("SELECT * FROM model_descriptions").all<ModelDescription>();
+      return Response.json(results);
     }
 
     // Model Browser catalog — models added by hand or via the AI

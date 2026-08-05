@@ -296,6 +296,22 @@ class ApexModelOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class PersonalEnsembleModelCreate(BaseModel):
+    method: str
+    label: str
+    filename: str
+
+
+class PersonalEnsembleModelOut(BaseModel):
+    id: int
+    method: str
+    label: str
+    filename: str
+    arch: str
+
+    model_config = {"from_attributes": True}
+
+
 class ModelChoiceOut(BaseModel):
     label: str
     file: str
@@ -353,6 +369,17 @@ class ModelRatingOut(BaseModel):
     rating: int
 
     model_config = {"from_attributes": True}
+
+
+class ModelDescriptionIn(BaseModel):
+    description: str
+
+
+class ModelDescriptionOut(BaseModel):
+    filename: str
+    description: str
+    updated_by: str
+    updated_at: str
 
 
 class AdminUnlockRequest(BaseModel):

@@ -52,6 +52,18 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       const onTime = () => {
         setCurrentTime(v.currentTime)
         onTimeUpdate(v.currentTime)
+        // Two independently-`.play()`-ed HTMLMediaElements (this <video> and
+        // the instrumental <audio>) aren't guaranteed to stay locked step —
+        // small decode/buffering differences accumulate over real playback
+        // time, not just around seeks. Only re-syncing on 'seeked' (below)
+        // left the instrumental audibly racing ahead of the seek bar during
+        // plain uninterrupted playback (confirmed live). Correcting on every
+        // timeupdate tick, but only past a small tolerance, fixes the drift
+        // without audibly stuttering the instrumental on every frame.
+        const a = vocalAudioRef.current
+        if (a && Math.abs(a.currentTime - v.currentTime) > 0.2) {
+          a.currentTime = v.currentTime
+        }
       }
       const onDur = () => {
         setDuration(v.duration)

@@ -2,11 +2,21 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import ApexModel
-from ..schemas import ApexModelCreate, ApexModelOut, ModelsOut, RegistryEntryOut
+from ..models import AppSettings, ApexModel, PersonalEnsembleModel, Profile
+from ..schemas import (
+    ApexModelCreate, ApexModelOut, ModelsOut, RegistryEntryOut,
+    PersonalEnsembleModelCreate, PersonalEnsembleModelOut,
+)
 from ..services import separator_service
 
 router = APIRouter(prefix="/models", tags=["models"])
+
+
+def _active_profile(db: Session) -> "Profile | None":
+    settings = db.get(AppSettings, 1)
+    if not settings or not settings.active_profile_id:
+        return None
+    return db.get(Profile, settings.active_profile_id)
 
 
 @router.get("", response_model=ModelsOut)
@@ -95,4 +105,79 @@ def delete_apex_model(model_id: int, db: Session = Depends(get_db)):
     db.delete(row)
     db.commit()
     separator_service.push_apex_models_to_worker(db)
+    return {"ok": True}
+
+
+# --- "Мій ансамбль" — personal, per-profile, local-only (no Worker sync,
+# unlike Апекс above) and starts EMPTY for every profile: the point is each
+# person choosing their own set, not sharing one curated studio-wide list. ---
+
+@router.get("/personal-ensemble", response_model=list[PersonalEnsembleModelOut])
+def get_personal_ensemble(db: Session = Depends(get_db)):
+    profile = _active_profile(db)
+    if not profile:
+        return []
+    return (
+        db.query(PersonalEnsembleModel)
+        .filter_by(profile_id=profile.id)
+        .order_by(PersonalEnsembleModel.id)
+        .all()
+    )
+
+
+@router.post("/personal-ensemble", response_model=PersonalEnsembleModelOut)
+def add_personal_ensemble_model(body: PersonalEnsembleModelCreate, db: Session = Depends(get_db)):
+    profile = _active_profile(db)
+    if not profile:
+        raise HTTPException(400, "Оберіть профіль")
+    if body.method not in separator_service.MODEL_CHOICES:
+        raise HTTPException(400, f"Невідомий метод: {body.method}")
+    label = body.label.strip()
+    filename = body.filename.strip()
+    if not label or not filename:
+        raise HTTPException(400, "Вкажіть назву і файл моделі")
+
+    if (
+        db.query(PersonalEnsembleModel)
+        .filter_by(profile_id=profile.id, filename=filename)
+        .first()
+    ):
+        raise HTTPException(400, "Ця модель вже у вашому ансамблі")
+
+    found, looks_vocal, stems = separator_service.check_registry_model(body.method, filename)
+    is_downloaded_custom = filename in separator_service.downloaded_model_filenames()
+    if not found and not is_downloaded_custom:
+        raise HTTPException(
+            400,
+            f"Файл '{filename}' не знайдено в реєстрі audio-separator для методу {body.method} — "
+            "перевірте точну назву файлу (з розширенням).",
+        )
+    if found and not looks_vocal:
+        raise HTTPException(
+            400,
+            f"Ця модель не розділяє вокал/інструментал (її стеми: {', '.join(stems)}) — "
+            "вона призначена для іншої задачі (наприклад, прибирання луни/шуму/ревербу). "
+            "Оберіть модель, що дає стеми vocals/instrumental.",
+        )
+
+    row = PersonalEnsembleModel(
+        profile_id=profile.id, method=body.method, label=label, filename=filename,
+        arch=separator_service.MODEL_ARCH[body.method],
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@router.delete("/personal-ensemble/{model_id}")
+def delete_personal_ensemble_model(model_id: int, db: Session = Depends(get_db)):
+    profile = _active_profile(db)
+    if not profile:
+        raise HTTPException(400, "Оберіть профіль")
+    row = db.get(PersonalEnsembleModel, model_id)
+    if not row or row.profile_id != profile.id:
+        raise HTTPException(404, "Не знайдено")
+    db.delete(row)
+    db.commit()
     return {"ok": True}

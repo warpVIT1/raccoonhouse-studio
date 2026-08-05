@@ -9,6 +9,7 @@ import { MarkersTab } from './workspace/MarkersTab'
 import { Spinner } from './ui/Spinner'
 import { VocalSeparationModal, type SeparationModel, type SeparationParams } from './VocalSeparationModal'
 import type { Episode, SubtitleLine, Marker, Character, Dubber, JobStatus } from '../types'
+import { playRaccoonChirp } from '../utils/notificationSound'
 
 type WorkspaceTab = 'subtitles' | 'markers'
 
@@ -133,6 +134,19 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
       if (job.status !== 'complete') continue
       if (handledJobIdsRef.current.has(job.id)) continue
       handledJobIdsRef.current.add(job.id)
+
+      // A separation run can take anywhere from under a minute to well over
+      // ten (see the batch/custom-model progress investigation elsewhere
+      // this session) — a short sound cue means the user doesn't have to
+      // keep glancing back at the tab to notice it finished.
+      if (
+        job.type === 'separate_vocals' ||
+        job.type === 'batch_separate_vocals' ||
+        job.type === 'distributed_separate_vocals' ||
+        job.type === 'request_remote_separation'
+      ) {
+        playRaccoonChirp()
+      }
 
       // Batch mode deliberately never touches the episode's own fields (see
       // separate_file_batch's docstring) — its N separate FLAC files have no

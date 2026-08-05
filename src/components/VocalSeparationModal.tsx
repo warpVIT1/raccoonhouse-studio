@@ -3,23 +3,26 @@ import { Spinner } from './ui/Spinner'
 import { Toggle } from './ui/Toggle'
 import { useApi } from '../hooks/useApi'
 import { useBackdropClose } from '../hooks/useBackdropClose'
-import type { ApexModelItem, AppSettings, ModelsConfig } from '../types'
+import type { ApexModelItem, AppSettings, ModelsConfig, PersonalEnsembleModelItem } from '../types'
 
-// "Апекс" is a 6th, ensemble-only pseudo-method — no checkpoint dropdown or
-// per-architecture advanced settings of its own (see isApex below and
-// backend's APEX_MODELS_DEFAULT in services/separator_service.py for the
-// seed line-up). The actual line-up is DB-backed and live-editable from
-// this modal (see the apexModels state below) — no rebuild needed to change it.
-export const SEPARATION_MODELS = ['MDX-Net', 'VR Arch', 'Demucs', 'MDX23C', 'BS-RoFormer', 'Апекс'] as const
+// "Апекс" and "МійАнсамбль" are both ensemble-only pseudo-methods — no
+// checkpoint dropdown or per-architecture advanced settings of their own
+// (see isApex/isPersonal below). Апекс's line-up is DB-backed and shared
+// studio-wide (admin-curated, see backend's APEX_MODELS_DEFAULT); МійАнсамбль
+// is the same idea but per-profile and local-only, starting empty — anyone
+// picks their own models for it (added from the Model Browser), not just
+// an admin (see backend's PersonalEnsembleModel).
+export const SEPARATION_MODELS = ['MDX-Net', 'VR Arch', 'Demucs', 'MDX23C', 'BS-RoFormer', 'Апекс', 'МійАнсамбль'] as const
 export type SeparationModel = typeof SEPARATION_MODELS[number]
 
 type Arch = 'mdx' | 'vr' | 'demucs' | 'mdxc'
 
 // MDX23C and BS-RoFormer are both "mdxc" architecture models in
 // audio-separator — same advanced-settings shape, matching backend's
-// MODEL_ARCH in services/separator_service.py. "Апекс" never actually reads
-// this (its advanced-settings/model-select UI is hidden entirely, see
-// isApex below) — the entry only exists to satisfy the Record's type.
+// MODEL_ARCH in services/separator_service.py. "Апекс"/"МійАнсамбль" never
+// actually read this (their advanced-settings/model-select UI is hidden
+// entirely, see isApex/isPersonal below) — the entries only exist to
+// satisfy the Record's type.
 const MODEL_ARCH: Record<SeparationModel, Arch> = {
   'MDX-Net': 'mdx',
   'VR Arch': 'vr',
@@ -27,6 +30,7 @@ const MODEL_ARCH: Record<SeparationModel, Arch> = {
   MDX23C: 'mdxc',
   'BS-RoFormer': 'mdxc',
   Апекс: 'mdxc',
+  МійАнсамбль: 'mdxc',
 }
 
 function extractApiError(e: unknown, fallback: string): string {
@@ -204,6 +208,30 @@ export function VocalSeparationModal({
     }
   }
 
+  // "Мій ансамбль" — same DB-backed live-editable idea as Апекс above, but
+  // per-profile and local (see backend's PersonalEnsembleModel) and starts
+  // empty for everyone: models are added from the Model Browser (click a
+  // model → "+ до мого ансамблю"), not typed in here — this modal only
+  // shows the current pick and lets you remove one.
+  const isPersonal = model === 'МійАнсамбль'
+  const [personalModels, setPersonalModels] = useState<PersonalEnsembleModelItem[] | null>(null)
+  const [personalError, setPersonalError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!isPersonal || personalModels !== null) return
+    get<PersonalEnsembleModelItem[]>('/models/personal-ensemble').then(setPersonalModels).catch(() => {})
+  }, [isPersonal, personalModels, get])
+
+  async function removePersonalModel(id: number) {
+    try {
+      await del(`/models/personal-ensemble/${id}`)
+      const refreshed = await get<PersonalEnsembleModelItem[]>('/models/personal-ensemble')
+      setPersonalModels(refreshed)
+    } catch (e) {
+      setPersonalError(extractApiError(e, 'Не вдалося видалити модель'))
+    }
+  }
+
   function toggleRequestPower(checked: boolean) {
     setRequestPowerMode(checked)
     if (checked) setDistributedMode(false)
@@ -228,7 +256,7 @@ export function VocalSeparationModal({
   // path below and drops back into the regular per-method view, so every
   // other piece of run logic (buildParams, handleRunClick) needs no changes.
   const [showOwnModels, setShowOwnModels] = useState(false)
-  const ownModels = SEPARATION_MODELS.filter((m) => m !== 'Апекс').flatMap((m) =>
+  const ownModels = SEPARATION_MODELS.filter((m) => m !== 'Апекс' && m !== 'МійАнсамбль').flatMap((m) =>
     (modelsConfig?.choices[m] ?? []).filter((c) => c.custom).map((c) => ({ method: m, ...c }))
   )
 
@@ -239,8 +267,11 @@ export function VocalSeparationModal({
     // predominantly mdxc-architecture (BS-Roformer/MDX23C/MelBand — only
     // Kim Vocal 2 in the line-up is mdx) and its cleanup pass is mdxc too
     // (see backend's _apex_cleanup_pass), so the mdxc segment/overlap
-    // controls below apply meaningfully to it and are sent through.
-    if (ensemble) return undefined
+    // controls below apply meaningfully to it and are sent through. Мій
+    // ансамбль can mix any architecture (it's whatever the person picked),
+    // so — like the generic Ensemble Mode — it just uses each model's own
+    // library defaults rather than one settings panel pretending to fit all.
+    if (ensemble || isPersonal) return undefined
     if (isApex) return { mdxc }
     if (arch === 'mdx') return { mdx }
     if (arch === 'vr') return { vr }
@@ -254,7 +285,7 @@ export function VocalSeparationModal({
   // switched on — like flipping a switch rather than picking from several
   // separate buttons that each did something different.
   function handleRunClick() {
-    const file = ensemble || isApex ? undefined : modelFile
+    const file = ensemble || isApex || isPersonal ? undefined : modelFile
     if (batchMode) { onRunBatch(); return }
     if (distributedMode) { onRunDistributed(model, ensemble, file, buildParams()); return }
     if (requestPowerMode) { onRequestPower(model, ensemble, file, buildParams()); return }
@@ -287,27 +318,36 @@ export function VocalSeparationModal({
         {/* Method picker */}
         <div className="flex flex-col gap-2">
           <span className="text-xs text-rh-muted">Метод</span>
-          <div className="grid grid-cols-7 gap-1.5">
+          <div className="grid grid-cols-3 gap-1.5">
             {SEPARATION_MODELS.map((m) => {
               const isApexButton = m === 'Апекс'
+              const isPersonalButton = m === 'МійАнсамбль'
               const active = model === m && !ensemble && !showOwnModels
               return (
                 <button
                   key={m}
                   onClick={() => { setShowOwnModels(false); selectMethod(m) }}
                   disabled={ensemble}
-                  title={isApexButton ? 'Кураторський ансамбль найсильніших моделей — для максимально чистого результату' : undefined}
+                  title={
+                    isApexButton ? 'Кураторський ансамбль найсильніших моделей — для максимально чистого результату'
+                    : isPersonalButton ? 'Ваш власний ансамбль — оберіть моделі у Браузері моделей'
+                    : undefined
+                  }
                   className={`px-2 py-2 rounded-lg text-xs font-medium transition-colors border
                     ${active
                       ? isApexButton
                         ? 'bg-gradient-to-br from-amber-400 to-amber-600 text-black border-amber-400'
+                        : isPersonalButton
+                        ? 'bg-gradient-to-br from-violet-500 to-violet-700 text-white border-violet-500'
                         : 'bg-rh-accent text-white border-rh-accent'
                       : isApexButton
                         ? 'text-amber-400 border-amber-500/40 hover:text-amber-300 hover:border-amber-400/60'
+                        : isPersonalButton
+                        ? 'text-violet-400 border-violet-500/40 hover:text-violet-300 hover:border-violet-400/60'
                         : 'text-rh-muted border-rh-border hover:text-rh-text hover:border-rh-border2'}
                     ${ensemble ? 'opacity-40 cursor-not-allowed' : ''}`}
                 >
-                  {isApexButton ? '★ Апекс' : m}
+                  {isApexButton ? '★ Апекс' : isPersonalButton ? '☆ Мій ансамбль' : m}
                 </button>
               )
             })}
@@ -391,7 +431,7 @@ export function VocalSeparationModal({
                     value={apexMethod}
                     onChange={(e) => setApexMethod(e.target.value as SeparationModel)}
                   >
-                    {SEPARATION_MODELS.filter((m) => m !== 'Апекс').map((m) => <option key={m} value={m}>{m}</option>)}
+                    {SEPARATION_MODELS.filter((m) => m !== 'Апекс' && m !== 'МійАнсамбль').map((m) => <option key={m} value={m}>{m}</option>)}
                   </select>
                   <input
                     value={apexLabel}
@@ -418,7 +458,42 @@ export function VocalSeparationModal({
               )}
             </div>
           )}
-          {!ensemble && !isApex && !showOwnModels && (
+
+          {isPersonal && !ensemble && (
+            <div className="flex flex-col gap-1.5 border border-violet-500/30 rounded-lg px-2.5 py-2 bg-violet-500/5">
+              {personalModels === null && (
+                <div className="flex justify-center py-2"><Spinner size={12} className="text-violet-400" /></div>
+              )}
+
+              {personalModels && personalModels.length === 0 && (
+                <p className="text-[11px] text-violet-200/70 leading-snug">
+                  Ще порожньо — відкрийте Браузер моделей і додайте моделі до свого ансамблю
+                  (кнопка «+ до мого ансамблю» на картці моделі).
+                </p>
+              )}
+
+              {personalModels && personalModels.length > 0 && (
+                <div className="flex flex-col gap-1">
+                  {personalModels.map((m) => (
+                    <div key={m.id} className="flex items-center gap-2 text-[11px] text-violet-100/80">
+                      <span className="truncate flex-1">{m.label}</span>
+                      <span className="text-[10px] text-violet-400/60 flex-shrink-0">{m.method}</span>
+                      <span className="font-mono text-violet-100/50 truncate max-w-[140px]">{m.filename}</span>
+                      <button
+                        onClick={() => removePersonalModel(m.id)}
+                        className="text-violet-100/50 hover:text-[#FF6B70] flex-shrink-0"
+                        title="Прибрати зі свого ансамблю"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {personalError && <span className="text-[11px] text-[#FF6B70]">{personalError}</span>}
+            </div>
+          )}
+          {!ensemble && !isApex && !isPersonal && !showOwnModels && (
             <Field label="Модель" hint="Конкретний чекпоінт цього методу — впливає на якість і швидкість.">
               <select className="rh-input" value={modelFile} onChange={(e) => setModelFile(e.target.value)}>
                 {modelChoices.map((c) => (
@@ -437,7 +512,7 @@ export function VocalSeparationModal({
             // ensembles — switching one on while Апекс is selected would
             // otherwise silently run the generic ensemble instead, ignoring
             // the Апекс pick with no visible explanation.
-            onChange={(v) => { setEnsemble(v); if (v && isApex) setModel(SEPARATION_MODELS[0]) }}
+            onChange={(v) => { setEnsemble(v); if (v && (isApex || isPersonal)) setModel(SEPARATION_MODELS[0]) }}
             className="mt-1"
             label="Ensemble Mode — запустити всі 5 методів і усереднити результат (повільніше, типові моделі й налаштування для кожного)"
           />
@@ -446,7 +521,11 @@ export function VocalSeparationModal({
             onChange={setBatchMode}
             label="Пакетний рендер — запустити всі 5 методів, кожен результат окремим файлом (без усереднення)"
           />
-          {powerShareEnabled && (
+          {/* Мій ансамбль is per-profile and purely local (see backend's
+              PersonalEnsembleModel) — a peer machine has no access to it, so
+              power-share/distributed modes are hidden while it's selected
+              rather than failing confusingly mid-job. */}
+          {powerShareEnabled && !isPersonal && (
             <>
               <Toggle
                 checked={requestPowerMode}
@@ -466,7 +545,7 @@ export function VocalSeparationModal({
             into the mdxc branch below (MODEL_ARCH['Апекс'] = 'mdxc') since
             its line-up and cleanup pass are predominantly mdxc — see
             buildParams' comment. */}
-        {!ensemble && (
+        {!ensemble && !isPersonal && (
           <div className="border-t border-rh-border pt-4 flex flex-col gap-3">
             <span className="text-xs text-rh-muted">Розширені налаштування ({model})</span>
             {isApex && (

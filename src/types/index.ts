@@ -213,6 +213,21 @@ export interface ApexModelItem {
   arch: string
 }
 
+export interface ModelDescription {
+  filename: string
+  description: string
+  updated_by: string
+  updated_at: string
+}
+
+export interface PersonalEnsembleModelItem {
+  id: number
+  method: string
+  label: string
+  filename: string
+  arch: string
+}
+
 export interface RegistryEntry {
   label: string
   filename: string

@@ -8,6 +8,8 @@ from ..database import get_db
 from ..models import AppSettings, ModelRating, Profile
 from ..schemas import (
     ModelConfirmRequest,
+    ModelDescriptionIn,
+    ModelDescriptionOut,
     ModelDownloadRequest,
     ModelRatingIn,
     ModelRatingOut,
@@ -213,3 +215,25 @@ def rate_model(body: ModelRatingIn, db: Session = Depends(get_db)):
         "rating": row.rating,
     })
     return row
+
+
+@router.get("/descriptions", response_model=list[ModelDescriptionOut])
+def get_model_descriptions():
+    # No local cache table — unlike ratings, this is a single shared value
+    # per filename (not per-profile), so there's nothing to reconcile
+    # locally; read straight through to the Worker each time the Browser
+    # loads a method's list.
+    return discovery_service.list_model_descriptions()
+
+
+@router.put("/descriptions/{filename}", response_model=ModelDescriptionOut)
+def set_model_description(filename: str, body: ModelDescriptionIn, db: Session = Depends(get_db)):
+    # Editable by ANYONE, not just admins or whoever added the model —
+    # explicitly requested as a shared, community-maintained note (unlike
+    # the catalog entry itself, which only its adder or an admin can remove).
+    profile = _active_profile(db)
+    updated_by = profile.name if profile else "Анонім"
+    try:
+        return discovery_service.submit_model_description(filename, body.description, updated_by)
+    except Exception as e:
+        raise HTTPException(502, f"Не вдалося зберегти опис: {e}")

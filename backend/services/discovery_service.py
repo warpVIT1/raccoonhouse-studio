@@ -357,6 +357,37 @@ def list_model_ratings() -> list[dict]:
         return []
 
 
+def submit_model_description(filename: str, description: str, updated_by: str) -> dict:
+    """Shared, editable-by-anyone "pros/cons" note for one model (see
+    /model-descriptions PUT in the Worker) — unlike ratings, raises on
+    failure rather than being best-effort: the caller is a deliberate save
+    action (a click on "Зберегти"), and the person needs to know if it
+    didn't actually save, not have it silently no-op."""
+    base = get_https_base()
+    if not base:
+        raise ValueError("Онлайн-сигналізація не налаштована — вкажіть URL сервера у Налаштуваннях")
+    resp = requests.put(f"{base}/model-descriptions", json={
+        "filename": filename, "description": description, "updated_by": updated_by,
+    }, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def list_model_descriptions() -> list[dict]:
+    """[] when unreachable/unconfigured — same reasoning as
+    list_model_ratings: a supplementary feature shouldn't hard-fail the
+    whole Model Browser panel."""
+    base = get_https_base()
+    if not base:
+        return []
+    try:
+        resp = requests.get(f"{base}/model-descriptions", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return []
+
+
 # --- Model Browser catalog (models added via "add by URL", stored server-
 # side in the Worker's D1 database rather than any per-install SQLite — see
 # cloudflare-signaling/schema.sql and routers/model_browser.py) ---

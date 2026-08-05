@@ -234,6 +234,25 @@ class ApexModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class PersonalEnsembleModel(Base):
+    """One profile's own "Мій ансамбль" line-up — same shape as ApexModel,
+    but scoped to profile_id and starting EMPTY for every profile (no
+    seeding, unlike Апекс's APEX_MODELS_DEFAULT) since the point is each
+    person picking their own set rather than everyone sharing the admin's
+    curated one. Purely local to this install/profile, never synced through
+    the Worker — Апекс is the shared, studio-wide ensemble; this is the
+    personal one."""
+    __tablename__ = "personal_ensemble_models"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    profile_id: Mapped[int] = mapped_column(Integer, ForeignKey("profiles.id"), nullable=False)
+    method: Mapped[str] = mapped_column(String(32), nullable=False)
+    label: Mapped[str] = mapped_column(String(255), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    arch: Mapped[str] = mapped_column(String(16), nullable=False)  # "mdx" | "vr" | "demucs" | "mdxc"
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+
 class ModelRating(Base):
     """One profile's 1-5 star opinion on one registry model (see the Model
     Browser — routers/model_browser.py). One row per (method, filename,

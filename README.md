@@ -43,7 +43,7 @@
 
 1. Завантажте останній інсталятор зі сторінки
    [Releases](https://github.com/warpVIT1/raccoonhouse-studio/releases) —
-   файл виду `RaccoonHouse Studio Setup <версія>.exe`.
+   файл виду `RaccoonHouse Studio Setup.exe`, або натисни на бейджик.
 2. Запустіть його. Установлення відбувається в теку користувача (не
    `Program Files`), тож права адміністратора не потрібні.
 3. Готово — застосунок сам себе запускає після встановлення.

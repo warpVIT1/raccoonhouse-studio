@@ -405,38 +405,48 @@ def push_actor_audio_fix_markers(submission_id: int, db: Session) -> None:
     _notify_team(ep.title.team_id, device_id)
 
 
-def delete_shared_title(shared_id: str, team_id: str, device_id: str) -> None:
+def delete_shared_title(shared_id: str, team_id: str, device_id: str, strict: bool = False) -> bool:
     """Permanent cloud-side delete (see the Worker's DELETE /shared-titles/:id) —
     unlike a plain local delete, this one does NOT come back on the next
-    pull_and_merge. Only called when routers/titles.py's delete_title is
-    explicitly asked for a permanent delete, not on every local title
-    removal (see that function's own docstring for why the resilient
-    default exists at all)."""
+    pull_and_merge... as long as it actually succeeded. `strict=True`
+    (routers/titles.py's permanent-delete path) returns False instead of
+    swallowing a failure — confirmed live 2026-09-09 as a real bug: the
+    caller used to delete the LOCAL row unconditionally regardless of
+    whether this cloud call worked, so a transient failure here (network
+    hiccup, a momentary D1 error, signaling not configured) left the
+    cloud-authoritative row alive with no local row to match it — exactly
+    what the next pull_and_merge treats as "a title I don't have yet,"
+    resurrecting it. `strict=False` keeps the old best-effort behavior for
+    any other caller that doesn't gate a local delete on this."""
     base = discovery_service.get_https_base()
     if not base:
-        return
+        if strict:
+            return False
+        return True
     try:
         requests.delete(f"{base}/shared-titles/{shared_id}", timeout=15).raise_for_status()
     except Exception:
         logger.exception("delete_shared_title: failed for shared_id %s", shared_id)
-        return
+        return not strict
     _notify_team(team_id, device_id)
+    return True
 
 
-def delete_shared_episode(shared_id: str, team_id: str, device_id: str) -> None:
+def delete_shared_episode(shared_id: str, team_id: str, device_id: str, strict: bool = False) -> bool:
     """Permanent cloud-side delete of one episode (see the Worker's DELETE
     /shared-episodes/:id) — same posture as delete_shared_title, just one
-    level down. Only called when routers/episodes.py's delete_episode is
-    explicitly asked for a permanent delete."""
+    level down, including the same strict-mode fix (see that function's
+    own comment for the "deleted, but it came back" bug this closes)."""
     base = discovery_service.get_https_base()
     if not base:
-        return
+        return not strict
     try:
         requests.delete(f"{base}/shared-episodes/{shared_id}", timeout=15).raise_for_status()
     except Exception:
         logger.exception("delete_shared_episode: failed for shared_id %s", shared_id)
-        return
+        return not strict
     _notify_team(team_id, device_id)
+    return True
 
 
 def push_episode(episode_id: int, db: Session) -> None:

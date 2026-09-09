@@ -345,16 +345,17 @@ async def delete_episode(ep_id: int, permanent: bool = False, db: Session = Depe
         if not profile_name or not team_service.can_manage_team(team_id, profile_name):
             raise HTTPException(403, "Лише адмін команди або адмін програми може видаляти серію назавжди")
 
+        # Cloud delete FIRST — see sync_service.delete_shared_title's own
+        # comment for the "deleted, but it came back" bug this fixes (same
+        # pattern, one level down).
+        from ..services import device_identity_service, sync_service
+        device_id = device_identity_service.get_profile_id(profile_name)
+        if not sync_service.delete_shared_episode(shared_id, team_id, device_id, strict=True):
+            raise HTTPException(502, "Не вдалося видалити серію у хмарі — спробуйте ще раз")
+
     db.delete(ep)
     db.commit()
     delete_episode_files(ep_id)
-
-    if permanent and shared_id and team_id:
-        from ..services import device_identity_service, sync_service
-        profile_name = _active_profile_name(db)
-        if profile_name:
-            device_id = device_identity_service.get_profile_id(profile_name)
-            sync_service.delete_shared_episode(shared_id, team_id, device_id)
 
     # Cancel any job still running for this episode (e.g. an ffmpeg import in
     # progress) and tell the frontend so it stops showing a stale percent for

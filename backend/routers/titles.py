@@ -152,17 +152,27 @@ def delete_title(title_id: int, permanent: bool = False, db: Session = Depends(g
         if not profile_name or not team_service.can_manage_team(team_id, profile_name):
             raise HTTPException(403, "Лише адмін команди або адмін програми може видаляти спільний тайтл назавжди")
 
+        # Cloud delete FIRST, local delete only after it actually succeeds —
+        # confirmed live 2026-09-09 as a real "deleted title keeps coming
+        # back" bug: this used to delete the local row unconditionally,
+        # THEN best-effort try the cloud delete (silently swallowing any
+        # failure — network hiccup, transient D1 error, offline
+        # signaling). The local copy would already be gone, but the
+        # cloud-authoritative shared_titles row survived, so the very next
+        # pull_and_merge found no matching local row and recreated it —
+        # same "silently downgrades" trap the comment above already
+        # guards against for the permission check, just for a network
+        # failure instead of a denied permission.
+        from ..services import device_identity_service, sync_service
+        device_id = device_identity_service.get_profile_id(profile_name)
+        if not sync_service.delete_shared_title(shared_id, team_id, device_id, strict=True):
+            raise HTTPException(502, "Не вдалося видалити тайтл у хмарі — спробуйте ще раз")
+
     episode_ids = [row[0] for row in db.query(Episode.id).filter(Episode.title_id == title_id).all()]
     db.delete(title)
     db.commit()
     for ep_id in episode_ids:
         delete_episode_files(ep_id)
-    if permanent and shared_id and team_id:
-        from ..services import device_identity_service, sync_service
-        profile_name = _active_profile_name(db)
-        if profile_name:
-            device_id = device_identity_service.get_profile_id(profile_name)
-            sync_service.delete_shared_title(shared_id, team_id, device_id)
 
 
 def _require_team_manager(title: Title, db: Session) -> None:

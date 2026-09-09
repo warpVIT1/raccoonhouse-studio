@@ -1,19 +1,24 @@
 import React, { useEffect, useState } from 'react'
 import { Spinner } from './ui/Spinner'
 import { useApi } from '../hooks/useApi'
+import { MiniMarkdown } from '../utils/miniMarkdown'
 
 interface UpdateState {
   status: string
   version?: string
   percent?: number
   message?: string
+  releaseNotes?: string
 }
 
 interface UpdatePanelProps {
   isAdmin?: boolean
+  // See PowerSharePanel's identical prop — SettingsPage's tabbed layout
+  // puts this panel alone in its own pane now, not stacked below others.
+  noTopMargin?: boolean
 }
 
-export function UpdatePanel({ isAdmin }: UpdatePanelProps) {
+export function UpdatePanel({ isAdmin, noTopMargin }: UpdatePanelProps) {
   const [state, setState] = useState<UpdateState>({ status: 'idle' })
   const available = Boolean(window.electronAPI?.onUpdateStatus)
   const { post } = useApi()
@@ -71,7 +76,7 @@ export function UpdatePanel({ isAdmin }: UpdatePanelProps) {
   })()
 
   return (
-    <div className="bg-rh-card border border-rh-border rounded-2xl overflow-hidden mt-5">
+    <div className={`bg-rh-card border border-rh-border rounded-2xl overflow-hidden ${noTopMargin ? '' : 'mt-5'}`}>
       <div className="flex items-center gap-3 py-3.5 px-4">
         <div className="flex-1">
           <div className="text-[12.5px] font-bold">Оновлення</div>
@@ -96,6 +101,12 @@ export function UpdatePanel({ isAdmin }: UpdatePanelProps) {
           </button>
         )}
       </div>
+      {state.releaseNotes && (state.status === 'available' || state.status === 'downloading' || state.status === 'downloaded') && (
+        <MiniMarkdown
+          text={state.releaseNotes}
+          className="text-[11px] text-rh-text-dim leading-relaxed flex flex-col gap-1 px-4 pb-3.5 border-t border-rh-border/70 pt-3"
+        />
+      )}
       {isAdmin && (
         <div className="flex items-center gap-3 py-3 px-4 border-t border-rh-border/70">
           <div className="flex-1">

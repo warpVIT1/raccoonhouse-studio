@@ -17,7 +17,7 @@ from ..schemas import (
     RegistryEntryOut,
 )
 from .. import job_manager
-from ..services import discovery_service, separator_service
+from ..services import discovery_service, separator_service, team_service
 
 router = APIRouter(prefix="/models", tags=["model-browser"])
 
@@ -156,7 +156,7 @@ def delete_catalog_entry(model_id: str, db: Session = Depends(get_db)):
         raise HTTPException(403, "Оберіть профіль")
 
     model = discovery_service.get_browsable_model(model_id)
-    if not profile.is_admin and (not model or model.get("added_by") != profile.name):
+    if not team_service.is_admin_profile(profile) and (not model or model.get("added_by") != profile.name):
         raise HTTPException(403, "Можна видаляти лише моделі, які додали ви самі")
 
     discovery_service.delete_browsable_model(model_id)

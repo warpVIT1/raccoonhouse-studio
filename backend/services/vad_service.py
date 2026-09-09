@@ -185,6 +185,10 @@ def _run_marker_detection(
     ep.status = "marked"
     db.commit()
 
+    if ep.title.shared_id:
+        from .sync_service import push_markers
+        push_markers(episode_id, db)
+
     reporter.update(100, f"Розміщено {len(new_markers)} маркерів")
     return {"marker_count": len(new_markers)}
 

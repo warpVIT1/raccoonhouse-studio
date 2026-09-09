@@ -17,8 +17,11 @@ interface Window {
     getBackendPort: () => Promise<number>
     getAppVersion: () => Promise<string>
     openPath: (path: string) => Promise<void>
+    saveFileToChosenFolder: (sourcePath: string) => Promise<string | null>
     openExternal: (url: string) => Promise<void>
     platform: string
+    openTelegramLogin: (code: string) => Promise<void>
+    openTelegramChat: (username: string) => Promise<void>
     minimize: () => void
     maximize: () => void
     close: () => void

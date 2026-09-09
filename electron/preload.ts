@@ -7,8 +7,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getBackendPort: () => ipcRenderer.invoke('get:backendPort'),
   getAppVersion: () => ipcRenderer.invoke('get:appVersion'),
   openPath: (filePath: string) => ipcRenderer.invoke('shell:openPath', filePath),
+  // Prompts for a folder and copies a local file there — see
+  // electron/main.ts's fs:saveFileToChosenFolder. Returns the saved path,
+  // or null if the user cancelled the folder picker.
+  saveFileToChosenFolder: (sourcePath: string) => ipcRenderer.invoke('fs:saveFileToChosenFolder', sourcePath),
   openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url),
   platform: process.platform,
+
+  // Telegram login — see electron/main.ts's telegram-login:open handler.
+  openTelegramLogin: (code: string) => ipcRenderer.invoke('telegram-login:open', code),
+  // Opens a real Telegram chat with someone by username — see electron/main.ts's telegram:open-chat handler.
+  openTelegramChat: (username: string) => ipcRenderer.invoke('telegram:open-chat', username),
 
   // Window controls
   minimize: () => ipcRenderer.send('window:minimize'),

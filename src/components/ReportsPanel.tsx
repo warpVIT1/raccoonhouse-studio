@@ -12,12 +12,23 @@ import type { SeparationReport } from '../types'
 // THIS admin's own local time here, with whoever actually ran it own
 // timezone shown alongside for reference — the two can easily differ across
 // a distributed group.
-export function ReportsPanel() {
+interface ReportsPanelProps {
+  // SettingsPage's Admin tab stacks this below the version-publish card
+  // rather than under a chain of other Settings cards — see
+  // PowerSharePanel's identical prop for why this exists at all.
+  noTopMargin?: boolean
+}
+
+export function ReportsPanel({ noTopMargin }: ReportsPanelProps = {}) {
   const { get, del } = useApi()
   const [reports, setReports] = useState<SeparationReport[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [selected, setSelected] = useState<SeparationReport | null>(null)
   const backdrop = useBackdropClose(() => setSelected(null))
+  // Expanded by default (matches prior behavior) — an admin on a busy
+  // studio can accumulate dozens of these, so being able to fold the list
+  // away keeps it from permanently eating Settings scroll space.
+  const [collapsed, setCollapsed] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -48,16 +59,29 @@ export function ReportsPanel() {
   }
 
   return (
-    <div className="bg-rh-card border border-rh-border rounded-2xl overflow-hidden mt-5">
-      <div className="flex items-center gap-3 py-3.5 px-4 border-b border-rh-border/70">
+    <div className={`bg-rh-card border border-rh-border rounded-2xl overflow-hidden ${noTopMargin ? '' : 'mt-5'}`}>
+      <button
+        onClick={() => setCollapsed((v) => !v)}
+        className="w-full flex items-center gap-3 py-3.5 px-4 border-b border-rh-border/70 text-left hover:bg-white/[0.02] transition-colors"
+      >
         <div className="flex-1">
-          <div className="text-[12.5px] font-bold">Звіти про розділення (тільки для адміна)</div>
+          <div className="text-[12.5px] font-bold">
+            Звіти про розділення (тільки для адміна)
+            {reports && reports.length > 0 && <span className="text-rh-muted font-normal"> · {reports.length}</span>}
+          </div>
           <div className="font-mono text-[11px] text-rh-text-dim mt-0.5">
             Хто запускав, яка модель, скільки часу, чи були помилки, хто допомагав
           </div>
         </div>
-      </div>
+        <svg
+          width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+          className={`text-rh-muted flex-shrink-0 transition-transform ${collapsed ? '' : 'rotate-180'}`}
+        >
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
+      </button>
 
+      {!collapsed && (
       <div className="px-4 py-3 flex flex-col gap-2">
         {error && <div className="text-[11px] text-[#FF6B70]">{error}</div>}
         {reports === null && !error && (
@@ -109,6 +133,7 @@ export function ReportsPanel() {
           </div>
         ))}
       </div>
+      )}
 
       {selected && (
         <div

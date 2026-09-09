@@ -37,6 +37,7 @@ from ..database import SessionLocal
 from ..job_manager import ProgressReporter
 from .power_share_service import app_logger
 from .title_status import bump_title_in_progress
+from .mvsep_service import MVSEP_METHOD
 
 DATA_DIR = os.environ.get("RH_DATA_DIR", os.path.join(os.path.expanduser("~"), ".raccoonhouse"))
 
@@ -340,27 +341,43 @@ MODEL_ARCH = {
 # Unlike Ensemble Mode's "one default per broad method" (which includes VR
 # Arch/Demucs — older, bleedier architectures per the UVR/MVSEP community's
 # own architecture comparisons), this is a cross-architecture pick of
-# specifically the strongest verified models already in MODEL_CHOICES:
-# BS-Roformer's Viperx pair (praised in community writeups for NOT
-# misclassifying orchestral/ethnic instruments as vocals — relevant for
-# anime OSTs), MDX23C-InstVoc HQ and Kim Vocal 2 for architecture diversity
-# (the community's own advice is that cross-architecture ensembles reduce
-# redundant artifacts better than averaging near-identical model families),
-# and MelBand Roformer Kim FT 3 to round it out. Each tuple is
-# (display label, exact registry filename, architecture kwarg key).
+# specifically the strongest verified models already in MODEL_CHOICES.
+# Re-picked 2026-08-09 by reading audio-separator's own registry scores
+# directly (Separator().list_supported_model_files(), not just community
+# writeups) and ranking by instrumental SDR among entries with an
+# unambiguous target_stem (excluding e.g. the many Gabox FV1-FV8 variants,
+# which ship with empty {} scores — untested, not just unlisted). Two of the
+# five previous picks got swapped out on that basis:
+#   - "MelBand Roformer Kim FT 3 (unwa)" had literally no published SDR at
+#     all (scores: {}) — replaced with "MelBand Roformer Kim | Inst V2 by
+#     Unwa" (instrumental SDR 16.06, target_stem='instrumental' explicitly).
+#   - "MDX23C-InstVoc HQ" (v1) — its "_2" sibling checkpoint scores
+#     marginally higher (15.92 vs 15.83 instrumental SDR) for the same
+#     architecture slot, so it replaced v1 outright.
+# BS-Roformer's Viperx pair stayed (16.45/16.31 instrumental SDR, the two
+# highest scores among unambiguous entries, and praised in community
+# writeups for NOT misclassifying orchestral/ethnic instruments as vocals —
+# relevant for anime OSTs) and Kim Vocal 2 stayed as the sole plain MDX-Net
+# entry — deliberately a different network family from the four MDXC/
+# Roformer picks, since cross-architecture ensembles reduce redundant
+# artifacts better than averaging near-identical model families (the whole
+# reason this list isn't just "the top 5 by SDR regardless of architecture").
+# Each tuple is (display label, exact registry filename, architecture kwarg key).
 #
 # This is only the SEED/fallback list — the actual line-up used at runtime
 # lives in the ApexModel DB table (see _load_apex_models below) so it can be
 # edited live from Settings, no rebuild+redeploy needed. Rename this if you
 # ever need to change the seed itself; existing installs that already seeded
-# their DB table won't be affected either way.
+# their DB table won't be affected either way — this specific re-pick was
+# ALSO pushed live via push_apex_models_to_worker so already-seeded installs
+# pick it up on their next Апекс panel open, not just fresh ones.
 APEX_METHOD = "Апекс"
 APEX_MODELS_DEFAULT: list[tuple[str, str, str]] = [
     ("BS-Roformer-Viperx-1297", "model_bs_roformer_ep_317_sdr_12.9755.ckpt", "mdxc"),
     ("BS-Roformer-Viperx-1296", "model_bs_roformer_ep_368_sdr_12.9628.ckpt", "mdxc"),
-    ("MDX23C-InstVoc HQ", "MDX23C-8KFFT-InstVoc_HQ.ckpt", "mdxc"),
+    ("MDX23C-InstVoc HQ 2", "MDX23C-8KFFT-InstVoc_HQ_2.ckpt", "mdxc"),
     ("Kim Vocal 2", "Kim_Vocal_2.onnx", "mdx"),
-    ("MelBand Roformer Kim FT 3 (unwa)", "mel_band_roformer_kim_ft3_unwa.ckpt", "mdxc"),
+    ("MelBand Roformer Kim Inst V2 (unwa)", "melband_roformer_inst_v2.ckpt", "mdxc"),
 ]
 
 
@@ -1235,6 +1252,33 @@ def separate_file(
 
     os.makedirs(output_dir, exist_ok=True)
 
+    if model_name == MVSEP_METHOD:
+        # Cloud separation via mvsep.com — none of the local audio-separator
+        # machinery below applies (no Separator() instance, no model file on
+        # disk). model_file carries "sep_type:add_opt1" (see MVSEP_MODEL_CHOICES
+        # in mvsep_service.py) rather than a checkpoint filename. Credits
+        # eligibility is checked by the CALLER (routers/episodes.py) before
+        # this ever runs — see team_service.is_credits_eligible — this
+        # function only re-checks the global kill-switch/token, via
+        # mvsep_service.run_separation itself.
+        from . import mvsep_service
+        sep_type, _, add_opt1 = (model_file or "").partition(":")
+        if not sep_type:
+            raise RuntimeError("Не вказано модель MVSep")
+        result = mvsep_service.run_separation(audio_path, sep_type, add_opt1, output_dir, on_progress=on_progress)
+        stems = {"vocal_stem_path": result["instrumental_path"], "vocal_only_stem_path": result["vocal_path"]}
+        # A multistem model (e.g. "BS Roformer SW") has more individual
+        # tracks (bass/drums/guitar/piano/other) than the two DB columns
+        # above have room for — Episode.vocal_stem_path only fits their SUM
+        # (see mvsep_service.run_separation's docstring). Every individual
+        # one is still on disk though, and this extra key rides along in
+        # job.result up through run_separation below (which returns `stems`
+        # unchanged) so the frontend can open the folder they landed in —
+        # the user asked for every track downloadable, not just the sum.
+        if result.get("extra_stems"):
+            stems["extra_stems"] = result["extra_stems"]
+        return stems
+
     if ensemble:
         jobs = [(method, MODEL_MAP[method], MODEL_ARCH[method]) for method in MODEL_MAP]
     elif model_name == APEX_METHOD:
@@ -1283,6 +1327,15 @@ def separate_file(
         except Exception:
             app_logger.exception("separate_file: failed to load model %s (file=%s)", mdl, uvr_model)
             raise
+
+        # Direct evidence of which device this specific model actually ran
+        # on — "CUDA available in torch" (logged once, at Separator() init)
+        # only says CUDA WAS offered to this instance, not that THIS
+        # particular model's own inference call actually landed on it.
+        # Added after a live report of a custom roformer model apparently
+        # running on CPU despite CUDA being detected — this removes the
+        # ambiguity for next time instead of inferring device from tqdm speed.
+        app_logger.info("separate_file: model %s using torch device=%s", mdl, getattr(sep, "torch_device", "?"))
 
         progress(base_pct + 15, f"нейромережа: ізоляція вокалу ({mdl})…")
 
@@ -1479,6 +1532,16 @@ def _active_profile_name(db) -> str:
     return "Анонім"
 
 
+def _active_device_id(db) -> "str | None":
+    settings = db.get(AppSettings, 1)
+    if settings and settings.active_profile_id:
+        profile = db.get(Profile, settings.active_profile_id)
+        if profile and profile.name.strip():
+            from . import device_identity_service
+            return device_identity_service.get_profile_id(profile.name.strip())
+    return None
+
+
 def _episode_label(db, episode_id: int) -> str:
     ep = db.get(Episode, episode_id)
     if not ep:
@@ -1540,6 +1603,7 @@ def _report_separation_run(episode_id: int, model_name: str, ensemble: bool, dis
             report = {
                 "id": str(uuid.uuid4()),
                 "profile_name": _active_profile_name(db),
+                "device_id": _active_device_id(db),
                 "user_timezone": _local_timezone_label(),
                 "episode_label": _episode_label(db, episode_id),
                 "model": model_name,
@@ -1555,6 +1619,165 @@ def _report_separation_run(episode_id: int, model_name: str, ensemble: bool, dis
         finally:
             db.close()
         _dispatch_report(report)
+
+
+HISTORY_MAX_AGE_HOURS = 48
+
+
+def _archive_previous_isolation(ep: "Episode", ep_dir: Path) -> None:
+    """Moves the CURRENT vocal_stem_path/vocal_only_stem_path into
+    stems/history/ instead of letting the next run_separation call silently
+    overwrite them — otherwise re-running isolation with a different model
+    left no way to go back and listen to (or restore) the previous result
+    (confirmed live: a real request to compare against an earlier isolation
+    after trying a different model). No-op if there's nothing there yet
+    (first-ever isolation for this episode)."""
+    if not ep.vocal_stem_path or not os.path.isfile(ep.vocal_stem_path):
+        return
+    history_dir = ep_dir / "stems" / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    label = _sanitize_filename(ep.last_separation_model or "модель")
+    ext = Path(ep.vocal_stem_path).suffix or ".wav"
+    dest = history_dir / f"{stamp}_{label}{ext}"
+    try:
+        shutil.move(ep.vocal_stem_path, dest)
+    except OSError:
+        app_logger.exception("_archive_previous_isolation: failed to archive %s", ep.vocal_stem_path)
+        return
+    if ep.vocal_only_stem_path and os.path.isfile(ep.vocal_only_stem_path):
+        only_ext = Path(ep.vocal_only_stem_path).suffix or ".wav"
+        dest_only = history_dir / f"{stamp}_{label}_only{only_ext}"
+        try:
+            shutil.move(ep.vocal_only_stem_path, dest_only)
+        except OSError:
+            pass
+
+
+def snapshot_current_into_history(ep: "Episode", ep_dir: Path) -> None:
+    """Copies the episode's CURRENT instrumental/vocal-only stems into
+    stems/history/ right after a fresh isolation completes — without this,
+    the very first isolation ever run for an episode never showed up in
+    "Історія ізоляцій" at all (confirmed live 2026-09-08: only the run
+    BEFORE the current one gets archived, by _archive_previous_isolation,
+    which only fires on the NEXT run replacing it — so a single isolation,
+    or the very first of several, was invisible in history until a second
+    run pushed it there). A copy, not a move — the current file stays put
+    as the episode's active stem; this just also makes it independently
+    browsable/restorable from the very moment it's produced."""
+    if not ep.vocal_stem_path or not os.path.isfile(ep.vocal_stem_path):
+        return
+    history_dir = ep_dir / "stems" / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    label = _sanitize_filename(ep.last_separation_model or "модель")
+    ext = Path(ep.vocal_stem_path).suffix or ".wav"
+    dest = history_dir / f"{stamp}_{label}{ext}"
+    try:
+        shutil.copy2(ep.vocal_stem_path, dest)
+    except OSError:
+        app_logger.exception("snapshot_current_into_history: failed to copy %s", ep.vocal_stem_path)
+        return
+    if ep.vocal_only_stem_path and os.path.isfile(ep.vocal_only_stem_path):
+        only_ext = Path(ep.vocal_only_stem_path).suffix or ".wav"
+        dest_only = history_dir / f"{stamp}_{label}_only{only_ext}"
+        try:
+            shutil.copy2(ep.vocal_only_stem_path, dest_only)
+        except OSError:
+            pass
+
+
+def list_separation_history(episode_id: int) -> list[dict]:
+    """Every archived past isolation for this episode, newest first — see
+    _archive_previous_isolation. Only the main instrumental half of each
+    archived pair is listed (the "_only" vocal-only counterpart is an
+    internal VAD input, not something to browse/listen to here)."""
+    history_dir = Path(DATA_DIR) / "episodes" / str(episode_id) / "stems" / "history"
+    if not history_dir.is_dir():
+        return []
+    items = []
+    for f in history_dir.iterdir():
+        if not f.is_file() or f.stem.endswith("_only"):
+            continue
+        parts = f.stem.split("_", 2)
+        if len(parts) < 3:
+            continue
+        date_part, time_part, label = parts
+        try:
+            created = datetime.strptime(f"{date_part}_{time_part}", "%Y%m%d_%H%M%S")
+        except ValueError:
+            continue
+        items.append({
+            "filename": f.name,
+            "path": str(f),
+            "model": label.replace("_", " "),
+            "created_at": created.isoformat(),
+        })
+    items.sort(key=lambda x: x["created_at"], reverse=True)
+    return items
+
+
+def restore_separation_history(episode_id: int, filename: str, db: Session) -> dict:
+    """Promotes a stems/history/ entry back to being the episode's current
+    instrumental (COPIES it — the history entry itself stays browsable) —
+    archives whatever's currently active first, same as a fresh isolation
+    run would, so restoring never loses the thing it replaces."""
+    ep = db.get(Episode, episode_id)
+    if not ep:
+        raise ValueError(f"Episode {episode_id} not found")
+    ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
+    history_dir = ep_dir / "stems" / "history"
+    src = history_dir / filename
+    if not src.is_file() or ".." in filename or "/" in filename or "\\" in filename:
+        raise ValueError("Файл історії не знайдено")
+
+    _archive_previous_isolation(ep, ep_dir)
+
+    output_dir = ep_dir / "stems"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dest = output_dir / ("vocal_isolated" + src.suffix)
+    shutil.copy2(src, dest)
+    ep.vocal_stem_path = str(dest)
+
+    only_src = history_dir / (src.stem + "_only" + src.suffix)
+    if only_src.is_file():
+        dest_only = output_dir / ("vocal_only" + src.suffix)
+        shutil.copy2(only_src, dest_only)
+        ep.vocal_only_stem_path = str(dest_only)
+    else:
+        ep.vocal_only_stem_path = None
+
+    parts = src.stem.split("_", 2)
+    ep.last_separation_model = parts[2].replace("_", " ") if len(parts) == 3 else "Історія"
+    ep.status = "vocal_isolated"
+    db.commit()
+    app_logger.info("restore_separation_history: episode %s restored from %s", episode_id, filename)
+    return {"vocal_stem_path": ep.vocal_stem_path, "vocal_only_stem_path": ep.vocal_only_stem_path}
+
+
+def cleanup_stale_separation_history() -> int:
+    """Deletes individual stems/history/ files older than
+    HISTORY_MAX_AGE_HOURS (48h) — unlike the batch-comparison library (one
+    folder created and discarded as a whole, see
+    cleanup_stale_batch_libraries), history entries accumulate one at a time
+    over an episode's entire working life, so each file's own age is
+    checked individually rather than the containing folder's."""
+    episodes_dir = Path(DATA_DIR) / "episodes"
+    if not episodes_dir.is_dir():
+        return 0
+    cutoff = time.time() - HISTORY_MAX_AGE_HOURS * 3600
+    removed = 0
+    for history_dir in episodes_dir.glob("*/stems/history"):
+        if not history_dir.is_dir():
+            continue
+        for f in history_dir.iterdir():
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except OSError:
+                continue
+    return removed
 
 
 def run_separation(
@@ -1583,6 +1806,9 @@ def run_separation(
         settings = db.get(AppSettings, 1)
         profile_id = settings.active_profile_id if settings else None
 
+        _archive_previous_isolation(ep, ep_dir)
+        db.commit()
+
         with _report_separation_run(episode_id, model_name, ensemble, distributed=False):
             try:
                 stems = separate_file(
@@ -1597,8 +1823,10 @@ def run_separation(
             reporter.update(95, "Оновлення БД…")
             ep.vocal_stem_path = stems["vocal_stem_path"]
             ep.vocal_only_stem_path = stems["vocal_only_stem_path"]
+            ep.last_separation_model = model_name
             ep.status = "vocal_isolated"
             bump_title_in_progress(db, ep.title_id)
+            snapshot_current_into_history(ep, ep_dir)
             db.commit()
             app_logger.info("run_separation: episode %s done, stems=%s", episode_id, stems)
 
@@ -1737,21 +1965,21 @@ def separate_file_batch(
     return results
 
 
-BATCH_LIBRARY_MAX_AGE_DAYS = 3
+BATCH_LIBRARY_MAX_AGE_HOURS = 48
 
 
 def cleanup_stale_batch_libraries() -> int:
     """Deletes any per-episode batch-separation folder (separate_file_batch's
     "every model, listen and pick" library) older than
-    BATCH_LIBRARY_MAX_AGE_DAYS — it's meant as a temporary A/B comparison
-    while deciding which model to render with, not permanent storage, and
-    every curated model's own FLAC output can add up to several GB per
-    episode across ~29 models. Called periodically from main.py's lifespan.
-    Returns how many episode libraries were removed."""
+    BATCH_LIBRARY_MAX_AGE_HOURS (48h) — it's meant as a temporary A/B
+    comparison while deciding which model to render with, not permanent
+    storage, and every curated model's own FLAC output can add up to
+    several GB per episode across ~29 models. Called periodically from
+    main.py's lifespan. Returns how many episode libraries were removed."""
     episodes_dir = Path(DATA_DIR) / "episodes"
     if not episodes_dir.is_dir():
         return 0
-    cutoff = time.time() - BATCH_LIBRARY_MAX_AGE_DAYS * 86400
+    cutoff = time.time() - BATCH_LIBRARY_MAX_AGE_HOURS * 3600
     removed = 0
     for batch_dir in episodes_dir.glob("*/stems/batch"):
         try:
@@ -1796,6 +2024,100 @@ def run_batch_separation(
 
         app_logger.info("run_batch_separation: episode %s done, output_dir=%s", episode_id, output_dir)
         return {"output_dir": str(output_dir), "models": results}
+    finally:
+        db.close()
+
+
+def run_mvsep_batch_separation(
+    episode_id: int,
+    audio_path: str,
+    models: list[dict],  # [{"label": str, "sepType": str, "addOpt1": str}, ...] — user-picked, capped at 5 in routers/episodes.py
+    reporter: ProgressReporter,
+    output_dir: Optional[str] = None,
+) -> dict:
+    """MVSep equivalent of run_batch_separation above — but unlike the local
+    batch (which always runs every free local model, no picking), MVSep
+    costs real studio credits per model run, so the caller explicitly picks
+    which ones to spend on rather than everything in MVSEP_CATEGORIES
+    running unattended. Runs strictly one at a time (MVSep itself only
+    allows 1 concurrent job per non-Premium account) and, like the local
+    batch, keeps every result as its own separate file — same
+    {"<label>": path} shape as separate_file_batch's `results`, so
+    use-batch-result's existing "path must be one of this job's own
+    recorded results" check in routers/episodes.py needs no changes."""
+    from . import mvsep_service
+
+    db = SessionLocal()
+    try:
+        ep = db.get(Episode, episode_id)
+        if not ep:
+            app_logger.error("run_mvsep_batch_separation: episode %s not found", episode_id)
+            raise ValueError(f"Episode {episode_id} not found")
+
+        if output_dir:
+            output_dir = Path(output_dir)
+        else:
+            ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
+            output_dir = ep_dir / "stems" / "batch"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        results: dict[str, str] = {}
+        total = len(models)
+        for idx, m in enumerate(models):
+            if reporter.cancelled:
+                raise RuntimeError("Скасовано")
+            label = m["label"]
+            slice_start = idx / total * 100
+            slice_end = (idx + 1) / total * 100
+
+            def progress(pct, msg, _start=slice_start, _end=slice_end, _label=label):
+                reporter.update(int(_start + (pct / 100) * (_end - _start)), f"[{_label}] {msg}")
+
+            model_dir = output_dir / _sanitize_filename(label)
+            result = mvsep_service.run_separation(
+                audio_path, m["sepType"], m.get("addOpt1", ""), str(model_dir), on_progress=progress,
+            )
+            dest = output_dir / f"{_sanitize_filename(label)}.wav"
+            shutil.copy2(result["instrumental_path"], dest)
+            results[f"MVSep — {label}"] = str(dest)
+
+        app_logger.info("run_mvsep_batch_separation: episode %s done, output_dir=%s", episode_id, output_dir)
+        return {"output_dir": str(output_dir), "models": results}
+    finally:
+        db.close()
+
+
+def run_mvsep_male_female_split(episode_id: int, reporter: ProgressReporter) -> dict:
+    """"Take a model, separate the vocal, then split THAT into male/female"
+    — the isolated-vocal-first requirement means this deliberately never
+    triggers a fresh vocal extraction itself: it reuses whatever
+    Episode.vocal_only_stem_path already holds from an earlier separation
+    run (local or MVSep, doesn't matter), the same way detect-markers in
+    routers/episodes.py does. This both avoids spending a second round of
+    MVSep credits re-isolating a vocal that already exists AND avoids
+    picking a base separation model on the caller's behalf — see
+    routers/episodes.py's mvsep-male-female endpoint for the "run a normal
+    separation first" error message when there's nothing to reuse yet.
+    Result files (one per stem MVSep returns, e.g. male/female) are saved
+    next to the episode's other stems but — like batch mode — never touch
+    any Episode column, since neither one alone IS the episode's vocal."""
+    from . import mvsep_service
+
+    db = SessionLocal()
+    try:
+        ep = db.get(Episode, episode_id)
+        if not ep:
+            app_logger.error("run_mvsep_male_female_split: episode %s not found", episode_id)
+            raise ValueError(f"Episode {episode_id} not found")
+        if not ep.vocal_only_stem_path or not os.path.isfile(ep.vocal_only_stem_path):
+            raise RuntimeError("Спочатку виконайте розділення вокалу — потрібен вже виділений вокал")
+
+        output_dir = Path(DATA_DIR) / "episodes" / str(episode_id) / "stems" / "male_female"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        result = mvsep_service.run_male_female_split(ep.vocal_only_stem_path, str(output_dir), on_progress=reporter.update)
+        app_logger.info("run_mvsep_male_female_split: episode %s done, files=%s", episode_id, list(result.keys()))
+        return {"output_dir": str(output_dir), "stems": result}
     finally:
         db.close()
 

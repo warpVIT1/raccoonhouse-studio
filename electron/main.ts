@@ -84,7 +84,13 @@ process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL
   ? path.join(APP_ROOT, 'public')
   : RENDERER_DIST
 
-const BACKEND_PORT = 8765
+// Overridable via RH_BACKEND_PORT so a second install directory can run
+// alongside the first without stealing its port — see
+// killAnyoneOnBackendPort()'s comment for why sharing one is otherwise
+// actively destructive, not just a conflict. Not exposed in Settings; this
+// is a dev/testing knob (simulating a second "studio PC" on one machine),
+// set by launching with the env var already in place, before the app reads it.
+const BACKEND_PORT = Number(process.env.RH_BACKEND_PORT) || 8765
 let backendProcess: ChildProcess | null = null
 let win: BrowserWindow | null = null
 
@@ -502,6 +508,13 @@ function createWindow() {
     win.webContents.openDevTools()
   } else {
     win.loadFile(path.join(RENDERER_DIST, 'index.html'))
+    // Opt-in DevTools for a packaged build (RH_DEBUG_DEVTOOLS=1) — for
+    // live-debugging a "nothing happened, no log entry at all" report
+    // straight from the renderer console, without needing a dev-mode
+    // rebuild just to see it.
+    if (process.env.RH_DEBUG_DEVTOOLS === '1') {
+      win.webContents.openDevTools({ mode: 'detach' })
+    }
   }
 }
 
@@ -509,6 +522,16 @@ function createWindow() {
 function sendUpdateStatus(status: string, extra?: Record<string, unknown>) {
   win?.webContents.send('update:status', { status, ...extra })
 }
+
+// Set once an update has actually finished downloading — before-quit uses
+// this to know whether the quit it's about to let through is "just closing
+// the app" (no backup needed) or "about to run the NSIS installer" (needs
+// the pre-update backup first). Covers both the explicit "Встановити"
+// click (update:install below) and autoInstallOnAppQuit's own implicit
+// install-on-normal-quit path, since both end up quitting through the same
+// before-quit handler.
+let updateDownloaded = false
+let preUpdateBackupDone = false
 
 const AUTO_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000 // 4 hours
 
@@ -542,10 +565,13 @@ function initAutoUpdater() {
   autoUpdater.on('update-not-available', () => sendUpdateStatus('not-available'))
   autoUpdater.on('error', (err) => sendUpdateStatus('error', { message: err.message }))
   autoUpdater.on('download-progress', (p) => sendUpdateStatus('downloading', { percent: Math.round(p.percent) }))
-  autoUpdater.on('update-downloaded', (info) => sendUpdateStatus('downloaded', {
-    version: info.version,
-    releaseNotes: formatReleaseNotes(info.releaseNotes),
-  }))
+  autoUpdater.on('update-downloaded', (info) => {
+    updateDownloaded = true
+    sendUpdateStatus('downloaded', {
+      version: info.version,
+      releaseNotes: formatReleaseNotes(info.releaseNotes),
+    })
+  })
 
   const check = () => autoUpdater.checkForUpdates().catch((err) => logLine('ERROR', 'updater', 'check failed', err))
   check()
@@ -594,17 +620,34 @@ async function checkForBetaAvailable() {
   try {
     const resp = await fetch(GITHUB_RELEASES_API)
     if (!resp.ok) return
-    const releases = (await resp.json()) as Array<{ tag_name: string; prerelease: boolean; html_url: string; body: string | null }>
-    const beta = releases.find((r) => r.prerelease)
+    const releases = (await resp.json()) as Array<{
+      tag_name: string; prerelease: boolean; draft: boolean; html_url: string; body: string | null; published_at: string | null
+    }>
+    const beta = releases.find((r) => r.prerelease && !r.draft)
     if (!beta) return
     const betaVersion = beta.tag_name.replace(/^v/, '')
-    if (isNewerVersion(betaVersion, currentVersion)) {
-      win?.webContents.send('update:beta-available', {
-        version: betaVersion,
-        url: beta.html_url,
-        notes: beta.body || '',
-      })
-    }
+
+    // Plain version-number comparison alone isn't safe here: this project's
+    // own versioning was reset downward once before (the 1.1.x line reset
+    // back to 1.0.0 — see "Let auto-update survive a future version-number
+    // reset"), which left old pre-reset betas like "1.1.8-beta" sitting on
+    // GitHub with a numerically HIGHER version than the current stable
+    // release despite being chronologically much older and irrelevant.
+    // Comparing publish dates against the release that actually matches
+    // what's currently installed is the real source of truth — falls back
+    // to the numeric check only if that release can't be found (e.g. it
+    // was deleted off GitHub).
+    const current = releases.find((r) => r.tag_name.replace(/^v/, '') === currentVersion)
+    const isActuallyNewer = current?.published_at && beta.published_at
+      ? new Date(beta.published_at) > new Date(current.published_at)
+      : isNewerVersion(betaVersion, currentVersion)
+    if (!isActuallyNewer) return
+
+    win?.webContents.send('update:beta-available', {
+      version: betaVersion,
+      url: beta.html_url,
+      notes: beta.body || '',
+    })
   } catch (err) {
     // Non-fatal by design — worst case, nobody sees the beta nudge this cycle.
     logLine('INFO', 'updater', 'beta check failed (non-fatal)', err)
@@ -627,14 +670,20 @@ ipcMain.handle('update:download', () => {
 })
 
 ipcMain.handle('update:install', () => {
-  // (isSilent, isForceRunAfter) — isSilent=true skips the NSIS installer's
-  // own wizard UI entirely (runs with the standard silent-install flag), so
-  // clicking this just closes the app, installs invisibly, and reopens it.
+  // (isSilent, isForceRunAfter) — isSilent=false lets the NSIS installer
+  // show its own window (progress bar, and on update runs it goes straight
+  // to installing rather than re-asking install location/shortcuts) instead
+  // of installing invisibly with zero feedback. Switched from true after a
+  // real production update silently hit a "couldn't delete old files"
+  // failure (a stray Explorer window had the install folder open) with no
+  // visible indication anything had even started — a visible install
+  // window at least shows progress and surfaces that kind of error as an
+  // actual dialog instead of the app just vanishing and never reopening.
   // Must count as a real quit even with background mode on — otherwise the
   // window's own close interception would just hide it instead of letting
   // the update actually install.
   isQuittingForReal = true
-  autoUpdater.quitAndInstall(true, true)
+  autoUpdater.quitAndInstall(false, true)
 })
 
 // Background mode (tray) — see the state/helpers declared above createWindow().
@@ -667,6 +716,23 @@ ipcMain.handle('dialog:openDirectory', async () => {
 ipcMain.handle('get:backendPort', () => BACKEND_PORT)
 ipcMain.handle('get:appVersion', () => app.getVersion())
 
+// Lets the user save an isolation result (current or from "Історія
+// ізоляцій") out of the app's own internal data/episodes/N/stems/ folder
+// to wherever they actually want it (e.g. handing off to a sound
+// engineer) — prompts for a destination folder, then copies the file
+// there under its original name. Windows' fs.renameSync throws EXDEV
+// across drive letters, so this always does a real copy, never a move —
+// irrelevant here anyway since the source must survive (it's still the
+// active/archived stem the app itself tracks).
+ipcMain.handle('fs:saveFileToChosenFolder', async (_event, sourcePath: string) => {
+  if (!win || !sourcePath || !fs.existsSync(sourcePath)) return null
+  const result = await dialog.showOpenDialog(win, { properties: ['openDirectory'] })
+  if (result.canceled || !result.filePaths[0]) return null
+  const destPath = path.join(result.filePaths[0], path.basename(sourcePath))
+  fs.copyFileSync(sourcePath, destPath)
+  return destPath
+})
+
 ipcMain.handle('shell:openExternal', async (_event, url: string) => {
   if (!/^https:\/\/github\.com\//.test(url)) return // only ever used for the beta-release-page link above
   await shell.openExternal(url)
@@ -674,6 +740,37 @@ ipcMain.handle('shell:openExternal', async (_event, url: string) => {
 
 ipcMain.handle('shell:openPath', async (_event, filePath: string) => {
   await shell.openPath(filePath)
+})
+
+// Telegram login — a bot deep-link (t.me/<bot>?start=<code>), handed
+// straight to the OS via shell.openExternal so it opens in the person's
+// own already-logged-in Telegram (desktop app if installed, else
+// web.telegram.org) — no embedded window, no phone-number re-entry, no
+// Chromium "this site wants to open an app" confirmation, since we're not
+// navigating a BrowserWindow into it at all. Telegram calls the Worker's
+// own webhook (cloudflare-signaling/src/index.ts's /telegram-bot/webhook)
+// the moment the person taps "START" in the resulting chat; the renderer
+// polls routers/profiles.py's /telegram-login/poll for the result exactly
+// the same way as any other background job in this app.
+ipcMain.handle('telegram-login:open', async (_event, code: string) => {
+  if (!/^[\w-]+$/.test(code)) return // only ever the opaque code this app itself generated
+  await shell.openExternal(`https://t.me/raccoonhouse_studio_bot?start=${encodeURIComponent(code)}`)
+})
+
+// Admin "База даних" tab's "Telegram ↗" button — opens a real chat with
+// someone for the admin to type into personally (see TeamsPage.tsx's
+// DatabaseTab). Needs its own dedicated shell.openExternal call rather than
+// plain window.open()/shell:openExternal: window.open goes through this
+// window's setWindowOpenHandler above, which unconditionally treats every
+// new-window request as a file download (right for transfer/:id links, but
+// downloads the raw HTML instead of opening anything for a normal webpage
+// like this — confirmed live 2026-08-18); shell:openExternal is
+// deliberately restricted to github.com only. Telegram usernames are
+// [a-zA-Z0-9_]{5,32} by Telegram's own rules, validated here before ever
+// reaching shell.openExternal.
+ipcMain.handle('telegram:open-chat', async (_event, username: string) => {
+  if (!/^\w{5,32}$/.test(username)) return
+  await shell.openExternal(`https://t.me/${username}`)
 })
 
 // Window controls
@@ -685,13 +782,68 @@ ipcMain.on('window:maximize', () => {
 ipcMain.on('window:close', () => win?.close())
 
 app.on('window-all-closed', () => {
-  stopBackend()
-  if (process.platform !== 'darwin') app.quit()
+  if (process.platform !== 'darwin') {
+    // Don't stopBackend() here — app.quit() below fires before-quit, which
+    // is the single place that decides whether a pre-update backup needs
+    // to run first and only stops the backend once that's settled. Killing
+    // it here instead would mean the most common quit path (closing the
+    // window) always hit an already-dead backend from before-quit's own
+    // POST /backup/create, silently skipping the backup every time.
+    app.quit()
+  } else {
+    stopBackend()
+  }
 })
 
-// Safety net: covers quit paths that don't go through window-all-closed
-// (e.g. Cmd+Q on macOS, or the app quitting itself for an update install).
-app.on('before-quit', () => stopBackend())
+// Backs up personal (non-team-shared) data to an external location right
+// before an update installs — see backend/services/backup_service.py.
+// Loops on "Спробувати ще раз" so the user can free disk space without
+// having to relaunch the update flow from scratch; "Пропустити і оновити"
+// proceeds with no automated cleanup, per the user's own explicit call.
+async function performPreUpdateBackup(): Promise<void> {
+  try {
+    const resp = await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/backup/create`, { method: 'POST' })
+    const result = await resp.json() as { ok: boolean; needed_bytes?: number; free_bytes?: number }
+    if (result.ok) return
+
+    const needed = result.needed_bytes ? (result.needed_bytes / 1024 / 1024).toFixed(1) : '?'
+    const free = result.free_bytes ? (result.free_bytes / 1024 / 1024).toFixed(1) : '?'
+    const choice = dialog.showMessageBoxSync({
+      type: 'warning',
+      title: 'Резервна копія',
+      message: `Не вдалося зробити резервну копію особистих даних перед оновленням.\nПотрібно: ${needed} МБ, вільно: ${free} МБ.\nЗвільніть місце на диску та спробуйте ще раз, або пропустіть цей крок.`,
+      buttons: ['Спробувати ще раз', 'Пропустити і оновити'],
+      defaultId: 0,
+      cancelId: 1,
+    })
+    if (choice === 0) return performPreUpdateBackup()
+  } catch (err) {
+    // Backend unreachable/already stopped, or any other unexpected failure
+    // — non-fatal, the update must still be able to proceed.
+    logLine('ERROR', 'backup', 'pre-update backup failed (non-fatal)', err)
+  }
+}
+
+// The single place that actually stops the backend — window-all-closed
+// above defers to this via app.quit() rather than stopping it directly, so
+// this also covers quit paths that never touch a window at all (Cmd+Q on
+// macOS, or the app quitting itself for an update install). When an update
+// is actually about to install (either via the explicit update:install
+// click or autoInstallOnAppQuit's own implicit path on a normal quit),
+// intercept once to run the backup first — with the backend still alive to
+// serve it — then let the quit proceed for real.
+app.on('before-quit', (event) => {
+  if (updateDownloaded && !preUpdateBackupDone) {
+    event.preventDefault()
+    performPreUpdateBackup().finally(() => {
+      preUpdateBackupDone = true
+      stopBackend()
+      app.quit()
+    })
+    return
+  }
+  stopBackend()
+})
 
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow()

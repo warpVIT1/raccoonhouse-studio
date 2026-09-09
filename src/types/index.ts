@@ -13,6 +13,9 @@ export interface Title {
   poster_path: string | null
   status: TitleStatus
   episode_count?: number
+  shared_id?: string | null
+  team_id?: string | null
+  team_name?: string | null
 }
 
 export interface Episode {
@@ -29,6 +32,14 @@ export interface Episode {
   created_at: string
   vocal_stem_path?: string | null
   subtitle_count?: number
+  subtitle_stage: string
+  actor_video_transfer_id?: string | null
+  remote_video_transfer_id?: string | null
+  original_filename?: string | null
+  cleaned_video_transfer_id?: string | null
+  cleaned_video_filename?: string | null
+  cleaned_video_uploaded_at?: string | null
+  shared_id?: string | null
 }
 
 export interface Character {
@@ -38,11 +49,24 @@ export interface Character {
   code: string | null
   dubber_id: number | null
   dubber_name?: string
+  team_device_id?: string | null
+}
+
+// A team member with the 'actor' role, as returned by GET /teams/{id}/actors
+// (mirrors the Worker's /team-actors — same source used for the Telegram
+// /notify-actors handoff). Feeds the subtitle grid's АКТОР dropdown.
+export interface TeamActor {
+  device_id: string
+  display_name: string
 }
 
 export interface Dubber {
   id: number
   name: string
+  // Explicit link to a local Profile (see backend Dubber.profile_id) —
+  // set once by a director/admin, lets the "actor" role workspace answer
+  // "which character is mine".
+  profile_id: number | null
 }
 
 export interface CharacterDubberMap {
@@ -61,6 +85,10 @@ export interface SubtitleLine {
   character_name?: string
   ass_style: string
   is_overlap: boolean
+  layer: number
+  margin_l: number
+  margin_r: number
+  margin_v: number
 }
 
 export interface Marker {
@@ -70,25 +98,109 @@ export interface Marker {
   position_seconds: number
   confirmed: boolean
   color?: string | null
+  character_id?: number | null
+}
+
+export interface ActorAudioSubmission {
+  id: number
+  episode_id: number
+  character_id: number | null
+  character_name: string | null
+  filename: string
+  transfer_id: string
+  uploaded_by_name: string
+  created_at: string
+  fix_requested_at?: string | null
+  fix_requested_by_role?: string | null
+  sent_to_sound_engineer_at?: string | null
+  fix_message?: string | null
+  fix_marker_count: number
+  fix_of_submission_id?: number | null
+  accepted_at?: string | null
+  accepted_by_name?: string | null
+}
+
+export interface ActorAudioFixMarker {
+  id: number
+  submission_id: number
+  label: string
+  position_seconds: number
+  color: string | null
 }
 
 export interface JobStatus {
   id: string
-  type: 'import_video' | 'import_video_remote' | 'separate_vocals' | 'batch_separate_vocals' | 'distributed_separate_vocals' | 'request_remote_separation' | 'detect_markers' | 'export_srt' | 'mux_audio' | 'request_remote_render' | 'install_gpu_runtime' | 'download_model'
+  type: 'import_video' | 'import_video_remote' | 'separate_vocals' | 'batch_separate_vocals' | 'distributed_separate_vocals' | 'request_remote_separation' | 'detect_markers' | 'export_srt' | 'mux_audio' | 'request_remote_render' | 'install_gpu_runtime' | 'download_model' | 'install_audio_separator_update' | 'mvsep_male_female' | 'export_actor_video' | 'submit_actor_audio' | 'download_original_video' | 'submit_cleaned_video' | 'generate_actor_reaper_project'
   status: 'pending' | 'running' | 'complete' | 'error' | 'cancelled'
   percent: number
   message: string
   episode_id?: number
   result?: Record<string, unknown>
+  filename?: string
+  fix_of_submission_id?: number
+  character_id?: number
 }
 
 export interface WsMessage {
-  type: 'progress' | 'complete' | 'error' | 'cancelled' | 'status' | 'power_share_request' | 'power_share_lending' | 'power_share_model_download_request' | 'power_share_borrowing' | 'force_update_request'
+  type: 'progress' | 'complete' | 'error' | 'cancelled' | 'status' | 'power_share_request' | 'power_share_lending' | 'power_share_model_download_request' | 'power_share_borrowing' | 'force_update_request' | 'team_invite' | 'shared_content_updated'
   job_id?: string
   percent?: number
   message?: string
   error?: string
   data?: Record<string, unknown>
+}
+
+export interface Team {
+  id: string
+  name: string
+  credits_enabled: number
+  created_by_device_id: string
+  created_at: string
+}
+
+export interface MyTeam extends Team {
+  is_team_admin: number
+}
+
+export interface TeamMember {
+  team_id: string
+  device_id: string
+  display_name: string
+  is_team_admin: number
+  joined_at: string
+}
+
+export interface TeamInvite {
+  id: string
+  team_id: string
+  team_name: string
+  created_at: string
+}
+
+export interface KnownUser {
+  device_id: string
+  display_name: string
+  teams: Array<{ team_id: string; team_name: string; is_team_admin: boolean }>
+  credits_enabled: boolean
+  // True when credits_enabled comes from being in a credits_enabled team
+  // (see team_service.all_known_users) — the manual per-person toggle is
+  // moot (and hidden) in that case, since it's already granted automatically.
+  credits_from_team: boolean
+  telegram_id: number | null
+  telegram_username?: string | null
+  roles?: string[]
+  first_seen_at?: string | null
+  last_seen_at?: string | null
+}
+
+export interface ErrorReport {
+  id: string
+  device_id?: string | null
+  profile_name: string
+  message: string
+  stack?: string | null
+  context: string
+  created_at: string
 }
 
 export interface SignStylesConfig {
@@ -118,11 +230,21 @@ export interface AppSettings {
   gpu_enabled: boolean
   gpu_available: boolean
   gpu_runtime_installed: boolean
+  audio_separator_version: string
+  audio_separator_update_version: string | null
+  beta_features_enabled: boolean
+  device_id: string
+  deepl_api_key: string | null
+  openai_api_key: string | null
+  gemini_api_key: string | null
+  sound_engineer_filename_template: string | null
+  backup_directory: string | null
 }
 
 export interface FeedbackItem {
   id: string
   nickname: string
+  device_id?: string | null
   message: string
   created_at: string
 }
@@ -130,6 +252,7 @@ export interface FeedbackItem {
 export interface SeparationReport {
   id: string
   profile_name: string
+  device_id?: string | null
   user_timezone: string
   episode_label: string
   model: string
@@ -148,11 +271,59 @@ export interface Profile {
   id: number
   name: string
   role: string
+  // Job-title roles (клінапер/звукорежисер/перекладач/режисер/актор and
+  // whatever an admin later adds — see RoleCatalogItem) — several at once,
+  // unlike the legacy `role` string above (which stays whatever it was set
+  // to, since it's also the unadvertised admin-unlock trigger).
+  roles: string[] | null
   color: string
   // Only ever true when set via ProfileModal's "type admin as your role"
   // password flow — see backend Profile.is_admin's comment for why this
   // lives per-profile rather than as a single install-wide flag.
   is_admin: boolean
+  // Whether this profile has its own optional password — never the hash
+  // itself. Set at creation, see ProfileModal's "Пароль" field.
+  has_password: boolean
+  // Telegram login — all null for a profile created the old manual way.
+  telegram_id: number | null
+  telegram_username: string | null
+  avatar_url: string | null
+}
+
+export interface RoleCatalogItem {
+  key: string
+  label: string
+  sort_order: number
+}
+
+export interface TitleRoleAssignment {
+  role: string
+  device_id: string
+  display_name: string
+}
+
+export interface EpisodeRoleDeadline {
+  role: string
+  character_id?: number | null
+  deadline?: string | null
+}
+
+export interface EpisodeRoleAssignment {
+  role: string
+  device_id: string
+  display_name: string
+}
+
+export interface EpisodeAdminPersonStatus {
+  role: string
+  character_id?: number | null
+  character_name?: string | null
+  device_id?: string | null
+  display_name?: string | null
+  status?: string | null
+  badges: Record<string, boolean>
+  progress?: string | null
+  deadline?: string | null
 }
 
 export interface PowerShareRequestPayload {

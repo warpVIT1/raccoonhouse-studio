@@ -6,7 +6,7 @@ import { TitleBadge } from './ui/Badge'
 import { Spinner } from './ui/Spinner'
 import { PosterSearch } from './PosterSearch'
 import { posterSrc } from '../lib/poster'
-import type { Title, TitleStatus, HikkaAnimeResult } from '../types'
+import type { Title, TitleStatus, HikkaAnimeResult, MyTeam } from '../types'
 
 const STATUS_FILTER_OPTIONS: Array<{ value: TitleStatus | 'all'; label: string }> = [
   { value: 'all', label: 'Всі' },
@@ -24,6 +24,7 @@ export function TitlesPage() {
   const { get, put, del } = useApi()
   const backendReady = useAppStore((s) => s.backendReady)
   const setSelectedTitle = useAppStore((s) => s.setSelectedTitle)
+  const sharedContentUpdatedAt = useAppStore((s) => s.sharedContentUpdatedAt)
 
   const [titles, setTitles] = useState<Title[]>([])
   const [loading, setLoading] = useState(false)
@@ -40,9 +41,17 @@ export function TitlesPage() {
       .finally(() => setLoading(false))
   }, [backendReady, get])
 
-  async function handleDeleteTitle(id: number) {
+  // A teammate's shared-title change was just pulled in locally (see
+  // backend discovery_service.py's "shared_content_updated" handling) —
+  // silently refetch, no window-switching or manual refresh needed.
+  useEffect(() => {
+    if (!backendReady || !sharedContentUpdatedAt) return
+    get<Title[]>('/titles').then(setTitles).catch(() => {})
+  }, [sharedContentUpdatedAt, backendReady, get])
+
+  async function handleDeleteTitle(id: number, permanent: boolean) {
     try {
-      await del(`/titles/${id}`)
+      await del(`/titles/${id}${permanent ? '?permanent=true' : ''}`)
       setTitles((prev) => prev.filter((t) => t.id !== id))
     } catch {
       // ignore
@@ -137,7 +146,7 @@ export function TitlesPage() {
                 key={title.id}
                 title={title}
                 onClick={() => setSelectedTitle(title.id)}
-                onDelete={() => handleDeleteTitle(title.id)}
+                onDelete={(permanent) => handleDeleteTitle(title.id, permanent)}
                 onStatusChange={(status) => handleStatusChange(title.id, status)}
               />
             ))}
@@ -161,12 +170,36 @@ export function TitlesPage() {
 interface TitleCardProps {
   title: Title
   onClick: () => void
-  onDelete: () => void
+  onDelete: (permanent: boolean) => void
   onStatusChange: (status: TitleStatus) => void
 }
 function TitleCard({ title, onClick, onDelete, onStatusChange }: TitleCardProps) {
+  const { get } = useApi()
   const [confirmingDelete, setConfirmingDelete] = useState(false)
   const [changingStatus, setChangingStatus] = useState(false)
+  // Only fetched lazily (on opening the delete confirm), and only matters
+  // for shared titles — gates whether "Видалити назавжди" even renders,
+  // same "hide, don't just block" posture as everywhere else (the backend
+  // enforces this too — see routers/titles.py's delete_title).
+  const [canDeletePermanently, setCanDeletePermanently] = useState(false)
+  useEffect(() => {
+    if (!confirmingDelete || !title.shared_id) return
+    get<{ can_delete_permanently: boolean }>(`/titles/${title.id}/can-delete-permanently`)
+      .then((r) => setCanDeletePermanently(r.can_delete_permanently))
+      .catch(() => setCanDeletePermanently(false))
+  }, [confirmingDelete, title.shared_id, title.id, get])
+
+  // Same permission as canDeletePermanently above (team admin or app admin)
+  // — reused here to gate the "Команда тайтлу" button, fetched eagerly
+  // (not lazily) since the button's very visibility depends on it.
+  const [canManageTeam, setCanManageTeam] = useState(false)
+  const [showTeamModal, setShowTeamModal] = useState(false)
+  useEffect(() => {
+    if (!title.shared_id) return
+    get<{ can_delete_permanently: boolean }>(`/titles/${title.id}/can-delete-permanently`)
+      .then((r) => setCanManageTeam(r.can_delete_permanently))
+      .catch(() => setCanManageTeam(false))
+  }, [title.shared_id, title.id, get])
 
   return (
     <div
@@ -202,16 +235,49 @@ function TitleCard({ title, onClick, onDelete, onStatusChange }: TitleCardProps)
           ✕
         </button>
 
+        {canManageTeam && (
+          <button
+            onClick={(e) => { e.stopPropagation(); setShowTeamModal(true) }}
+            className="absolute top-1.5 right-8 w-6 h-6 rounded-lg bg-black/60 backdrop-blur-sm text-white/80 hover:bg-rh-accent hover:text-white opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-xs"
+            title="Команда тайтлу"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/>
+            </svg>
+          </button>
+        )}
+
+        {showTeamModal && (
+          <div onClick={(e) => e.stopPropagation()}>
+            <TitleTeamModal title={title} onClose={() => setShowTeamModal(false)} />
+          </div>
+        )}
+
         {confirmingDelete && (
           <div
             onClick={(e) => e.stopPropagation()}
             className="absolute inset-0 bg-black/85 flex flex-col items-center justify-center gap-2 p-3 text-center"
           >
             <span className="text-xs text-white">Видалити «{title.name_ua}»?</span>
-            <div className="flex gap-2">
-              <button onClick={() => setConfirmingDelete(false)} className="rh-btn-ghost text-[11px] px-2 py-1">Скасувати</button>
-              <button onClick={onDelete} className="bg-rh-accent hover:bg-rh-accent-h text-white text-[11px] px-2 py-1 rounded-md font-semibold">Видалити</button>
-            </div>
+            {title.shared_id ? (
+              <>
+                <span className="text-[10px] text-rh-muted max-w-[180px]">
+                  Спільний з командою — просте видалення прибере його лише у вас, він повернеться при наступній синхронізації
+                </span>
+                <div className="flex flex-col gap-1.5 w-full">
+                  <button onClick={() => onDelete(false)} className="rh-btn-ghost text-[11px] px-2 py-1 w-full">Видалити лише в мене</button>
+                  {canDeletePermanently && (
+                    <button onClick={() => onDelete(true)} className="bg-rh-accent hover:bg-rh-accent-h text-white text-[11px] px-2 py-1 rounded-md font-semibold w-full">Видалити назавжди (у всієї команди)</button>
+                  )}
+                  <button onClick={() => setConfirmingDelete(false)} className="rh-btn-ghost text-[11px] px-2 py-1 w-full">Скасувати</button>
+                </div>
+              </>
+            ) : (
+              <div className="flex gap-2">
+                <button onClick={() => setConfirmingDelete(false)} className="rh-btn-ghost text-[11px] px-2 py-1">Скасувати</button>
+                <button onClick={() => onDelete(false)} className="bg-rh-accent hover:bg-rh-accent-h text-white text-[11px] px-2 py-1 rounded-md font-semibold">Видалити</button>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -222,11 +288,24 @@ function TitleCard({ title, onClick, onDelete, onStatusChange }: TitleCardProps)
           {title.name_ua}
         </div>
         <div className="text-xs text-rh-muted line-clamp-1">{title.name_original}</div>
+        {/* Which team, not just "shared" — someone can be in several
+            teams, so the icon alone doesn't say which one this title
+            belongs to (confirmed live 2026-08-18). */}
+        {title.team_name && (
+          <div className="text-[10px] text-rh-accent/80 line-clamp-1">{title.team_name}</div>
+        )}
         <div className="flex items-center justify-between mt-0.5 relative">
           <button onClick={(e) => { e.stopPropagation(); setChangingStatus((v) => !v) }} className="cursor-pointer">
             <TitleBadge status={title.status} />
           </button>
-          <span className="text-xs text-rh-muted">
+          <span className="text-xs text-rh-muted flex items-center gap-1">
+            {title.shared_id && (
+              <span title={title.team_name ? `Спільний з командою: ${title.team_name}` : 'Спільний з командою'}>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/>
+                </svg>
+              </span>
+            )}
             {title.episode_count ?? 0} еп.
           </span>
 
@@ -252,18 +331,120 @@ function TitleCard({ title, onClick, onDelete, onStatusChange }: TitleCardProps)
   )
 }
 
+interface TitleTeamModalProps {
+  title: Title
+  onClose: () => void
+}
+// "Команда тайтлу" — who currently holds each non-actor studio role
+// (director/translator/sound_engineer/...) for this title, see backend
+// routers/titles.py's role-assignments endpoints. Actor casting is
+// deliberately absent here — that's the director's own job via the
+// subtitle grid/Ролі tab's team-actor dropdown, untouched by this panel.
+// Only ever rendered for someone canManageTeam already gated true for
+// (see TitleCard), but the backend enforces the same check regardless.
+function TitleTeamModal({ title, onClose }: TitleTeamModalProps) {
+  const backdrop = useBackdropClose(onClose)
+  const { get, put } = useApi()
+  const [roles, setRoles] = useState<import('../types').RoleCatalogItem[]>([])
+  const [assignments, setAssignments] = useState<import('../types').TitleRoleAssignment[]>([])
+  const [teamMembersByRole, setTeamMembersByRole] = useState<Record<string, { device_id: string; display_name: string }[]>>({})
+  const [saving, setSaving] = useState<string | null>(null)
+
+  useEffect(() => {
+    get<import('../types').RoleCatalogItem[]>('/role-catalog').then((all) => {
+      const nonActor = all.filter((r) => r.key !== 'actor')
+      setRoles(nonActor)
+      if (!title.team_id) return
+      Promise.all(nonActor.map((r) =>
+        get<{ device_id: string; display_name: string }[]>(`/teams/${title.team_id}/actors?role=${r.key}`).catch(() => []),
+      )).then((lists) => {
+        const byRole: Record<string, { device_id: string; display_name: string }[]> = {}
+        nonActor.forEach((r, i) => { byRole[r.key] = lists[i] })
+        setTeamMembersByRole(byRole)
+      })
+    }).catch(() => {})
+    get<import('../types').TitleRoleAssignment[]>(`/titles/${title.id}/role-assignments`).then(setAssignments).catch(() => {})
+  }, [get, title.id, title.team_id])
+
+  async function assign(role: string, deviceId: string) {
+    setSaving(role)
+    try {
+      const member = (teamMembersByRole[role] ?? []).find((m) => m.device_id === deviceId)
+      const updated = await put<import('../types').TitleRoleAssignment | null>(
+        `/titles/${title.id}/role-assignments/${role}`,
+        { device_id: deviceId || null, display_name: member?.display_name ?? null },
+      )
+      setAssignments((prev) => {
+        const rest = prev.filter((a) => a.role !== role)
+        return updated ? [...rest, updated] : rest
+      })
+    } catch {
+      /* ignore — best-effort like every other admin action in this app */
+    } finally {
+      setSaving(null)
+    }
+  }
+
+  return (
+    <div {...backdrop} className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4">
+      <div className="bg-rh-card border border-rh-border rounded-2xl w-full max-w-md overflow-hidden">
+        <div className="px-4 py-3 border-b border-rh-border/70 flex items-center justify-between">
+          <div>
+            <div className="text-[13px] font-bold">Команда тайтлу</div>
+            <div className="text-[10.5px] text-rh-muted mt-0.5">{title.name_ua}</div>
+          </div>
+          <button onClick={onClose} className="text-rh-muted hover:text-white text-sm">✕</button>
+        </div>
+        <div className="flex flex-col">
+          {roles.map((role) => {
+            const current = assignments.find((a) => a.role === role.key)
+            const members = teamMembersByRole[role.key] ?? []
+            return (
+              <div key={role.key} className="flex items-center gap-2.5 px-4 py-2.5 border-b border-rh-border/50 last:border-b-0">
+                <span className="flex-1 text-[12px] text-rh-text-dim">{role.label}</span>
+                <select
+                  value={current?.device_id ?? ''}
+                  onChange={(e) => assign(role.key, e.target.value)}
+                  disabled={saving === role.key}
+                  className="w-44 bg-rh-bg border border-rh-border rounded-lg px-2 py-1 text-[11px]"
+                >
+                  <option value="">— не призначено —</option>
+                  {members.map((m) => (
+                    <option key={m.device_id} value={m.device_id}>{m.display_name}</option>
+                  ))}
+                </select>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 interface AddTitleModalProps {
   onClose: () => void
   onAdded: (title: Title) => void
 }
 function AddTitleModal({ onClose, onAdded }: AddTitleModalProps) {
   const backdrop = useBackdropClose(onClose)
-  const { post } = useApi()
+  const { get, post } = useApi()
   const backendReady = useAppStore((s) => s.backendReady)
   const [nameUa, setNameUa] = useState('')
   const [nameOrig, setNameOrig] = useState('')
   const [saving, setSaving] = useState(false)
   const [selectedPoster, setSelectedPoster] = useState<HikkaAnimeResult | null>(null)
+
+  // Only shown at all if the active profile is in at least one team — same
+  // "hide, don't just block" posture as every other team-gated UI piece.
+  // Auto-picks the team when there's exactly one; a picker only appears
+  // for someone in more than one.
+  const [myTeams, setMyTeams] = useState<MyTeam[]>([])
+  const [shareTeamId, setShareTeamId] = useState<string | null>(null)
+  useEffect(() => {
+    if (!backendReady) return
+    get<MyTeam[]>('/teams/mine').then(setMyTeams).catch(() => {})
+  }, [backendReady, get])
 
   async function handleSave() {
     if (!nameUa.trim()) return
@@ -274,6 +455,7 @@ function AddTitleModal({ onClose, onAdded }: AddTitleModalProps) {
           name_ua: nameUa.trim(),
           name_original: nameOrig.trim(),
           status: 'new',
+          team_id: shareTeamId,
         })
         if (selectedPoster?.image) {
           try {
@@ -339,6 +521,39 @@ function AddTitleModal({ onClose, onAdded }: AddTitleModalProps) {
             selected={selectedPoster}
             onSelect={setSelectedPoster}
           />
+          {myTeams.length > 0 && (
+            <div>
+              <label className="text-xs text-rh-muted mb-1 block">Видимість</label>
+              <div className="flex gap-1">
+                <button
+                  onClick={() => setShareTeamId(null)}
+                  className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${shareTeamId === null ? 'bg-rh-accent text-white' : 'text-rh-muted hover:text-rh-text hover:bg-white/5'}`}
+                >
+                  Особистий
+                </button>
+                <button
+                  onClick={() => setShareTeamId(myTeams[0].id)}
+                  className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${shareTeamId !== null ? 'bg-rh-accent text-white' : 'text-rh-muted hover:text-rh-text hover:bg-white/5'}`}
+                >
+                  Спільний з командою
+                </button>
+              </div>
+              {shareTeamId !== null && myTeams.length > 1 && (
+                <select
+                  className="rh-input w-full mt-1.5 text-xs"
+                  value={shareTeamId}
+                  onChange={(e) => setShareTeamId(e.target.value)}
+                >
+                  {myTeams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+                </select>
+              )}
+              {shareTeamId !== null && (
+                <p className="text-[10.5px] text-rh-muted mt-1">
+                  Тайтл, епізоди, персонажі й субтитри автоматично з'являться у всіх учасників команди.
+                </p>
+              )}
+            </div>
+          )}
         </div>
         <div className="flex gap-2 justify-end">
           <button onClick={onClose} className="rh-btn-ghost">Скасувати</button>

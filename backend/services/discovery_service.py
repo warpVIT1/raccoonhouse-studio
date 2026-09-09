@@ -78,7 +78,7 @@ _registry: dict[str, dict] = {}  # peer_id -> {id, host, port, name, ...}
 _registry_lock = threading.Lock()
 _started = False
 
-_state_provider = None             # () -> (profile_name, power_share_enabled, logged_in)
+_state_provider = None             # () -> (profile_name, power_share_enabled, logged_in, team_device_id, roles, telegram_id, telegram_username)
 _online_signaling_provider = None  # () -> (enabled, url)
 
 _ws = None  # the live websocket connection, if any — guarded by _ws_lock
@@ -169,10 +169,33 @@ def get_https_base() -> "str | None":
 # single-shot PUT of a ~376MB result failed outright with a 400 before ever
 # reaching the Worker's own code. Anything at or above this threshold goes
 # through R2's multipart upload API instead (see the /transfer/:id/multipart
-# routes in cloudflare-signaling/src/index.ts) — several smaller PUTs, each
-# safely under the cap, rather than one giant one. Deliberately well under
-# the documented 100MB floor to leave headroom for HTTP overhead.
-MULTIPART_THRESHOLD = 80 * 1024 * 1024
+# routes in cloudflare-signaling/src/index.ts) — several smaller buffered-
+# bytes PUTs, each safely under the cap, rather than one giant streamed one.
+#
+# The simple path sends `request.body` to Cloudflare as a streaming
+# ReadableStream (see the Worker's PUT /transfer/:id handler) — confirmed
+# live 2026-09-08 that THIS, not raw size, is what actually breaks: an
+# actor-audio FLAC well under the old 80MB threshold reliably died at ~95%
+# with "426 Client Error: Upgrade Required" on every attempt (reproduced
+# twice, including through the retry-on-fresh-connection added earlier the
+# same day — ruling out a transient network blip). Python's `requests`
+# doesn't speak HTTP/2, and Cloudflare's edge apparently needs it to stream
+# a request body through to a Worker past a size far smaller than the old
+# 80MB assumption. Each multipart PART, by contrast, is sent as fully-
+# buffered `bytes` (see upload_transfer's per-chunk `data=chunk` below),
+# never a stream — that path has real, working uploads elsewhere in this
+# app (e.g. original video imports, routinely hundreds of MB). A 5MB
+# threshold was tried first (R2's own multipart minimum part size) on the
+# theory this only bit large bodies — confirmed live 2026-09-08 that this
+# was wrong: a small FLAC well under 5MB (finished sending in well under a
+# second) STILL 426'd the same way on the simple-PUT path. The streaming
+# ReadableStream-to-R2 hand-off apparently isn't reliable via HTTP/1.1 at
+# ANY size, not just large ones — so the simple path is effectively dead
+# for this Worker regardless of file size. Threshold dropped to 1 byte:
+# every real (non-empty) file now always takes the proven buffered-bytes
+# multipart path; only a genuinely empty (0-byte) upload would still hit
+# the simple PUT, which is fine since there's nothing to stream anyway.
+MULTIPART_THRESHOLD = 1
 MULTIPART_PART_SIZE = 80 * 1024 * 1024
 
 
@@ -182,12 +205,30 @@ def upload_transfer(transfer_id: str, stream, size: int) -> None:
         raise ValueError("Онлайн-сигналізація не налаштована — вкажіть URL сервера у Налаштуваннях")
 
     if size < MULTIPART_THRESHOLD:
-        resp = requests.put(
-            f"{base}/transfer/{transfer_id}", data=stream,
-            headers={"Content-Length": str(size)}, timeout=3600,
-        )
-        resp.raise_for_status()
-        return
+        # A long single-request upload (multi-minute for a large FLAC/WAV)
+        # occasionally has its underlying connection dropped/reset partway
+        # through by something between this machine and Cloudflare's edge —
+        # confirmed live 2026-09-08: a "Здати" upload died at 95% with
+        # "426 Client Error: Upgrade Required", the edge's way of signalling
+        # a broken mid-body connection, not an actual client bug. One retry
+        # on a brand-new connection (requests.put with no session reuse
+        # already gets a fresh one) is the standard mitigation — the stream
+        # needs rewinding first since the failed attempt already consumed
+        # part of it.
+        last_error: Exception | None = None
+        for attempt in range(2):
+            if attempt > 0 and hasattr(stream, "reset"):
+                stream.reset()
+            try:
+                resp = requests.put(
+                    f"{base}/transfer/{transfer_id}", data=stream,
+                    headers={"Content-Length": str(size)}, timeout=3600,
+                )
+                resp.raise_for_status()
+                return
+            except requests.exceptions.RequestException as e:
+                last_error = e
+        raise last_error
 
     create_resp = requests.post(f"{base}/transfer/{transfer_id}/multipart", timeout=30)
     create_resp.raise_for_status()
@@ -200,12 +241,23 @@ def upload_transfer(transfer_id: str, stream, size: int) -> None:
             chunk = stream.read(MULTIPART_PART_SIZE)
             if not chunk:
                 break
-            part_resp = requests.put(
-                f"{base}/transfer/{transfer_id}/multipart/{upload_id}/{part_number}",
-                data=chunk, headers={"Content-Length": str(len(chunk))}, timeout=3600,
-            )
-            part_resp.raise_for_status()
-            part_info = part_resp.json()
+            # Same retry-on-a-fresh-connection posture as the single-PUT
+            # path above — chunk is already fully in memory, so no rewind
+            # is needed to resend it.
+            part_last_error: Exception | None = None
+            for attempt in range(2):
+                try:
+                    part_resp = requests.put(
+                        f"{base}/transfer/{transfer_id}/multipart/{upload_id}/{part_number}",
+                        data=chunk, headers={"Content-Length": str(len(chunk))}, timeout=3600,
+                    )
+                    part_resp.raise_for_status()
+                    part_info = part_resp.json()
+                    break
+                except requests.exceptions.RequestException as e:
+                    part_last_error = e
+            else:
+                raise part_last_error
             parts.append({"partNumber": part_info["partNumber"], "etag": part_info["etag"]})
             part_number += 1
 
@@ -222,15 +274,24 @@ def upload_transfer(transfer_id: str, stream, size: int) -> None:
         raise
 
 
-def download_transfer(transfer_id: str, dest_path: str) -> None:
+def download_transfer(transfer_id: str, dest_path: str, on_progress=None) -> None:
+    """`on_progress`, if given, is called with an int 0-100 as bytes arrive —
+    used by the on-demand original-video download job (see
+    routers/episodes.py's download-original-video) to show real progress on
+    a multi-GB file instead of just a spinner."""
     base = get_https_base()
     if not base:
         raise ValueError("Онлайн-сигналізація не налаштована — вкажіть URL сервера у Налаштуваннях")
     resp = requests.get(f"{base}/transfer/{transfer_id}", stream=True, timeout=3600)
     resp.raise_for_status()
+    total = int(resp.headers.get("content-length") or 0)
+    written = 0
     with open(dest_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=1024 * 1024):
             f.write(chunk)
+            written += len(chunk)
+            if on_progress and total:
+                on_progress(min(100, int(written / total * 100)))
 
 
 def delete_transfer(transfer_id: str) -> None:
@@ -246,11 +307,11 @@ def delete_transfer(transfer_id: str) -> None:
 # --- "Suggestions & complaints" inbox (plain HTTPS to the Worker's /feedback
 # routes — see cloudflare-signaling/src/index.ts) ---
 
-def submit_feedback(nickname: str, message: str) -> str:
+def submit_feedback(nickname: str, message: str, device_id: "str | None" = None) -> str:
     base = get_https_base()
     if not base:
         raise ValueError("Онлайн-сигналізація не налаштована — вкажіть URL сервера у Налаштуваннях")
-    resp = requests.post(f"{base}/feedback", json={"nickname": nickname, "message": message}, timeout=15)
+    resp = requests.post(f"{base}/feedback", json={"nickname": nickname, "message": message, "device_id": device_id}, timeout=15)
     resp.raise_for_status()
     return resp.json()["id"]
 
@@ -274,6 +335,40 @@ def delete_feedback(feedback_id: str) -> None:
         pass
 
 
+# --- Renderer error reports (plain HTTPS to the Worker's /errors routes —
+# same R2-JSON-blob shape as feedback above) ---
+
+def submit_error_report(profile_name: str, message: str, stack: "str | None", context: str, device_id: "str | None") -> str:
+    base = get_https_base()
+    if not base:
+        raise ValueError("Онлайн-сигналізація не налаштована — вкажіть URL сервера у Налаштуваннях")
+    resp = requests.post(f"{base}/errors", json={
+        "profile_name": profile_name, "message": message, "stack": stack,
+        "context": context, "device_id": device_id,
+    }, timeout=15)
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+def list_error_reports() -> list[dict]:
+    base = get_https_base()
+    if not base:
+        raise ValueError("Онлайн-сигналізація не налаштована — вкажіть URL сервера у Налаштуваннях")
+    resp = requests.get(f"{base}/errors", timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def delete_error_report(error_id: str) -> None:
+    base = get_https_base()
+    if not base:
+        return
+    try:
+        requests.delete(f"{base}/errors/{error_id}", timeout=15)
+    except Exception:
+        pass
+
+
 # --- Separation-run reports for the admin (plain HTTPS to the Worker's
 # /reports routes — see cloudflare-signaling/src/index.ts) ---
 
@@ -284,6 +379,83 @@ def submit_report(report: dict) -> "str | None":
     resp = requests.post(f"{base}/reports", json=report, timeout=15)
     resp.raise_for_status()
     return resp.json()["id"]
+
+
+# --- Stage-handoff notifications (Worker's /notify-director + /notify-actors
+# routes, see cloudflare-signaling/src/index.ts's shared notifyTeamRole) ---
+
+def _notify_team_role(worker_path: str, message: str) -> "int | None":
+    base = get_https_base()
+    if not base:
+        return None
+    _, _, _, team_device_id, _, _, _ = _state_provider() if _state_provider else ("?", False, False, "", [], None, None)
+    if not team_device_id:
+        return None
+    resp = requests.post(
+        f"{base}/{worker_path}",
+        json={"team_device_id": team_device_id, "message": message},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()["sent"]
+
+
+def notify_director(message: str) -> "int | None":
+    return _notify_team_role("notify-director", message)
+
+
+def notify_actors(message: str) -> "int | None":
+    return _notify_team_role("notify-actors", message)
+
+
+def notify_sound_engineer(message: str) -> "int | None":
+    return _notify_team_role("notify-sound-engineer", message)
+
+
+def notify_translator(message: str) -> "int | None":
+    return _notify_team_role("notify-translator", message)
+
+
+def notify_all_team_admins(team_id: str, message: str) -> int:
+    """Episode "Адмін" tab's automatic late-submission alert — every team
+    admin (not just one) gets pinged, only when something actually landed
+    late. Uses team_service.team_members (already returns is_team_admin)
+    rather than a dedicated Worker route — notify_device below already
+    resolves telegram_id server-side per device_id, so no extra lookup is
+    needed here."""
+    from . import team_service
+    try:
+        members = team_service.team_members(team_id)
+    except Exception:
+        return 0
+    sent = 0
+    for m in members:
+        if not m.get("is_team_admin"):
+            continue
+        if notify_device(m["device_id"], message):
+            sent += 1
+    return sent
+
+
+def notify_device(device_id: str, message: str) -> "int | None":
+    """Targets exactly one device_id (the Worker's /notify-device — same
+    route team_service.send_message_to_user uses for the admin's manual
+    "Написати" button) rather than broadcasting to a whole role — used for
+    the per-actor SRT handoff (see actor_video_service.py), where each
+    actor should only be pinged about their own lines, not everyone's.
+    respect_pause=true — this is an automated stage-handoff notification,
+    unlike the admin's own manually-composed message via
+    team_service.send_message_to_user, which stays unaffected by the
+    admin's own pause toggle (see areNotificationsPaused's Worker-side
+    comment)."""
+    base = get_https_base()
+    if not base:
+        return None
+    resp = requests.post(f"{base}/notify-device", json={
+        "device_id": device_id, "message": message, "respect_pause": True,
+    }, timeout=15)
+    resp.raise_for_status()
+    return resp.json()["sent"]
 
 
 def list_reports() -> list[dict]:
@@ -517,6 +689,21 @@ def fetch_peer_log(peer_id: str, filename: str) -> str:
     return result.get("content", "")
 
 
+def fetch_log_by_device_id(device_id: str, filename: str) -> str:
+    """Same live log fetch as fetch_peer_log above, but addressed by the
+    admin "База даних" tab's own device_id (team_device_id) rather than the
+    power-share peer_id — those are different id spaces (peer_id is the
+    ephemeral per-launch client_id, team_device_id is the stable per-
+    profile team identity), and the tab only ever knows the latter. Only
+    works while that person is actually online right now (their own
+    _instance_id has to be live in the peer registry to answer the relay
+    call at all) — there's no offline/queued fallback."""
+    peer = next((p for p in get_discovered_peers() if p.get("team_device_id") == device_id), None)
+    if not peer:
+        raise ValueError("Користувач зараз не в мережі")
+    return fetch_peer_log(peer["id"], filename)
+
+
 def _handle_log_fetch_request(from_id: str, payload: dict):
     """Runs on the machine WHOSE logs are being viewed — reads a bounded tail
     (not the whole file — electron.log has no rotation cap, and even the
@@ -640,6 +827,61 @@ def _handle_relay(from_id: str, payload: dict):
     if kind == "force_update_request":
         broadcast_local({"type": "force_update_request", "data": {"from_name": payload.get("from_name", "Адмін")}})
         return
+
+    if kind == "team_invite":
+        # Immediate delivery when the invited device is online right now
+        # (see team_service.invite_member) — this is purely a live nudge for
+        # the frontend to show the prompt without waiting for a poll; the
+        # invite itself already persisted via the Worker's /teams/invites
+        # regardless, so a missed/offline delivery still surfaces next time
+        # this device calls team_service.pending_invites().
+        broadcast_local({"type": "team_invite", "data": {
+            "invite_id": payload.get("invite_id"),
+            "team_id": payload.get("team_id"),
+            "team_name": payload.get("team_name", "?"),
+        }})
+        return
+
+    if kind == "shared_content_updated":
+        # A teammate pushed a change to a shared title (see
+        # sync_service.py's push_*/_notify_team and the Worker's
+        # /notify-team-content route) — pull the fresh snapshot now rather
+        # than waiting for the periodic fallback in _online_signaling_loop,
+        # then tell the frontend to refetch whatever title/episode list is
+        # currently in view.
+        team_id = payload.get("team_id")
+        if team_id:
+            threading.Thread(target=_handle_shared_content_updated, args=(team_id,), daemon=True).start()
+        return
+
+
+def _handle_shared_content_updated(team_id: str):
+    from ..database import SessionLocal
+    from .sync_service import pull_and_merge
+    db = SessionLocal()
+    try:
+        pull_and_merge(team_id, db)
+    except Exception:
+        pss.power_logger.exception("_handle_shared_content_updated: pull failed for team %s", team_id)
+    finally:
+        db.close()
+    broadcast_local({"type": "shared_content_updated", "data": {"team_id": team_id}})
+
+
+def _pull_all_shared_teams():
+    """Offline-catch-up fallback for shared titles — see
+    _online_signaling_loop's periodic call to this. Pulls every team the
+    active profile belongs to, then nudges the frontend to refetch."""
+    from ..database import SessionLocal
+    from .sync_service import pull_and_merge_all_teams
+    db = SessionLocal()
+    try:
+        pull_and_merge_all_teams(db)
+    except Exception:
+        pss.power_logger.exception("_pull_all_shared_teams: failed")
+    finally:
+        db.close()
+    broadcast_local({"type": "shared_content_updated", "data": {}})
 
 
 def _handle_consent_request(from_id: str, payload: dict):
@@ -788,8 +1030,8 @@ def _online_signaling_loop(backend_port: int, gpu: dict):
                 pss.power_logger.info("Online signaling connected url=%s", url)
 
                 def send_hello():
-                    name, power_share_enabled, logged_in = (
-                        _state_provider() if _state_provider else ("?", False, False)
+                    name, power_share_enabled, logged_in, team_device_id, roles, telegram_id, telegram_username = (
+                        _state_provider() if _state_provider else ("?", False, False, "", [], None, None)
                     )
                     ws.send(json.dumps({
                         "type": "hello",
@@ -800,14 +1042,42 @@ def _online_signaling_loop(backend_port: int, gpu: dict):
                         "logged_in": logged_in,
                         "gpu_name": gpu["name"],
                         "vram_gb": gpu["vram_gb"],
+                        # Lets a team-invite relay (targeted by this,
+                        # profile-scoped id — see team_service.invite_member)
+                        # reach this exact connection — routing everywhere
+                        # else stays addressed by client_id/_instance_id
+                        # unchanged (see cloudflare-signaling's relay handler).
+                        "team_device_id": team_device_id,
+                        # Job-title roles + Telegram chat id, synced into the
+                        # Worker's known_devices table so /notify-director can
+                        # find "teammates with role X who have Telegram linked"
+                        # without a dedicated sync channel (see notify_director
+                        # below and cloudflare-signaling's hello handler).
+                        "roles": roles,
+                        "telegram_id": telegram_id,
+                        "telegram_username": telegram_username,
                     }))
 
                 send_hello()
                 last_heartbeat = time.monotonic()
+                # Periodic shared-titles catch-up — covers "was offline when
+                # a teammate pushed a change" (the relay push in
+                # _handle_relay's "shared_content_updated" branch only
+                # reaches devices that are online right that moment). Fires
+                # once immediately on every fresh connect (covers app
+                # startup and reconnect-after-team-join) and every ~5min
+                # after that — a background thread each time so a slow pull
+                # never stalls this WS recv loop.
+                SHARED_SYNC_INTERVAL_SECONDS = 300
+                threading.Thread(target=_pull_all_shared_teams, daemon=True).start()
+                last_shared_sync = time.monotonic()
                 while True:
                     if time.monotonic() - last_heartbeat >= ONLINE_SIGNALING_HEARTBEAT_SECONDS:
                         send_hello()
                         last_heartbeat = time.monotonic()
+                    if time.monotonic() - last_shared_sync >= SHARED_SYNC_INTERVAL_SECONDS:
+                        threading.Thread(target=_pull_all_shared_teams, daemon=True).start()
+                        last_shared_sync = time.monotonic()
                     try:
                         raw = ws.recv(timeout=ONLINE_SIGNALING_HEARTBEAT_SECONDS)
                     except TimeoutError:
@@ -826,13 +1096,17 @@ def _online_signaling_loop(backend_port: int, gpu: dict):
                                     continue
                                 _registry[peer["id"]] = {
                                     "id": peer["id"],
-                                    "host": peer["host"],
-                                    "port": peer["port"],
                                     "name": peer.get("name", "?"),
                                     "power_share_enabled": bool(peer.get("power_share_enabled")),
                                     "logged_in": bool(peer.get("logged_in")),
                                     "gpu_name": peer.get("gpu_name", "Невідома відеокарта"),
                                     "vram_gb": peer.get("vram_gb", 0.0),
+                                    # Server-side only — used to filter the
+                                    # discovered-peers list down to teammates
+                                    # (see routers/power_share.py's
+                                    # _visible_peers), never returned to the
+                                    # frontend as-is.
+                                    "team_device_id": peer.get("team_device_id", ""),
                                     "last_seen": now,
                                 }
                             # A peer not in THIS broadcast means it

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
-import type { Character, Marker } from '../../types'
+import type { Character, Marker, TeamActor } from '../../types'
 
 function formatTime(s: number): string {
   const h = Math.floor(s / 3600)
@@ -11,6 +11,7 @@ function formatTime(s: number): string {
 interface MarkersTabProps {
   markers: Marker[]
   characters: Character[]
+  teamActors: TeamActor[]
   currentTimeMs: number
   onConfirm: (id: number) => void
   onEdit: (id: number, changes: Partial<Marker>) => void
@@ -18,6 +19,13 @@ interface MarkersTabProps {
   onDeleteAll: () => void
   onAdd: (positionSeconds: number, name: string) => void
   onSeek: (t: number) => void
+  // Bulk-assigns every marker of one color to one actor at once — the
+  // "Кольори" legend panel below.
+  onAssignColor: (color: string, characterId: number | null) => void
+  onImport: (file: File, bpm: number) => void
+  importBpm: number
+  onImportBpmChange: (bpm: number) => void
+  onPickTeamActor: (deviceId: string, displayName: string) => Promise<Character | null>
 }
 
 // Picks a character's code (or a short fallback from their name) and inserts
@@ -55,13 +63,55 @@ function CharacterPicker({ characters, onPick }: { characters: Character[]; onPi
   )
 }
 
-export function MarkersTab({ markers, characters, currentTimeMs, onConfirm, onEdit, onDelete, onDeleteAll, onAdd, onSeek }: MarkersTabProps) {
+export function MarkersTab({
+  markers,
+  characters,
+  teamActors,
+  currentTimeMs,
+  onConfirm,
+  onEdit,
+  onDelete,
+  onDeleteAll,
+  onAdd,
+  onSeek,
+  onAssignColor,
+  onImport,
+  importBpm,
+  onImportBpmChange,
+  onPickTeamActor,
+}: MarkersTabProps) {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [editName, setEditName] = useState('')
   const [editPos, setEditPos] = useState('')
   const [showAdd, setShowAdd] = useState(false)
   const [newName, setNewName] = useState('')
   const [newPos, setNewPos] = useState('')
+  const importInputRef = useRef<HTMLInputElement>(null)
+
+  // Distinct colors present among current markers — one legend row each.
+  const distinctColors = Array.from(new Set(markers.map((m) => m.color).filter((c): c is string => !!c)))
+
+  // Same find-or-create-by-team_device_id pattern as SubtitleGrid's
+  // commitTeamActor — picking a team actor for a color either reuses an
+  // already-linked local Character or creates one, then bulk-assigns.
+  const assignColorToActor = useCallback(
+    async (color: string, deviceId: string) => {
+      if (!deviceId) {
+        onAssignColor(color, null)
+        return
+      }
+      const existing = characters.find((c) => c.team_device_id === deviceId)
+      if (existing) {
+        onAssignColor(color, existing.id)
+        return
+      }
+      const actor = teamActors.find((a) => a.device_id === deviceId)
+      if (!actor) return
+      const created = await onPickTeamActor(actor.device_id, actor.display_name)
+      if (created) onAssignColor(color, created.id)
+    },
+    [characters, teamActors, onPickTeamActor, onAssignColor]
+  )
 
   function appendCode(current: string, code: string): string {
     const base = current.replace(/\s*-\s*ЗВУК\s*$/i, '').trim()
@@ -171,6 +221,7 @@ export function MarkersTab({ markers, characters, currentTimeMs, onConfirm, onEd
       <div className="flex items-center justify-between px-3 py-2 border-b border-rh-border bg-rh-card2 flex-shrink-0">
         <span className="text-xs text-rh-muted">
           {markers.length} маркерів · {markers.filter((m) => m.confirmed).length} підтверджено
+          <span className="text-rh-muted/60 ml-2">· Ctrl/⌘+клік — вибрати декілька · Shift+клік — діапазон</span>
         </span>
         <div className="flex items-center gap-1.5">
           <button
@@ -196,6 +247,39 @@ export function MarkersTab({ markers, characters, currentTimeMs, onConfirm, onEd
             </svg>
             Додати
           </button>
+          {/* BPM — Reaper's own marker CSV export writes Bar.Beat.Fraction
+              positions (Measures.Beats ruler mode), not a timecode;
+              converting that to seconds needs the project's actual tempo,
+              which the CSV never carries (confirmed live 2026-08-18 against
+              a real exported file — every marker landed at 00:00:00 without
+              this). Same value is used for drag-drop import. */}
+          <label className="flex items-center gap-1 text-[10px] text-rh-muted" title="Темп Reaper-проєкту — потрібен для правильного перерахунку тактів/долей у секунди">
+            BPM
+            <input
+              type="number"
+              min={1}
+              value={importBpm}
+              onChange={(e) => onImportBpmChange(Number(e.target.value) || 120)}
+              className="rh-input w-14 text-xs py-0.5 px-1"
+            />
+          </label>
+          <button
+            onClick={() => importInputRef.current?.click()}
+            className="rh-btn-ghost text-xs px-2 py-1"
+            title="Імпортувати маркери з CSV (Reaper-експорт або власний формат: #,Name,Start,End,Length,Color)"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            Імпорт CSV
+          </button>
+          <input
+            ref={importInputRef}
+            type="file"
+            accept=".csv"
+            className="hidden"
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) onImport(f, importBpm); e.target.value = '' }}
+          />
           {markers.length > 0 && (
             <button
               onClick={onDeleteAll}
@@ -209,6 +293,64 @@ export function MarkersTab({ markers, characters, currentTimeMs, onConfirm, onEd
           )}
         </div>
       </div>
+
+      {/* Colors legend — assign every marker of one color to one actor at
+          once, instead of picking a character on each marker individually.
+          Only shown when the title has team actors AND there's at least
+          one colored marker to assign. */}
+      {teamActors.length > 0 && distinctColors.length > 0 && (
+        <div className="flex flex-wrap items-center gap-3 px-3 py-2 border-b border-rh-border bg-rh-card2 flex-shrink-0">
+          <span className="text-xs text-rh-muted flex-shrink-0">Кольори:</span>
+          {distinctColors.map((color) => {
+            const count = markers.filter((m) => m.color === color).length
+            const assignedCharId = markers.find((m) => m.color === color)?.character_id ?? null
+            const assignedDeviceId = characters.find((c) => c.id === assignedCharId)?.team_device_id ?? ''
+            return (
+              <label key={color} className="flex items-center gap-1.5">
+                <span
+                  className="w-4 h-4 rounded-full flex-shrink-0 ring-1 ring-white/40 ring-inset"
+                  style={{ background: color, boxShadow: '0 0 0 1px rgba(0,0,0,0.5)' }}
+                />
+                <select
+                  className="rh-input text-xs py-0.5 px-1"
+                  value={assignedDeviceId}
+                  onChange={(e) => assignColorToActor(color, e.target.value)}
+                >
+                  <option value="">— Без актора ({count})</option>
+                  {teamActors.map((a) => (
+                    <option key={a.device_id} value={a.device_id}>{a.display_name}</option>
+                  ))}
+                </select>
+              </label>
+            )
+          })}
+        </div>
+      )}
+
+      {/* Bulk actions — visible only while 2+ markers are Ctrl/Shift-selected.
+          Same "loop onEdit per id" approach the Delete-key handler above
+          already uses for bulk delete, just for color instead. */}
+      {selectedIds.size > 0 && (
+        <div className="flex items-center gap-2.5 px-3 py-2 border-b border-rh-border bg-rh-accent/10 flex-shrink-0">
+          <span className="text-xs text-rh-accent font-semibold">Обрано: {selectedIds.size}</span>
+          <label
+            className="flex items-center gap-1.5 text-xs text-rh-text cursor-pointer rh-btn-outline px-2 py-1"
+          >
+            <span className="w-3.5 h-3.5 rounded-full flex-shrink-0 border border-white/30" style={{ background: '#E52128' }} />
+            Змінити колір
+            <input
+              type="color"
+              defaultValue="#E52128"
+              className="w-0 h-0 opacity-0"
+              onChange={(e) => { for (const id of selectedIds) onEdit(id, { color: e.target.value }) }}
+            />
+          </label>
+          <button onClick={() => { for (const id of selectedIds) onDelete(id); setSelectedIds(new Set()) }} className="rh-btn-outline text-xs px-2 py-1 hover:text-red-400">
+            Видалити обрані
+          </button>
+          <button onClick={() => setSelectedIds(new Set())} className="rh-btn-ghost text-xs px-2 py-1 ml-auto">Зняти виділення</button>
+        </div>
+      )}
 
       {/* Add form */}
       {showAdd && (
@@ -248,8 +390,21 @@ export function MarkersTab({ markers, characters, currentTimeMs, onConfirm, onEd
               key={m.id}
               className={`flex items-center gap-2 px-3 py-2 border-b border-rh-border/50 hover:bg-white/[0.02] group
                 ${m.confirmed ? '' : 'border-l-2 border-l-amber-500'}
-                ${selectedIds.has(m.id) ? 'bg-rh-accent/10 ring-1 ring-inset ring-rh-accent/40' : ''}`}
+                ${selectedIds.has(m.id) ? 'bg-rh-accent/20 ring-2 ring-inset ring-rh-accent' : ''}`}
             >
+              {/* Selection checkmark — Ctrl/Cmd+click toggles, Shift+click
+                  range-selects (see handleMarkerClick above); only shown
+                  once something's actually selected, doesn't otherwise take
+                  up row space. */}
+              {selectedIds.size > 0 && (
+                <div className={`w-3.5 h-3.5 rounded flex-shrink-0 flex items-center justify-center border ${selectedIds.has(m.id) ? 'bg-rh-accent border-rh-accent' : 'border-rh-border'}`}>
+                  {selectedIds.has(m.id) && (
+                    <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3">
+                      <polyline points="20 6 9 17 4 12"/>
+                    </svg>
+                  )}
+                </div>
+              )}
               {/* Position indicator */}
               <div
                 className={`w-2 h-2 rounded-full flex-shrink-0 ${m.confirmed ? 'bg-emerald-400' : 'bg-amber-400'}`}
@@ -277,11 +432,22 @@ export function MarkersTab({ markers, characters, currentTimeMs, onConfirm, onEd
                 <>
                   <button
                     onClick={(e) => handleMarkerClick(m, idx, e)}
-                    className="flex-1 text-left"
+                    className="flex-1 text-left min-w-0 flex items-center gap-1.5"
                   >
-                    <span className="text-xs text-rh-text" style={m.color ? { color: m.color } : undefined}>
+                    {m.color && (
+                      <span
+                        className="w-2.5 h-2.5 rounded-full flex-shrink-0 ring-1 ring-white/40 ring-inset"
+                        style={{ background: m.color, boxShadow: '0 0 0 1px rgba(0,0,0,0.5)' }}
+                      />
+                    )}
+                    <span className="text-xs text-rh-text truncate">
                       {m.reaper_name}
                     </span>
+                    {m.character_id != null && (
+                      <span className="text-[10px] text-rh-muted ml-1.5 truncate">
+                        {characters.find((c) => c.id === m.character_id)?.name ?? ''}
+                      </span>
+                    )}
                   </button>
                   <span className="text-xs font-mono text-rh-muted">{formatTime(m.position_seconds)}</span>
 

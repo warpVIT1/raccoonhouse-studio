@@ -22,6 +22,21 @@ function logFailure(method: string, path: string, err: unknown) {
   console.error(`[api] XX ${method} ${path} failed:`, err)
 }
 
+// A 204 (or any other empty-bodied success response) has nothing for
+// res.json() to parse — calling it unconditionally throws "Unexpected end
+// of JSON input" (confirmed live 2026-08-18: DirectorWorkspace's
+// assignDubber hit exactly this against POST /character-dubber-map, which
+// returns 204 by design). Every call site here awaits a JSON value, so
+// returning `undefined as T` for an empty body is safe as long as the
+// caller doesn't need it — same posture as `del` below, which already
+// never parses a body at all.
+async function parseJsonOrEmpty<T>(res: Response): Promise<T> {
+  if (res.status === 204) return undefined as T
+  const text = await res.text()
+  if (!text) return undefined as T
+  return JSON.parse(text) as T
+}
+
 export function useApi() {
   const backendPort = useAppStore((s) => s.backendPort)
   const base = `http://localhost:${backendPort}/api`
@@ -36,7 +51,7 @@ export function useApi() {
         const text = await res.text()
         throw new Error(`GET ${path} failed: ${res.status} ${text}`)
       }
-      return res.json()
+      return parseJsonOrEmpty<T>(res)
     } catch (err) {
       logFailure('GET', path, err)
       throw err
@@ -57,7 +72,7 @@ export function useApi() {
         const text = await res.text()
         throw new Error(`POST ${path} failed: ${res.status} ${text}`)
       }
-      return res.json()
+      return parseJsonOrEmpty<T>(res)
     } catch (err) {
       logFailure('POST', path, err)
       throw err
@@ -78,7 +93,7 @@ export function useApi() {
         const text = await res.text()
         throw new Error(`PUT ${path} failed: ${res.status} ${text}`)
       }
-      return res.json()
+      return parseJsonOrEmpty<T>(res)
     } catch (err) {
       logFailure('PUT', path, err)
       throw err
@@ -114,7 +129,7 @@ export function useApi() {
         const text = await res.text()
         throw new Error(`POST ${path} failed: ${res.status} ${text}`)
       }
-      return res.json()
+      return parseJsonOrEmpty<T>(res)
     } catch (err) {
       logFailure('POST(form)', path, err)
       throw err

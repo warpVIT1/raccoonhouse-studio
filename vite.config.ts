@@ -33,6 +33,15 @@ export default defineConfig({
       '@': path.resolve(__dirname, './src'),
     },
   },
+  // jassub (libass/WASM subtitle renderer, see VideoPlayer.tsx) constructs
+  // its own `new Worker(new URL(...))` internally — Vite's default worker
+  // output format (IIFE) can't code-split, which jassub's worker bundle
+  // needs, and the build fails outright without this. Vite's own
+  // documented fix for this exact "UMD and IIFE output formats are not
+  // supported for code-splitting builds" error.
+  worker: {
+    format: 'es',
+  },
   server: {
     port: 5173,
   },

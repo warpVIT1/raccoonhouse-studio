@@ -12,8 +12,24 @@ import type { ApexModelItem, AppSettings, ModelsConfig, PersonalEnsembleModelIte
 // is the same idea but per-profile and local-only, starting empty — anyone
 // picks their own models for it (added from the Model Browser), not just
 // an admin (see backend's PersonalEnsembleModel).
-export const SEPARATION_MODELS = ['MDX-Net', 'VR Arch', 'Demucs', 'MDX23C', 'BS-RoFormer', 'Апекс', 'МійАнсамбль'] as const
+export const SEPARATION_MODELS = ['MDX-Net', 'VR Arch', 'Demucs', 'MDX23C', 'BS-RoFormer', 'Апекс', 'МійАнсамбль', 'MVSep'] as const
 export type SeparationModel = typeof SEPARATION_MODELS[number]
+
+// Fetched from GET /teams/mvsep-eligible-models (backend mvsep_service.
+// MVSEP_CATEGORIES) rather than hardcoded — that list has grown into
+// several categories with a premium flag per model, no longer the kind of
+// short static thing worth hand-mirroring (see MVSEP_MAX_BATCH below for
+// the one MVSep constant that IS still hardcoded here, since it's a
+// frontend-only UX cap, not a fact about MVSep itself).
+type MvsepModel = { label: string; sepType: string; addOpt1: string; premium: boolean }
+type MvsepCategory = { category: string; models: MvsepModel[] }
+
+// MVSep costs real studio credits per model run (unlike the free local
+// batch, which always runs every model) — capped here to match the
+// server-side cap in routers/episodes.py's batch-separate-vocals, so a
+// rejected 6th pick fails in the UI immediately rather than round-tripping
+// to the backend first.
+const MVSEP_MAX_BATCH = 5
 
 type Arch = 'mdx' | 'vr' | 'demucs' | 'mdxc'
 
@@ -31,6 +47,7 @@ const MODEL_ARCH: Record<SeparationModel, Arch> = {
   'BS-RoFormer': 'mdxc',
   Апекс: 'mdxc',
   МійАнсамбль: 'mdxc',
+  MVSep: 'mdxc',
 }
 
 function extractApiError(e: unknown, fallback: string): string {
@@ -73,7 +90,10 @@ interface VocalSeparationModalProps {
   onClose: () => void
   onRun: (model: SeparationModel, ensemble: boolean, modelFile?: string, params?: SeparationParams) => void
   onRequestPower: (model: SeparationModel, ensemble: boolean, modelFile?: string, params?: SeparationParams) => void
-  onRunBatch: () => void
+  // mvsepModels is only passed for MVSep's own batch mode (see
+  // toggleMvsepBatchModel below) — omitted entirely for the local batch,
+  // which still always runs every free model with no picking.
+  onRunBatch: (mvsepModels?: Array<{ label: string; sepType: string; addOpt1: string }>) => void
   onRunDistributed: (model: SeparationModel, ensemble: boolean, modelFile?: string, params?: SeparationParams) => void
   separating: boolean
   requestingPower: boolean
@@ -83,11 +103,23 @@ interface VocalSeparationModalProps {
   powerShareError: string | null
   separationError: string | null
   disabled: boolean
+  // MVSep's "take the already-isolated vocal and split IT into male/female"
+  // (backend: run_mvsep_male_female_split) — deliberately excluded from
+  // MVSEP_CATEGORIES/the main model list above (see mvsep_service.py's own
+  // comment: it produces male_vocals/female_vocals only, no instrumental,
+  // so it can never satisfy the normal "run separation" vocal+instrumental
+  // contract). Still belongs under the MVSep method tab rather than as an
+  // unrelated top-toolbar button, since it's still an MVSep action.
+  vocalIsolated: boolean
+  maleFemaleEligible: boolean
+  maleFemaleSplitBusy: boolean
+  onMaleFemaleSplit: () => void
 }
 
 export function VocalSeparationModal({
   onClose, onRun, onRequestPower, onRunBatch, onRunDistributed, separating, requestingPower,
   batchRendering, distributedRunning, powerShareEnabled, powerShareError, separationError, disabled,
+  vocalIsolated, maleFemaleEligible, maleFemaleSplitBusy, onMaleFemaleSplit,
 }: VocalSeparationModalProps) {
   const backdrop = useBackdropClose(onClose)
   const { get, post, del } = useApi()
@@ -222,6 +254,55 @@ export function VocalSeparationModal({
     get<PersonalEnsembleModelItem[]>('/models/personal-ensemble').then(setPersonalModels).catch(() => {})
   }, [isPersonal, personalModels, get])
 
+  // Cloud separation via mvsep.com — the only method here that isn't a
+  // local audio-separator model at all (see backend mvsep_service.py).
+  // No longer beta-gated (confirmed live 2026-08-18 — it was invisible in
+  // the method picker with no way to reach it at all until this) — still
+  // server-checked against credits eligibility (team credits_enabled or an
+  // individual grant, both app-admin controlled — see team_service.py);
+  // eligibility is re-checked server-side on run too, this is just for
+  // hiding the option from someone it wouldn't work for anyway.
+  const isMvsep = model === 'MVSep'
+  const [mvsepCategories, setMvsepCategories] = useState<MvsepCategory[] | null>(null)
+  const [mvsepChoice, setMvsepChoice] = useState<MvsepModel | null>(null)
+  const [mvsepEligible, setMvsepEligible] = useState(false)
+  // MVSep's own batch mode — separate from the local batchMode toggle
+  // (hidden entirely while isMvsep, see the "!isMvsep &&" wrapper below)
+  // because MVSep costs real credits per model, so it's an explicit
+  // multi-select capped at MVSEP_MAX_BATCH rather than "run everything."
+  const [mvsepBatch, setMvsepBatch] = useState(false)
+  const [mvsepBatchSelected, setMvsepBatchSelected] = useState<MvsepModel[]>([])
+  const [mvsepBalance, setMvsepBalance] = useState<{ premium_minutes: number | null; premium_enabled: boolean } | null>(null)
+  const [mvsepBalanceError, setMvsepBalanceError] = useState<string | null>(null)
+
+  useEffect(() => {
+    get<{ eligible: boolean }>('/teams/mvsep-eligible').then((r) => setMvsepEligible(r.eligible)).catch(() => {})
+  }, [get])
+
+  useEffect(() => {
+    if (!isMvsep || mvsepCategories !== null) return
+    get<MvsepCategory[]>('/teams/mvsep-models').then((cats) => {
+      setMvsepCategories(cats)
+      setMvsepChoice(cats[0]?.models[0] ?? null)
+    }).catch(() => {})
+  }, [isMvsep, mvsepCategories, get])
+
+  useEffect(() => {
+    if (!isMvsep || !mvsepEligible || mvsepBalance || mvsepBalanceError) return
+    get<{ premium_minutes: number | null; premium_enabled: boolean }>('/teams/mvsep-balance')
+      .then(setMvsepBalance)
+      .catch((e) => setMvsepBalanceError(extractApiError(e, 'Не вдалося отримати баланс MVSep')))
+  }, [isMvsep, mvsepEligible, mvsepBalance, mvsepBalanceError, get])
+
+  function toggleMvsepBatchModel(m: MvsepModel) {
+    setMvsepBatchSelected((prev) => {
+      const exists = prev.some((p) => p.sepType === m.sepType && p.addOpt1 === m.addOpt1)
+      if (exists) return prev.filter((p) => !(p.sepType === m.sepType && p.addOpt1 === m.addOpt1))
+      if (prev.length >= MVSEP_MAX_BATCH) return prev
+      return [...prev, m]
+    })
+  }
+
   async function removePersonalModel(id: number) {
     try {
       await del(`/models/personal-ensemble/${id}`)
@@ -246,6 +327,15 @@ export function VocalSeparationModal({
     setModel(m)
     const choices = modelsConfig?.choices[m]
     if (choices && choices.length) setModelFile(choices[0].file)
+    // MVSep is a single cloud call — batch/power-share/distributed modes
+    // don't apply and their toggles are hidden while it's selected, but
+    // stale state from a prior method would otherwise still be read by
+    // handleRunClick and silently hijack the run.
+    if (m === 'MVSep') {
+      setBatchMode(false)
+      setRequestPowerMode(false)
+      setDistributedMode(false)
+    }
   }
 
   // "Свої моделі" — a shortcut picker over every custom/Model Browser model
@@ -271,7 +361,7 @@ export function VocalSeparationModal({
     // ансамбль can mix any architecture (it's whatever the person picked),
     // so — like the generic Ensemble Mode — it just uses each model's own
     // library defaults rather than one settings panel pretending to fit all.
-    if (ensemble || isPersonal) return undefined
+    if (ensemble || isPersonal || isMvsep) return undefined
     if (isApex) return { mdxc }
     if (arch === 'mdx') return { mdx }
     if (arch === 'vr') return { vr }
@@ -285,20 +375,30 @@ export function VocalSeparationModal({
   // switched on — like flipping a switch rather than picking from several
   // separate buttons that each did something different.
   function handleRunClick() {
-    const file = ensemble || isApex || isPersonal ? undefined : modelFile
+    if (isMvsep && mvsepBatch) {
+      onRunBatch(mvsepBatchSelected.map((m) => ({ label: m.label, sepType: m.sepType, addOpt1: m.addOpt1 })))
+      return
+    }
+    const file = isMvsep
+      ? mvsepChoice ? `${mvsepChoice.sepType}:${mvsepChoice.addOpt1}` : undefined
+      : ensemble || isApex || isPersonal ? undefined : modelFile
     if (batchMode) { onRunBatch(); return }
     if (distributedMode) { onRunDistributed(model, ensemble, file, buildParams()); return }
     if (requestPowerMode) { onRequestPower(model, ensemble, file, buildParams()); return }
     onRun(model, ensemble, file, buildParams())
   }
 
-  const runLabel = batchMode
+  const runLabel = isMvsep && mvsepBatch
+    ? 'Запустити пакетний рендер MVSep'
+    : batchMode
     ? 'Запустити пакетний рендер'
     : distributedMode
     ? 'Запустити розподілену обробку'
     : requestPowerMode
     ? 'Запросити потужність'
     : 'Запустити'
+
+  const mvsepRunDisabled = isMvsep && (mvsepBatch ? mvsepBatchSelected.length === 0 : !mvsepChoice)
 
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" {...backdrop}>
@@ -322,6 +422,7 @@ export function VocalSeparationModal({
             {SEPARATION_MODELS.map((m) => {
               const isApexButton = m === 'Апекс'
               const isPersonalButton = m === 'МійАнсамбль'
+              const isMvsepButton = m === 'MVSep'
               const active = model === m && !ensemble && !showOwnModels
               return (
                 <button
@@ -331,6 +432,7 @@ export function VocalSeparationModal({
                   title={
                     isApexButton ? 'Кураторський ансамбль найсильніших моделей — для максимально чистого результату'
                     : isPersonalButton ? 'Ваш власний ансамбль — оберіть моделі у Браузері моделей'
+                    : isMvsepButton ? 'Хмарне розділення mvsep.com — потребує кредитів (бета)'
                     : undefined
                   }
                   className={`px-2 py-2 rounded-lg text-xs font-medium transition-colors border
@@ -339,15 +441,19 @@ export function VocalSeparationModal({
                         ? 'bg-gradient-to-br from-amber-400 to-amber-600 text-black border-amber-400'
                         : isPersonalButton
                         ? 'bg-gradient-to-br from-violet-500 to-violet-700 text-white border-violet-500'
+                        : isMvsepButton
+                        ? 'bg-gradient-to-br from-cyan-500 to-cyan-700 text-white border-cyan-500'
                         : 'bg-rh-accent text-white border-rh-accent'
                       : isApexButton
                         ? 'text-amber-400 border-amber-500/40 hover:text-amber-300 hover:border-amber-400/60'
                         : isPersonalButton
                         ? 'text-violet-400 border-violet-500/40 hover:text-violet-300 hover:border-violet-400/60'
+                        : isMvsepButton
+                        ? 'text-cyan-400 border-cyan-500/40 hover:text-cyan-300 hover:border-cyan-400/60'
                         : 'text-rh-muted border-rh-border hover:text-rh-text hover:border-rh-border2'}
                     ${ensemble ? 'opacity-40 cursor-not-allowed' : ''}`}
                 >
-                  {isApexButton ? '★ Апекс' : isPersonalButton ? '☆ Мій ансамбль' : m}
+                  {isApexButton ? '★ Апекс' : isPersonalButton ? '☆ Мій ансамбль' : isMvsepButton ? '☁ MVSep' : m}
                 </button>
               )
             })}
@@ -493,7 +599,111 @@ export function VocalSeparationModal({
               {personalError && <span className="text-[11px] text-[#FF6B70]">{personalError}</span>}
             </div>
           )}
-          {!ensemble && !isApex && !isPersonal && !showOwnModels && (
+
+          {isMvsep && !ensemble && (
+            <div className="flex flex-col gap-1.5 border border-cyan-500/30 rounded-lg px-2.5 py-2 bg-cyan-500/5">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-[10.5px] text-cyan-300/90 italic leading-snug">
+                  Хмарне розділення на mvsep.com — файл іде на сторонній сервер, обробка займає час і витрачає кредити студії.
+                </p>
+                <span className="text-[10px] font-semibold text-cyan-300 bg-cyan-500/15 border border-cyan-500/30 rounded px-1.5 py-0.5 flex-shrink-0">
+                  💳 Кредити
+                </span>
+              </div>
+
+              {mvsepEligible && (
+                <p className="text-[10.5px] text-cyan-200/80">
+                  {mvsepBalance
+                    ? `Баланс студії: ${mvsepBalance.premium_minutes ?? 0} хв преміум${mvsepBalance.premium_enabled ? '' : ' (преміум вимкнено — деякі моделі нижче можуть бути недоступні)'}`
+                    : mvsepBalanceError
+                    ? mvsepBalanceError
+                    : 'Завантажую баланс…'}
+                </p>
+              )}
+
+              {!mvsepEligible && (
+                <p className="text-[11px] text-[#FF6B70] leading-snug">
+                  Кредити недоступні для цього профілю — зверніться до адміна програми або адміна команди.
+                </p>
+              )}
+
+              <Toggle
+                size="sm"
+                checked={mvsepBatch}
+                onChange={setMvsepBatch}
+                label={`Пакетний рендер MVSep — обрати кілька моделей (до ${MVSEP_MAX_BATCH}), кожна окремим файлом і окремими кредитами`}
+              />
+
+              {mvsepCategories === null && (
+                <div className="flex justify-center py-2"><Spinner size={12} className="text-cyan-400" /></div>
+              )}
+
+              {mvsepCategories !== null && !mvsepBatch && (
+                <Field label="Модель MVSep" hint="Конкретний алгоритм на боці mvsep.com.">
+                  <select
+                    className="rh-input"
+                    value={mvsepChoice ? `${mvsepChoice.sepType}:${mvsepChoice.addOpt1}` : ''}
+                    onChange={(e) => {
+                      const [sepType, addOpt1] = e.target.value.split(':')
+                      const found = mvsepCategories.flatMap((c) => c.models).find((m) => m.sepType === sepType && m.addOpt1 === addOpt1)
+                      if (found) setMvsepChoice(found)
+                    }}
+                  >
+                    {mvsepCategories.map((cat) => (
+                      <optgroup key={cat.category} label={cat.category}>
+                        {cat.models.map((m) => (
+                          <option key={`${m.sepType}:${m.addOpt1}`} value={`${m.sepType}:${m.addOpt1}`}>
+                            {m.label}{m.premium ? ' 🔒 преміум' : ''}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                  {mvsepChoice?.premium && (
+                    <div className="text-[10.5px] text-amber-400/80 mt-1">
+                      🔒 Ця модель на mvsep.com позначена як преміум — може не спрацювати, якщо на токені студії немає преміум-хвилин.
+                    </div>
+                  )}
+                </Field>
+              )}
+
+              {mvsepCategories !== null && mvsepBatch && (
+                <div className="flex flex-col gap-1.5">
+                  <div className="text-[10.5px] text-cyan-200/70">
+                    Обрано {mvsepBatchSelected.length}/{MVSEP_MAX_BATCH}
+                  </div>
+                  <div className="flex flex-col gap-2 max-h-[220px] overflow-y-auto pr-1">
+                    {mvsepCategories.map((cat) => (
+                      <div key={cat.category} className="flex flex-col gap-0.5">
+                        <span className="text-[10px] uppercase tracking-wide text-cyan-400/60">{cat.category}</span>
+                        {cat.models.map((m) => {
+                          const checked = mvsepBatchSelected.some((p) => p.sepType === m.sepType && p.addOpt1 === m.addOpt1)
+                          const atLimit = !checked && mvsepBatchSelected.length >= MVSEP_MAX_BATCH
+                          return (
+                            <label
+                              key={`${m.sepType}:${m.addOpt1}`}
+                              className={`flex items-center gap-2 text-[11px] px-1 py-0.5 rounded ${atLimit ? 'opacity-40' : 'hover:bg-white/5 cursor-pointer'}`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                disabled={atLimit}
+                                onChange={() => toggleMvsepBatchModel(m)}
+                              />
+                              <span className="flex-1 truncate text-cyan-100/90">{m.label}</span>
+                              {m.premium && <span className="text-[10px] text-amber-400/80 flex-shrink-0">🔒</span>}
+                            </label>
+                          )
+                        })}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {!ensemble && !isApex && !isPersonal && !isMvsep && !showOwnModels && (
             <Field label="Модель" hint="Конкретний чекпоінт цього методу — впливає на якість і швидкість.">
               <select className="rh-input" value={modelFile} onChange={(e) => setModelFile(e.target.value)}>
                 {modelChoices.map((c) => (
@@ -505,27 +715,54 @@ export function VocalSeparationModal({
               </div>
             </Field>
           )}
-          <Toggle
-            checked={ensemble}
-            // Ensemble Mode's "one default per broad method" and Апекс's own
-            // fixed 5-model set are two different, mutually exclusive
-            // ensembles — switching one on while Апекс is selected would
-            // otherwise silently run the generic ensemble instead, ignoring
-            // the Апекс pick with no visible explanation.
-            onChange={(v) => { setEnsemble(v); if (v && (isApex || isPersonal)) setModel(SEPARATION_MODELS[0]) }}
-            className="mt-1"
-            label="Ensemble Mode — запустити всі 5 методів і усереднити результат (повільніше, типові моделі й налаштування для кожного)"
-          />
-          <Toggle
-            checked={batchMode}
-            onChange={setBatchMode}
-            label="Пакетний рендер — запустити всі 5 методів, кожен результат окремим файлом (без усереднення)"
-          />
+          {/* MVSep is a single cloud call, not a local model — none of
+              Ensemble/Batch/Power-share/Distributed apply to it. */}
+          {!isMvsep && (
+            <>
+              <Toggle
+                checked={ensemble}
+                // Ensemble Mode's "one default per broad method" and Апекс's own
+                // fixed 5-model set are two different, mutually exclusive
+                // ensembles — switching one on while Апекс is selected would
+                // otherwise silently run the generic ensemble instead, ignoring
+                // the Апекс pick with no visible explanation.
+                onChange={(v) => { setEnsemble(v); if (v && (isApex || isPersonal)) setModel(SEPARATION_MODELS[0]) }}
+                className="mt-1"
+                label="Ensemble Mode — запустити всі 5 методів і усереднити результат (повільніше, типові моделі й налаштування для кожного)"
+              />
+              <Toggle
+                checked={batchMode}
+                onChange={setBatchMode}
+                label="Пакетний рендер — запустити всі 5 методів, кожен результат окремим файлом (без усереднення)"
+              />
+            </>
+          )}
+          {/* Ч/Ж split — takes the vocal already isolated for this episode
+              (by any method) and further splits IT into male/female via
+              MVSep, spending credits. Hidden entirely unless eligible, same
+              "hide AND block" posture as everything else MVSep. */}
+          {isMvsep && maleFemaleEligible && (
+            <div className="border border-rh-border rounded-lg p-2.5 flex items-center gap-2.5">
+              <div className="flex-1 text-[10.5px] text-rh-muted">
+                Розділити вже виділений вокал цієї серії на чоловічий/жіночий (MVSep, витрачає кредити)
+              </div>
+              <button
+                type="button"
+                onClick={onMaleFemaleSplit}
+                disabled={!vocalIsolated || maleFemaleSplitBusy}
+                className="rh-btn-outline text-xs flex items-center gap-1.5 flex-shrink-0"
+                title={vocalIsolated ? undefined : 'Спершу виділіть вокал для цієї серії'}
+              >
+                {maleFemaleSplitBusy ? <Spinner size={12} /> : null}
+                Ч/Ж
+              </button>
+            </div>
+          )}
           {/* Мій ансамбль is per-profile and purely local (see backend's
               PersonalEnsembleModel) — a peer machine has no access to it, so
               power-share/distributed modes are hidden while it's selected
               rather than failing confusingly mid-job. */}
-          {powerShareEnabled && !isPersonal && (
+          {powerShareEnabled && !isPersonal && !isMvsep && (
             <>
               <Toggle
                 checked={requestPowerMode}
@@ -545,7 +782,7 @@ export function VocalSeparationModal({
             into the mdxc branch below (MODEL_ARCH['Апекс'] = 'mdxc') since
             its line-up and cleanup pass are predominantly mdxc — see
             buildParams' comment. */}
-        {!ensemble && !isPersonal && (
+        {!ensemble && !isPersonal && !isMvsep && (
           <div className="border-t border-rh-border pt-4 flex flex-col gap-3">
             <span className="text-xs text-rh-muted">Розширені налаштування ({model})</span>
             {isApex && (
@@ -638,7 +875,7 @@ export function VocalSeparationModal({
           <button
             onClick={handleRunClick}
             className="rh-btn-primary text-xs"
-            disabled={busy || disabled}
+            disabled={busy || disabled || mvsepRunDisabled}
           >
             {busy ? <Spinner size={12} /> : null}
             {runLabel}

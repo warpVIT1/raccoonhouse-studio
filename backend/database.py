@@ -33,6 +33,41 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     _sync_missing_columns()
     _repair_stale_episode_paths()
+    _seed_default_roles()
+    _restore_backup_if_present()
+
+
+def _restore_backup_if_present():
+    """No-ops on every normal startup — only does anything right after an
+    update, when backup_service.estimate_and_create_backup wrote a file
+    before the install ran (see electron/main.ts's before-quit handler)."""
+    from .services import backup_service
+    with SessionLocal() as db:
+        backup_service.restore_and_cleanup_backup(db)
+
+
+# (key, label, sort_order) — the 5 roles requested for RaccoonHouse Studio.
+# Only ever used to seed an EMPTY role_catalog table (see _seed_default_roles)
+# — an admin can add/rename/remove from here afterward via
+# routers/profiles.py's /role-catalog endpoints, so this list is a starting
+# point, not the permanent set.
+_DEFAULT_ROLES = [
+    ("cleaner", "Клінапер", 0),
+    ("sound_engineer", "Звукорежисер", 1),
+    ("translator", "Перекладач", 2),
+    ("director", "Режисер", 3),
+    ("actor", "Актор", 4),
+]
+
+
+def _seed_default_roles():
+    from . import models
+    with SessionLocal() as db:
+        if db.query(models.RoleCatalog).first() is not None:
+            return  # already seeded (or an admin already emptied it on purpose) — never re-seed over that
+        for key, label, sort_order in _DEFAULT_ROLES:
+            db.add(models.RoleCatalog(key=key, label=label, sort_order=sort_order))
+        db.commit()
 
 
 def _sync_missing_columns():

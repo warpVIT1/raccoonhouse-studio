@@ -8,28 +8,66 @@ from ..database import get_db
 from ..models import AppSettings, Episode, Title, Profile
 from ..schemas import PowerShareRespondIn
 from ..services import power_share_service as pss
-from ..services import discovery_service
+from ..services import device_identity_service, discovery_service, team_service
 from ..services.gpu_service import get_gpu_info
 
 router = APIRouter(tags=["power-share"])
 
 
+def _active_profile_name(db: Session) -> "str | None":
+    settings = db.get(AppSettings, 1)
+    profile = db.get(Profile, settings.active_profile_id) if settings and settings.active_profile_id else None
+    return profile.name if profile else None
+
+
+def _visible_peers(db: Session) -> list[dict]:
+    """Team-scoped: you only see peers who share a team with you — being in
+    NO team means seeing nobody (matches "must be in a team to appear
+    online", already the rule for the Sidebar's own Teams-tab visibility).
+    The app admin is the one exception, seeing every online peer regardless
+    of team, since they're the one who might need to lend/borrow from
+    anyone (see _can_request_from below for the matching request-side rule)."""
+    peers = discovery_service.get_discovered_peers()
+    profile_name = _active_profile_name(db)
+    if not profile_name:
+        return []
+    if team_service.is_app_admin(profile_name):
+        return peers
+    teammate_ids: set[str] = set()
+    try:
+        for t in team_service.my_teams(profile_name):
+            for m in team_service.team_members(t["id"]):
+                teammate_ids.add(m["device_id"])
+    except Exception:
+        # Online signaling/Worker unreachable — fail closed (nobody visible)
+        # rather than accidentally showing everyone.
+        return []
+    return [p for p in peers if p.get("team_device_id") in teammate_ids]
+
+
+def _strip_internal_fields(peers: list[dict]) -> list[dict]:
+    # team_device_id only exists for _visible_peers' own filtering — the
+    # frontend never needs it and shouldn't see it (same posture as the
+    # already-stripped host/port).
+    return [{k: v for k, v in p.items() if k != "team_device_id"} for p in peers]
+
+
 @router.get("/power-share/discovered")
-def discovered_peers():
+def discovered_peers(db: Session = Depends(get_db)):
     """Peers currently online via the Cloudflare signaling Worker — no LAN
     broadcast, no manual IP entry. Each entry already carries its own
     power_share_enabled/logged_in state (self-reported in its "hello"), so
     no extra reachability round-trip is needed to know if it's usable."""
-    peers = discovery_service.get_discovered_peers()
+    peers = _visible_peers(db)
     for p in peers:
         p["available"] = p["power_share_enabled"] and p["logged_in"]
-    return peers
+    return _strip_internal_fields(peers)
 
 
 @router.get("/power-share/overview")
 def power_share_overview(db: Session = Depends(get_db)):
     """Aggregate view for Settings' "Загальна потужність" tab."""
-    peers = discovery_service.get_discovered_peers()
+    peers = _visible_peers(db)
     for p in peers:
         p["available"] = p["power_share_enabled"] and p["logged_in"]
     available_count = sum(1 for p in peers if p["available"])
@@ -42,7 +80,7 @@ def power_share_overview(db: Session = Depends(get_db)):
         "own_vram_gb": own_gpu["vram_gb"],
         "total_peers": len(peers),
         "available_peers": available_count,
-        "peers": peers,
+        "peers": _strip_internal_fields(peers),
     }
 
 
@@ -70,7 +108,7 @@ def broadcast_force_update(db: Session = Depends(get_db)):
     # every currently-online peer over the relay.
     settings = db.get(AppSettings, 1)
     profile = db.get(Profile, settings.active_profile_id) if settings and settings.active_profile_id else None
-    if not profile or not profile.is_admin:
+    if not team_service.is_admin_profile(profile):
         raise HTTPException(403, "Лише адмін може надсилати це всім")
     sent = discovery_service.broadcast_force_update_request(profile.name)
     return {"sent": sent}
@@ -83,7 +121,7 @@ def get_peer_log(peer_id: str, filename: str, db: Session = Depends(get_db)):
     # corresponding PUT/POST anywhere in this router or the relay protocol.
     settings = db.get(AppSettings, 1)
     profile = db.get(Profile, settings.active_profile_id) if settings and settings.active_profile_id else None
-    if not profile or not profile.is_admin:
+    if not team_service.is_admin_profile(profile):
         raise HTTPException(403, "Лише адмін може переглядати журнали інших ПК")
     try:
         content = discovery_service.fetch_peer_log(peer_id, filename)

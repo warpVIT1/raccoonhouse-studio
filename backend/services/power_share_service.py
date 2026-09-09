@@ -500,12 +500,27 @@ def _acquire_peer(title_id: int, title_name: str, episode_number: int, task: str
     Так. Reports each stage through `reporter` (may be None) so the requesting
     UI always shows a specific, human-readable status instead of a bare
     'Обробка' — including WHY, per peer, if nobody agrees."""
-    from . import discovery_service
+    from . import discovery_service, team_service
 
     if reporter:
         reporter.update(5, "Шукаю доступні ПК через сервер сигналізації…")
 
     peers = [p for p in discovery_service.get_discovered_peers() if p["power_share_enabled"] and p["logged_in"]]
+    # Team-scoped, same rule as the "Пристрої онлайн" list itself (see
+    # routers/power_share.py's _visible_peers) — you can only actually
+    # BORROW from someone you'd also see there. The app admin is the one
+    # exception, able to request power from anyone online regardless of team.
+    settings = db.get(AppSettings, 1)
+    profile = db.get(Profile, settings.active_profile_id) if settings and settings.active_profile_id else None
+    if profile and not team_service.is_app_admin(profile.name):
+        teammate_ids: set[str] = set()
+        try:
+            for t in team_service.my_teams(profile.name):
+                for m in team_service.team_members(t["id"]):
+                    teammate_ids.add(m["device_id"])
+        except Exception:
+            teammate_ids = set()
+        peers = [p for p in peers if p.get("team_device_id") in teammate_ids]
     if not peers:
         raise ValueError(
             "Немає жодного доступного ПК онлайн — переконайтесь, що на іншому ПК увімкнено "
@@ -598,6 +613,15 @@ class _ProgressFile:
 
     def close(self):
         self._f.close()
+
+    def reset(self):
+        """Rewinds for a clean retry after a failed upload attempt (see
+        discovery_service.upload_transfer's retry-once — a request that
+        died partway through has already consumed part of the stream, so
+        just re-calling requests.put on the same object would send a
+        truncated body)."""
+        self._f.seek(0)
+        self._sent = 0
 
 
 def request_remote_power(episode_id: int, model: str, ensemble: bool, reporter=None, model_file: Optional[str] = None, params: Optional[dict] = None) -> dict:

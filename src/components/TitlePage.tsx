@@ -61,6 +61,10 @@ export function TitlePage({ titleId }: TitlePageProps) {
   const [showPosterModal, setShowPosterModal] = useState(false)
   const [importError, setImportError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  // Gates "Видалити назавжди" on each episode tile — same permission check
+  // as TitlesPage's own "Видалити тайтл назавжди" (team admin or app
+  // admin; always true for a personal title with nothing shared to protect).
+  const [canManageTeam, setCanManageTeam] = useState(false)
 
   useEffect(() => {
     if (!backendReady) return
@@ -75,6 +79,9 @@ export function TitlePage({ titleId }: TitlePageProps) {
       })
       .catch(() => {})
       .finally(() => setLoading(false))
+    get<{ can_delete_permanently: boolean }>(`/titles/${titleId}/can-delete-permanently`)
+      .then((r) => setCanManageTeam(r.can_delete_permanently))
+      .catch(() => setCanManageTeam(false))
   }, [backendReady, titleId, get])
 
   // Live-refresh: when a background job for one of this title's episodes
@@ -175,10 +182,10 @@ export function TitlePage({ titleId }: TitlePageProps) {
     }
   }, [backendReady, put])
 
-  const deleteEpisode = useCallback(async (epId: number) => {
+  const deleteEpisode = useCallback(async (epId: number, permanent = false) => {
     if (backendReady) {
       try {
-        await del(`/episodes/${epId}`)
+        await del(`/episodes/${epId}${permanent ? '?permanent=true' : ''}`)
       } catch {
         return
       }
@@ -277,10 +284,12 @@ export function TitlePage({ titleId }: TitlePageProps) {
                   key={ep.id}
                   episode={ep}
                   job={epJob}
+                  canManageTeam={canManageTeam}
                   onClick={() => setSelectedEpisode(ep.id)}
                   onRenumber={(season, number) => renumberEpisode(ep.id, season, number)}
                   onStatusChange={(status) => changeEpisodeStatus(ep.id, status)}
                   onDelete={() => deleteEpisode(ep.id)}
+                  onDeletePermanently={() => deleteEpisode(ep.id, true)}
                   onCancelJob={() => { if (epJob) del(`/jobs/${epJob.id}`).catch(() => {}) }}
                 />
               )
@@ -456,13 +465,15 @@ const STATUS_OPTIONS: Array<{ value: Episode['status']; label: string }> = [
 interface EpisodeTileProps {
   episode: Episode
   job?: JobStatus
+  canManageTeam: boolean
   onClick: () => void
   onRenumber: (season: number, number: number) => void
   onStatusChange: (status: Episode['status']) => void
   onDelete: () => void
+  onDeletePermanently: () => void
   onCancelJob: () => void
 }
-function EpisodeTile({ episode, job, onClick, onRenumber, onStatusChange, onDelete, onCancelJob }: EpisodeTileProps) {
+function EpisodeTile({ episode, job, canManageTeam, onClick, onRenumber, onStatusChange, onDelete, onDeletePermanently, onCancelJob }: EpisodeTileProps) {
   const progress = job ? job.percent : episodeStatusProgress(episode.status)
   const isProcessing = Boolean(job && job.status === 'running')
   const canOpen = episode.status !== 'not_uploaded'
@@ -598,9 +609,15 @@ function EpisodeTile({ episode, job, onClick, onRenumber, onStatusChange, onDele
             className="absolute inset-0 z-50 bg-black/85 rounded-2xl flex flex-col items-center justify-center gap-2.5 p-3 text-center"
           >
             <span className="text-xs text-white">Видалити серію {String(episode.number).padStart(2, '0')}?</span>
+            {canManageTeam && episode.shared_id && (
+              <span className="text-[10px] text-rh-muted -mt-1.5">«Видалити» прибирає лише з цього пристрою — повернеться при синхронізації</span>
+            )}
             <div className="flex gap-2">
               <button onClick={() => setConfirmingDelete(false)} className="rh-btn-ghost text-[11px] px-2 py-1">Скасувати</button>
               <button onClick={onDelete} className="bg-rh-accent hover:bg-rh-accent-h text-white text-[11px] px-2 py-1 rounded-md font-semibold">Видалити</button>
+              {canManageTeam && episode.shared_id && (
+                <button onClick={onDeletePermanently} className="bg-red-900 hover:bg-red-800 text-white text-[11px] px-2 py-1 rounded-md font-semibold">Видалити назавжди</button>
+              )}
             </div>
           </div>
         )}

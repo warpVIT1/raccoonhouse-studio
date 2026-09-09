@@ -1,4 +1,5 @@
 import React, { useRef, useEffect, useState, forwardRef, useImperativeHandle } from 'react'
+import { useAppStore } from '../../stores/appStore'
 import type { SubtitleLine } from '../../types'
 
 export interface VideoPlayerHandle {
@@ -19,8 +20,39 @@ interface VideoPlayerProps {
   onDurationChange: (d: number) => void
 }
 
+// Parses just the leading {...} override-tag block our own SubtitleEditBox
+// ever writes (\b1/\i1/\u1/\s1/\c&Hbbggrr&, see toggleTag/setColorTag there)
+// into real CSS, plus \N line breaks — not a full ASS/libass implementation.
+// Anything else (per-word tags, \pos, karaoke \k, drawing commands from a
+// hand-authored/imported file) is silently stripped rather than rendered.
+// Deliberate tradeoff: this replaced a full libass-via-WASM renderer
+// (JASSUB) that, across several attempts, never reliably rendered anything
+// in the packaged app (wrong file copied into public/jassub/, then a worker
+// that loaded but whose own promise chain never resolved — confirmed live
+// 2026-08-16 through three rounds of DevTools Network/Console inspection).
+// A plain positioned <div> can't silently half-fail like a WASM worker can:
+// either the text is here or it isn't, no async worker/wasm loading chain
+// to go wrong. Good enough for a translator/timer checking their own text
+// and basic emphasis against the picture — not a substitute for a real
+// typesetting pass in Aegisub itself for anything with real positioning.
+function parseAssText(raw: string): { bold: boolean; italic: boolean; underline: boolean; strike: boolean; color: string | null; lines: string[] } {
+  const match = raw.match(/^\{([^}]*)\}/)
+  const tags = match ? match[1] : ''
+  const body = match ? raw.slice(match[0].length) : raw
+  const colorMatch = tags.match(/\\c&H([0-9A-Fa-f]{6})&/)
+  const clean = body.replace(/\{[^}]*\}/g, '')
+  return {
+    bold: /\\b1/.test(tags),
+    italic: /\\i1/.test(tags),
+    underline: /\\u1/.test(tags),
+    strike: /\\s1/.test(tags),
+    color: colorMatch ? `#${colorMatch[1].slice(4, 6)}${colorMatch[1].slice(2, 4)}${colorMatch[1].slice(0, 2)}` : null,
+    lines: clean.split(/\\N/i),
+  }
+}
+
 export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
-  ({ src, vocalStemPath, subtitles, activeSubIndex, onTimeUpdate, onDurationChange }, ref) => {
+  ({ src, vocalStemPath, subtitles, onTimeUpdate, onDurationChange }, ref) => {
     const videoRef = useRef<HTMLVideoElement>(null)
     const vocalAudioRef = useRef<HTMLAudioElement>(null)
     const [isPlaying, setIsPlaying] = useState(false)
@@ -33,6 +65,12 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     // <audio> element kept in lockstep with the video rather than swapping
     // the video's own audio track (different file entirely).
     const [audioSource, setAudioSource] = useState<'original' | 'vocal'>('original')
+    // Was hardcoded to 8765 everywhere below (video/vocal stream URLs,
+    // JASSUB's subUrl, the ass-content refetch) — silently pointed at the
+    // wrong backend for any second instance run on a different port (e.g.
+    // this session's own RH_BACKEND_PORT sandbox setup), even though every
+    // other network call in the app already reads this from the store.
+    const backendPort = useAppStore((s) => s.backendPort)
 
     useImperativeHandle(ref, () => ({
       currentTime: () => videoRef.current?.currentTime ?? 0,
@@ -43,8 +81,8 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       isPaused: () => videoRef.current?.paused ?? true,
     }))
 
-    const videoUrl = src ? `http://localhost:8765/api/stream?path=${encodeURIComponent(src)}` : null
-    const vocalUrl = vocalStemPath ? `http://localhost:8765/api/stream?path=${encodeURIComponent(vocalStemPath)}` : null
+    const videoUrl = src ? `http://localhost:${backendPort}/api/stream?path=${encodeURIComponent(src)}` : null
+    const vocalUrl = vocalStemPath ? `http://localhost:${backendPort}/api/stream?path=${encodeURIComponent(vocalStemPath)}` : null
 
     useEffect(() => {
       const v = videoRef.current
@@ -113,13 +151,20 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       if (!v.paused) a.play().catch(() => {})
     }, [audioSource, vocalUrl])
 
+    // Active line(s) for the plain overlay below — every subtitle whose
+    // range covers the current playhead, not just one, since dialogue and
+    // an overlapping sign/overlay line can legitimately be simultaneous
+    // (SubtitleLine.is_overlap). Recomputed from `subtitles` directly (not
+    // the `activeSubIndex` prop) so it updates on every timeupdate tick
+    // rather than only when the grid's own selection changes.
+    const activeLines = subtitles.filter(
+      (l) => currentTime * 1000 >= l.start_ms && currentTime * 1000 <= l.end_ms
+    )
+
     useEffect(() => {
       if (videoRef.current) videoRef.current.volume = volume
       if (vocalAudioRef.current) vocalAudioRef.current.volume = volume
     }, [volume])
-
-    // Active subtitle text
-    const activeSub = activeSubIndex != null ? subtitles[activeSubIndex] : null
 
     function togglePlay() {
       if (!videoRef.current) return
@@ -169,16 +214,36 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
             </div>
           )}
 
-          {/* Subtitle overlay — outlined text, no background box, matching
-              Aegisub's own preview rendering rather than a solid caption bar */}
-          {activeSub && (
-            <div className="absolute bottom-10 left-0 right-0 flex justify-center pointer-events-none px-4">
-              <div
-                className="text-white text-base font-medium text-center max-w-2xl leading-snug whitespace-pre-line"
-                style={{ textShadow: '-1.5px -1.5px 0 #000, 1.5px -1.5px 0 #000, -1.5px 1.5px 0 #000, 1.5px 1.5px 0 #000, 0 0 4px rgba(0,0,0,0.8)' }}
-              >
-                {activeSub.text.replace(/\\N/gi, '\n').replace(/\{[^}]+\}/g, '')}
-              </div>
+          {/* Plain HTML/CSS subtitle overlay — see parseAssText's comment for
+              why this replaced a libass/WASM (JASSUB) renderer. */}
+          {videoUrl && activeLines.length > 0 && (
+            <div className="absolute inset-x-0 bottom-3 flex flex-col items-center gap-1 px-6 pointer-events-none">
+              {activeLines.map((line) => {
+                const parsed = parseAssText(line.text)
+                if (!parsed.lines.some((l) => l.trim())) return null
+                return (
+                  <div
+                    key={line.id}
+                    className="text-center px-2 py-0.5 max-w-full"
+                    style={{
+                      color: parsed.color ?? '#FFFFFF',
+                      fontWeight: parsed.bold ? 700 : 500,
+                      fontStyle: parsed.italic ? 'italic' : 'normal',
+                      textDecoration: [parsed.underline && 'underline', parsed.strike && 'line-through'].filter(Boolean).join(' ') || 'none',
+                      fontSize: '1.05rem',
+                      lineHeight: 1.35,
+                      textShadow: '0 1px 3px rgba(0,0,0,0.95), 0 0 6px rgba(0,0,0,0.8), 1px 1px 0 rgba(0,0,0,0.9), -1px -1px 0 rgba(0,0,0,0.9)',
+                    }}
+                  >
+                    {parsed.lines.map((l, i) => (
+                      <React.Fragment key={i}>
+                        {i > 0 && <br />}
+                        {l}
+                      </React.Fragment>
+                    ))}
+                  </div>
+                )
+              })}
             </div>
           )}
         </div>

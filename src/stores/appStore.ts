@@ -9,6 +9,8 @@ interface AppState {
   selectedEpisodeId: number | null
   showSettings: boolean
   showModelBrowser: boolean
+  showTeams: boolean
+  showContact: boolean
   activeJobs: Map<string, JobStatus>
   activeProfile: Profile | null
   incomingPowerShareRequest: PowerShareRequestPayload | null
@@ -16,6 +18,12 @@ interface AppState {
   lendingStatus: PowerShareLendingPayload | null
   borrowingStatus: PowerShareBorrowingPayload | null
   forceUpdateNotice: { from_name: string } | null
+  teamInviteNotice: { invite_id: string; team_id: string; team_name: string } | null
+  // Bumped to Date.now() whenever the backend pulls a fresh shared-titles
+  // snapshot (see backend discovery_service.py's "shared_content_updated"
+  // relay/heartbeat handling) — components showing titles/episodes watch
+  // this in a useEffect to silently refetch, no window-switching needed.
+  sharedContentUpdatedAt: number
 
   setBackendPort: (port: number) => void
   setBackendReady: (ready: boolean) => void
@@ -24,10 +32,13 @@ interface AppState {
   setSelectedEpisode: (id: number | null) => void
   setShowSettings: (show: boolean) => void
   setShowModelBrowser: (show: boolean) => void
+  setShowTeams: (show: boolean) => void
+  setShowContact: (show: boolean) => void
   setActiveProfile: (profile: Profile | null) => void
   clearIncomingPowerShareRequest: () => void
   clearIncomingModelDownloadRequest: () => void
   clearForceUpdateNotice: () => void
+  clearTeamInviteNotice: () => void
   upsertJob: (job: JobStatus) => void
   removeJob: (jobId: string) => void
   reconcileActiveJobs: (liveJobIds: string[]) => void
@@ -42,6 +53,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectedEpisodeId: null,
   showSettings: false,
   showModelBrowser: false,
+  showTeams: false,
+  showContact: false,
   activeJobs: new Map(),
   activeProfile: null,
   incomingPowerShareRequest: null,
@@ -49,19 +62,41 @@ export const useAppStore = create<AppState>((set, get) => ({
   lendingStatus: null,
   borrowingStatus: null,
   forceUpdateNotice: null,
+  teamInviteNotice: null,
+  sharedContentUpdatedAt: 0,
 
   setBackendPort: (port) => set({ backendPort: port }),
   setBackendReady: (ready) => set({ backendReady: ready }),
   setTitles: (titles) => set({ titles }),
-  setSelectedTitle: (id) => set({ selectedTitleId: id, selectedEpisodeId: null, showSettings: false, showModelBrowser: false }),
+  setSelectedTitle: (id) => set({ selectedTitleId: id, selectedEpisodeId: null, showSettings: false, showModelBrowser: false, showTeams: false, showContact: false }),
   setSelectedEpisode: (id) => set({ selectedEpisodeId: id }),
   setShowSettings: (show) => set((state) => ({
     showSettings: show,
     showModelBrowser: show ? false : state.showModelBrowser,
+    showTeams: show ? false : state.showTeams,
+    showContact: show ? false : state.showContact,
   })),
   setShowModelBrowser: (show) => set((state) => ({
     showModelBrowser: show,
     showSettings: show ? false : state.showSettings,
+    showTeams: show ? false : state.showTeams,
+    showContact: show ? false : state.showContact,
+    selectedTitleId: show ? null : state.selectedTitleId,
+    selectedEpisodeId: show ? null : state.selectedEpisodeId,
+  })),
+  setShowTeams: (show) => set((state) => ({
+    showTeams: show,
+    showSettings: show ? false : state.showSettings,
+    showModelBrowser: show ? false : state.showModelBrowser,
+    showContact: show ? false : state.showContact,
+    selectedTitleId: show ? null : state.selectedTitleId,
+    selectedEpisodeId: show ? null : state.selectedEpisodeId,
+  })),
+  setShowContact: (show) => set((state) => ({
+    showContact: show,
+    showSettings: show ? false : state.showSettings,
+    showModelBrowser: show ? false : state.showModelBrowser,
+    showTeams: show ? false : state.showTeams,
     selectedTitleId: show ? null : state.selectedTitleId,
     selectedEpisodeId: show ? null : state.selectedEpisodeId,
   })),
@@ -69,6 +104,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   clearIncomingPowerShareRequest: () => set({ incomingPowerShareRequest: null }),
   clearIncomingModelDownloadRequest: () => set({ incomingModelDownloadRequest: null }),
   clearForceUpdateNotice: () => set({ forceUpdateNotice: null }),
+  clearTeamInviteNotice: () => set({ teamInviteNotice: null }),
 
   upsertJob: (job) => set((state) => {
     const jobs = new Map(state.activeJobs)
@@ -124,6 +160,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
     if (msg.type === 'force_update_request') {
       set({ forceUpdateNotice: msg.data as unknown as { from_name: string } })
+      return
+    }
+    if (msg.type === 'team_invite') {
+      set({ teamInviteNotice: msg.data as unknown as { invite_id: string; team_id: string; team_name: string } })
+      return
+    }
+    if (msg.type === 'shared_content_updated') {
+      set({ sharedContentUpdatedAt: Date.now() })
       return
     }
     if (!msg.job_id) return

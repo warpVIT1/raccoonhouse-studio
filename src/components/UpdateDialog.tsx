@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { Spinner } from './ui/Spinner'
 import { useBackdropClose } from '../hooks/useBackdropClose'
+import { MiniMarkdown } from '../utils/miniMarkdown'
 
 interface UpdateState {
   status: string
@@ -53,9 +54,10 @@ export function UpdateDialog() {
         </div>
 
         {state.releaseNotes && (
-          <div className="text-xs text-rh-text-dim leading-relaxed whitespace-pre-wrap bg-rh-bg border border-rh-border rounded-lg p-3 max-h-56 overflow-y-auto">
-            {state.releaseNotes}
-          </div>
+          <MiniMarkdown
+            text={state.releaseNotes}
+            className="text-xs text-rh-text-dim leading-relaxed flex flex-col gap-1 bg-rh-bg border border-rh-border rounded-lg p-3 max-h-56 overflow-y-auto"
+          />
         )}
 
         {state.status === 'downloading' && (

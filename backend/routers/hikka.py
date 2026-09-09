@@ -28,4 +28,7 @@ def set_poster_from_url(title_id: int, body: PosterFromUrlRequest, db: Session =
     title.poster_path = body.image_url
     db.commit()
     db.refresh(title)
+    if title.shared_id:
+        from ..services import sync_service
+        sync_service.push_title(title_id, db)
     return TitleOut.model_validate(title)

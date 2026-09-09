@@ -1,11 +1,12 @@
 import React, { useState, useEffect } from 'react'
 import { useAppStore } from '../../stores/appStore'
+import { useApi } from '../../hooks/useApi'
 import { ProfileModal } from '../ProfileModal'
 import logoUrl from '../../assets/logo.png'
 
 interface SidebarProps {
-  view: 'titles' | 'title' | 'episode' | 'settings' | 'browser'
-  onNavigate: (view: 'titles' | 'settings' | 'browser') => void
+  view: 'titles' | 'title' | 'episode' | 'settings' | 'browser' | 'teams' | 'contact'
+  onNavigate: (view: 'titles' | 'settings' | 'browser' | 'teams' | 'contact') => void
 }
 
 export function Sidebar({ view, onNavigate }: SidebarProps) {
@@ -14,10 +15,46 @@ export function Sidebar({ view, onNavigate }: SidebarProps) {
   const isLibraryArea = view === 'titles' || view === 'title' || view === 'episode'
   const [showProfileModal, setShowProfileModal] = useState(false)
   const [appVersion, setAppVersion] = useState('')
+  // avatar_url always points at the Worker's own proxy even for a profile
+  // with no Telegram photo at all (see ProfileModal.tsx's identical
+  // fallback) — that 404s, so this drops back to the usual color-initials
+  // badge instead of a broken image. Reset per profile id so switching to
+  // a DIFFERENT profile with its own real photo gets a fresh attempt.
+  const [avatarFailed, setAvatarFailed] = useState(false)
+  useEffect(() => { setAvatarFailed(false) }, [activeProfile?.id])
+  const { get } = useApi()
+  // The "Команди" icon (and everything behind it) is hidden from anyone
+  // who isn't already in a team and isn't the app admin — team admins/
+  // members only ever see THEIR OWN team, and outsiders shouldn't even
+  // know the page exists (confirmed live 2026-08-05: an earlier version
+  // let any user browse every team's name via a join dropdown). Someone
+  // invited while this is hidden still gets the live TeamInviteBanner popup
+  // regardless — accepting it is what makes this icon appear, via the poll
+  // below picking up their new membership shortly after.
+  const [canSeeTeams, setCanSeeTeams] = useState(false)
 
   useEffect(() => {
     window.electronAPI?.getAppVersion().then(setAppVersion).catch(() => {})
   }, [])
+
+  useEffect(() => {
+    if (!backendReady) return
+    let cancelled = false
+    async function check() {
+      try {
+        const [admin, mine] = await Promise.all([
+          get<{ is_app_admin: boolean }>('/teams/is-app-admin'),
+          get<unknown[]>('/teams/mine'),
+        ])
+        if (!cancelled) setCanSeeTeams(admin.is_app_admin || mine.length > 0)
+      } catch {
+        if (!cancelled) setCanSeeTeams(false)
+      }
+    }
+    check()
+    const interval = setInterval(check, 15000)
+    return () => { cancelled = true; clearInterval(interval) }
+  }, [backendReady, get, activeProfile])
 
   return (
     <aside className="w-14 flex flex-col items-center py-3 bg-rh-bg border-r border-rh-border flex-shrink-0">
@@ -49,6 +86,23 @@ export function Sidebar({ view, onNavigate }: SidebarProps) {
             <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
           </svg>
         </SidebarIcon>
+        {canSeeTeams && (
+          <SidebarIcon active={view === 'teams'} onClick={() => onNavigate('teams')} title="Команди">
+            {/* People icon */}
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+              <circle cx="9" cy="7" r="4" />
+              <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+              <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+            </svg>
+          </SidebarIcon>
+        )}
+        <SidebarIcon active={view === 'contact'} onClick={() => onNavigate('contact')} title="Зв'язок з розробником">
+          {/* Message/mail icon */}
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+          </svg>
+        </SidebarIcon>
         <SidebarIcon active={view === 'settings'} onClick={() => onNavigate('settings')} title="Налаштування">
           {/* Gear icon */}
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -68,10 +122,21 @@ export function Sidebar({ view, onNavigate }: SidebarProps) {
       <button
         onClick={() => setShowProfileModal(true)}
         title={activeProfile ? `${activeProfile.name} — ${activeProfile.role}` : 'Створити профіль'}
-        className="w-[30px] h-[30px] rounded-full flex items-center justify-center text-[10px] font-extrabold text-white cursor-pointer no-drag transition-transform hover:scale-105"
+        className="w-[30px] h-[30px] rounded-full flex items-center justify-center text-[10px] font-extrabold text-white cursor-pointer no-drag transition-transform hover:scale-105 overflow-hidden"
         style={{ background: activeProfile ? activeProfile.color : 'linear-gradient(140deg,#38383F,#221F22)' }}
       >
-        {activeProfile ? initials(activeProfile.name) : '+'}
+        {activeProfile?.avatar_url && !avatarFailed ? (
+          <img
+            src={activeProfile.avatar_url}
+            alt={activeProfile.name}
+            onError={() => setAvatarFailed(true)}
+            className="w-full h-full object-cover"
+          />
+        ) : activeProfile ? (
+          initials(activeProfile.name)
+        ) : (
+          '+'
+        )}
       </button>
 
       {showProfileModal && <ProfileModal onClose={() => setShowProfileModal(false)} />}

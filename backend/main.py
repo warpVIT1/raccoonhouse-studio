@@ -51,9 +51,16 @@ if gpu_runtime_service.is_gpu_enabled_setting() and gpu_runtime_service.is_torch
 # separator_service.py's _patch_separator_gpu_detection(), since it only
 # needs to run right before a Separator() gets instantiated, not this early.
 
+# Admin-pushed audio-separator updates (see lib_runtime_service.py) — same
+# "must run before anything imports it" constraint as torch above, since
+# separator_service.py does `from audio_separator...` at module level.
+from backend.services import lib_runtime_service
+if lib_runtime_service.installed_version():
+    sys.path.insert(0, lib_runtime_service.audio_separator_sys_path())
+
 from backend.database import init_db, SessionLocal
 from backend import job_manager
-from backend.routers import titles, episodes, characters, subtitles, markers, jobs, settings, hikka, profiles, power_share, separation_models, feedback, reports, model_browser
+from backend.routers import titles, episodes, characters, subtitles, markers, jobs, settings, hikka, profiles, power_share, separation_models, feedback, reports, errors, model_browser, teams, translation, actor_audio, backup
 from backend.services.ffmpeg_service import get_waveform_samples
 from backend.services import discovery_service, separator_service
 from backend.services.power_share_service import app_logger
@@ -80,13 +87,27 @@ def _discovery_state():
     try:
         s = db.get(AppSettings, 1)
         if not s:
-            return "?", False, False
+            return "?", False, False, "", [], None, None
         name = "?"
+        team_device_id = ""
+        roles: list[str] = []
+        telegram_id = None
+        telegram_username = None
         if s.active_profile_id:
             profile = db.get(Profile, s.active_profile_id)
             if profile:
                 name = profile.name
-        return name, bool(s.power_share_enabled), bool(s.active_profile_id)
+                # Lets a live team-invite relay (see team_service.invite_member)
+                # find THIS connection — the relay is addressed by the
+                # profile-scoped id, which the Worker otherwise has no way to
+                # associate with any connected WebSocket (see the "hello"
+                # handler in cloudflare-signaling/src/index.ts).
+                from .services import device_identity_service
+                team_device_id = device_identity_service.get_profile_id(name)
+                roles = profile.roles or []
+                telegram_id = profile.telegram_id
+                telegram_username = profile.telegram_username
+        return name, bool(s.power_share_enabled), bool(s.active_profile_id), team_device_id, roles, telegram_id, telegram_username
     finally:
         db.close()
 
@@ -133,9 +154,10 @@ async def lifespan(app: FastAPI):
         # Runs once shortly after launch and then every few hours for the
         # rest of the app's lifetime — deletes per-episode batch-separation
         # "listen and pick" libraries (every curated model's own FLAC output)
-        # once they're a few days old, so trying out all the models doesn't
-        # quietly accumulate multi-GB folders per episode forever. See
-        # separator_service.cleanup_stale_batch_libraries's docstring.
+        # and individually-archived past isolation results once they're 48h
+        # old, so trying out models doesn't quietly accumulate multi-GB
+        # folders per episode forever. See separator_service's
+        # cleanup_stale_batch_libraries/cleanup_stale_separation_history.
         while True:
             try:
                 removed = await asyncio.get_event_loop().run_in_executor(
@@ -145,6 +167,14 @@ async def lifespan(app: FastAPI):
                     app_logger.info("batch-library-cleanup: removed %s stale episode librar%s", removed, "y" if removed == 1 else "ies")
             except Exception:
                 app_logger.exception("batch-library-cleanup: failed")
+            try:
+                removed_history = await asyncio.get_event_loop().run_in_executor(
+                    None, separator_service.cleanup_stale_separation_history
+                )
+                if removed_history:
+                    app_logger.info("separation-history-cleanup: removed %s stale file%s", removed_history, "" if removed_history == 1 else "s")
+            except Exception:
+                app_logger.exception("separation-history-cleanup: failed")
             await asyncio.sleep(6 * 3600)
 
     asyncio.create_task(_batch_library_cleanup_loop())
@@ -212,7 +242,12 @@ app.include_router(power_share.router, prefix="/api")
 app.include_router(separation_models.router, prefix="/api")
 app.include_router(feedback.router, prefix="/api")
 app.include_router(reports.router, prefix="/api")
+app.include_router(errors.router, prefix="/api")
+app.include_router(actor_audio.router, prefix="/api")
 app.include_router(model_browser.router, prefix="/api")
+app.include_router(teams.router, prefix="/api")
+app.include_router(translation.router, prefix="/api")
+app.include_router(backup.router, prefix="/api")
 
 
 @app.websocket("/ws")

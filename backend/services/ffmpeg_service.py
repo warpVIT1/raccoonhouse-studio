@@ -6,6 +6,7 @@ ffmpeg pipeline:
     finishes rather than waiting on a second, slower re-encode step.
   - mux: final mux with rendered audio against original video container
 """
+import hashlib
 import os
 import subprocess
 import json
@@ -221,6 +222,7 @@ def run_import_pipeline(
         reporter.update(95, "Оновлюю базу даних…")
 
         ep.original_file_path = file_path
+        ep.original_filename = os.path.basename(file_path)
         ep.audio_stem_path = result["audio_path"]
         ep.original_size = result["file_size"]
         ep.original_bitrate = result["bit_rate"]
@@ -229,6 +231,10 @@ def run_import_pipeline(
         ep.status = "processing"
         db.commit()
         app_logger.info("run_import_pipeline: episode %s done, audio_path=%s", episode_id, result["audio_path"])
+
+        if ep.title.shared_id:
+            from .sync_service import push_episode_video_async
+            push_episode_video_async(episode_id)
 
         reporter.update(100, "Аудіо готове")
         return {"audio_path": result["audio_path"]}
@@ -405,29 +411,119 @@ def _run_mux_pipeline(
     return result
 
 
-def get_waveform_samples(audio_path: str, num_samples: int = 2000) -> tuple[list[float], float, int]:
-    """Return downsampled RMS amplitude array for waveform display."""
+WAVEFORM_CACHE_DIR = Path(DATA_DIR) / "cache" / "waveform"
+
+
+def _waveform_cache_path(audio_path: str, num_samples: int) -> "Path | None":
     try:
-        import soundfile as sf
-        import numpy as np
+        mtime = int(os.path.getmtime(audio_path))
+    except OSError:
+        return None
+    key = hashlib.md5(audio_path.encode("utf-8")).hexdigest()
+    return WAVEFORM_CACHE_DIR / f"{key}_{mtime}_{num_samples}.json"
 
-        data, sr = sf.read(audio_path, dtype="float32", always_2d=True)
-        mono = data.mean(axis=1)
-        duration = len(mono) / sr
 
-        # Chunk into num_samples windows
-        chunk_size = max(1, len(mono) // num_samples)
-        chunks = [mono[i:i+chunk_size] for i in range(0, len(mono), chunk_size)]
-        rms = [float(np.sqrt(np.mean(c**2))) for c in chunks[:num_samples]]
-
-        # Normalize 0–1
-        max_rms = max(rms) if rms else 1.0
-        if max_rms > 0:
-            rms = [v / max_rms for v in rms]
-
-        return rms, duration, sr
+def _read_waveform_cache(audio_path: str, num_samples: int) -> "tuple[list[float], float, int] | None":
+    path = _waveform_cache_path(audio_path, num_samples)
+    if not path or not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data["samples"], data["duration"], data["sample_rate"]
     except Exception:
+        return None
+
+
+def _write_waveform_cache(audio_path: str, num_samples: int, result: tuple[list[float], float, int]) -> None:
+    path = _waveform_cache_path(audio_path, num_samples)
+    if not path:
+        return
+    samples, duration, sample_rate = result
+    try:
+        WAVEFORM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps({"samples": samples, "duration": duration, "sample_rate": sample_rate}),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, path)
+    except OSError:
+        pass
+
+
+def _rms_downsample(mono, sr: int, num_samples: int) -> list[float]:
+    """Shared by both decode paths below — chunks a mono float array into
+    `num_samples` windows and returns their 0-1-normalized RMS amplitude."""
+    import numpy as np
+
+    chunk_size = max(1, len(mono) // num_samples)
+    chunks = [mono[i:i+chunk_size] for i in range(0, len(mono), chunk_size)]
+    rms = [float(np.sqrt(np.mean(c**2))) for c in chunks[:num_samples]]
+    max_rms = max(rms) if rms else 1.0
+    if max_rms > 0:
+        rms = [v / max_rms for v in rms]
+    return rms
+
+
+def _get_waveform_via_soundfile(audio_path: str, num_samples: int) -> tuple[list[float], float, int]:
+    import soundfile as sf
+
+    data, sr = sf.read(audio_path, dtype="float32", always_2d=True)
+    mono = data.mean(axis=1)
+    duration = len(mono) / sr
+    return _rms_downsample(mono, sr, num_samples), duration, sr
+
+
+def _get_waveform_via_ffmpeg(audio_path: str, num_samples: int) -> tuple[list[float], float, int]:
+    """Fallback for anything soundfile/libsndfile can't decode directly —
+    notably the original video container (H.264/AAC etc.), which a
+    translator's workspace has no separated vocal stem for at all. Decodes
+    to raw mono PCM at a downsampled rate (proportional to how many RMS
+    samples we actually need) rather than the source's native rate, so a
+    feature-length episode's decode/pipe stays small and fast."""
+    import numpy as np
+
+    probe = _probe(audio_path)
+    duration = float(probe.get("format", {}).get("duration", 0)) or 0
+    if duration <= 0:
         return [], 0.0, 48000
+
+    target_sr = int(min(8000, max(200, num_samples * 8 / duration)))
+    cmd = [
+        _ffmpeg_bin(), "-v", "error",
+        "-i", audio_path,
+        "-vn", "-ac", "1", "-ar", str(target_sr), "-f", "f32le",
+        "pipe:1",
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=120)
+    if result.returncode != 0 or not result.stdout:
+        return [], 0.0, 48000
+
+    mono = np.frombuffer(result.stdout, dtype="<f4")
+    if len(mono) == 0:
+        return [], 0.0, 48000
+    return _rms_downsample(mono, target_sr, num_samples), duration, target_sr
+
+
+def get_waveform_samples(audio_path: str, num_samples: int = 2000) -> tuple[list[float], float, int]:
+    """Return downsampled RMS amplitude array for waveform display. Tries
+    the fast soundfile path first (works for WAV vocal stems with no
+    subprocess spawn); anything it can't decode — most notably a video
+    container — falls back to an ffmpeg decode. Both paths are cached on
+    disk, keyed by path+mtime, since a vocal stem re-isolation overwrites
+    the same filename in place and correctly busts the cache."""
+    cached = _read_waveform_cache(audio_path, num_samples)
+    if cached is not None:
+        return cached
+    try:
+        result = _get_waveform_via_soundfile(audio_path, num_samples)
+    except Exception:
+        try:
+            result = _get_waveform_via_ffmpeg(audio_path, num_samples)
+        except Exception:
+            result = ([], 0.0, 48000)
+    _write_waveform_cache(audio_path, num_samples, result)
+    return result
 
 
 def _parse_time(line: str) -> float:

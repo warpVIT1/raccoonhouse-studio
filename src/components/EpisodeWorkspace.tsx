@@ -5,13 +5,16 @@ import { useBackdropClose } from '../hooks/useBackdropClose'
 import { VideoPlayer, type VideoPlayerHandle } from './workspace/VideoPlayer'
 import { WaveformViewer } from './workspace/WaveformViewer'
 import { SubtitleGrid } from './workspace/SubtitleGrid'
+import { SubtitleEditBox } from './workspace/SubtitleEditBox'
 import { MarkersTab } from './workspace/MarkersTab'
 import { Spinner } from './ui/Spinner'
 import { VocalSeparationModal, type SeparationModel, type SeparationParams } from './VocalSeparationModal'
-import type { Episode, SubtitleLine, Marker, Character, Dubber, JobStatus } from '../types'
+import type { ActorAudioSubmission, Episode, SubtitleLine, Marker, Character, Dubber, JobStatus, Title, TeamActor } from '../types'
 import { playRaccoonChirp } from '../utils/notificationSound'
 
-type WorkspaceTab = 'subtitles' | 'markers'
+// 'audio' only ever appears once there's at least one actor audio
+// submission for this episode — see the audioSubmissions fetch below.
+type WorkspaceTab = 'subtitles' | 'markers' | 'audio'
 
 interface EpisodeWorkspaceProps {
   episodeId: number
@@ -25,17 +28,25 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   const setSelectedEpisode = useAppStore((s) => s.setSelectedEpisode)
   const activeJobs = useAppStore((s) => s.activeJobs)
   const upsertJob = useAppStore((s) => s.upsertJob)
+  const sharedContentUpdatedAt = useAppStore((s) => s.sharedContentUpdatedAt)
 
   const [episode, setEpisode] = useState<Episode | null>(null)
   const [subtitles, setSubtitles] = useState<SubtitleLine[]>([])
   const [markers, setMarkers] = useState<Marker[]>([])
+  const [audioSubmissions, setAudioSubmissions] = useState<ActorAudioSubmission[]>([])
+  const [audioFixDrafts, setAudioFixDrafts] = useState<Record<number, string>>({})
+  const [audioFixMarkerFilePaths, setAudioFixMarkerFilePaths] = useState<Record<number, string>>({})
+  const [audioActionResult, setAudioActionResult] = useState<string | null>(null)
+  const audioFixMarkerInputRefs = useRef<Record<number, HTMLInputElement | null>>({})
   const [characters, setCharacters] = useState<Character[]>([])
+  const [teamActors, setTeamActors] = useState<TeamActor[]>([])
   const [loading, setLoading] = useState(false)
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('subtitles')
   const [activeSubIndex, setActiveSubIndex] = useState<number | null>(null)
   const [currentTimeMs, setCurrentTimeMs] = useState(0)
   const [duration, setDuration] = useState(0)
   const subtitlesUndoStackRef = useRef<SubtitleLine[][]>([])
+  const subtitlesRedoStackRef = useRef<SubtitleLine[][]>([])
 
   // Video panel is resizable both by width (against the waveform) and by
   // height (against the subtitles/markers grid below) — a fixed size felt
@@ -64,7 +75,69 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   const batchResultsBackdrop = useBackdropClose(() => setBatchResults(null))
   const [usingBatchResult, setUsingBatchResult] = useState<string | null>(null)
   const [distributedRunning, setDistributedRunning] = useState(false)
+
+  // "Історія ізоляцій" — every past isolation result for this episode,
+  // archived automatically instead of silently overwritten each time a new
+  // run (or a batch-result pick) replaces the current instrumental (see
+  // backend's separator_service._archive_previous_isolation). Auto-deleted
+  // after 48h, so this is a short working-memory window, not a full archive.
+  const [showHistoryModal, setShowHistoryModal] = useState(false)
+  const [historyItems, setHistoryItems] = useState<{ filename: string; path: string; model: string; created_at: string }[] | null>(null)
+  const [restoringHistory, setRestoringHistory] = useState<string | null>(null)
+  const [savingHistory, setSavingHistory] = useState<string | null>(null)
+  const [savedHistoryFlash, setSavedHistoryFlash] = useState<string | null>(null)
+  const historyBackdrop = useBackdropClose(() => setShowHistoryModal(false))
+
+  function openHistoryModal() {
+    setShowHistoryModal(true)
+    setHistoryItems(null)
+    get<{ filename: string; path: string; model: string; created_at: string }[]>(`/episodes/${episodeId}/separation-history`)
+      .then(setHistoryItems)
+      .catch(() => setHistoryItems([]))
+  }
+
+  // Copies an isolation result (from history, or the current active stem)
+  // out of the app's own internal stems folder to wherever the user picks
+  // — see electron/main.ts's fs:saveFileToChosenFolder.
+  async function saveIsolationToFolder(sourcePath: string, key: string) {
+    if (!window.electronAPI?.saveFileToChosenFolder) return
+    setSavingHistory(key)
+    try {
+      const saved = await window.electronAPI.saveFileToChosenFolder(sourcePath)
+      if (saved) {
+        setSavedHistoryFlash(key)
+        setTimeout(() => setSavedHistoryFlash((k) => (k === key ? null : k)), 2000)
+      }
+    } finally {
+      setSavingHistory(null)
+    }
+  }
+
+  async function restoreHistoryItem(filename: string) {
+    setRestoringHistory(filename)
+    try {
+      await post(`/episodes/${episodeId}/separation-history/restore`, { filename })
+      const fresh = await get<Episode>(`/episodes/${episodeId}`)
+      setEpisode(fresh)
+      setShowHistoryModal(false)
+    } catch (err) {
+      setSeparationError(err instanceof Error ? err.message : 'Не вдалося відновити цю ізоляцію')
+    } finally {
+      setRestoringHistory(null)
+    }
+  }
   const [markersError, setMarkersError] = useState<string | null>(null)
+
+  // "Take a model, separate the vocal, then split THAT into male/female"
+  // (backend: run_mvsep_male_female_split) — MVSep-only, needs credits, so
+  // gated the same way VocalSeparationModal gates the rest of MVSep: hidden
+  // unless eligible AND re-checked server-side on the actual request.
+  const [mvsepEligibleForSplit, setMvsepEligibleForSplit] = useState(false)
+  const [mvsepSplitBusy, setMvsepSplitBusy] = useState(false)
+  const [mvsepSplitError, setMvsepSplitError] = useState<string | null>(null)
+  useEffect(() => {
+    get<{ eligible: boolean }>('/teams/mvsep-eligible').then((r) => setMvsepEligibleForSplit(r.eligible)).catch(() => {})
+  }, [get])
 
   // Final render/mux
   const [rendering, setRendering] = useState(false)
@@ -75,8 +148,42 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   const assInputRef = useRef<HTMLInputElement>(null)
   const [importingAss, setImportingAss] = useState(false)
   const [assDragOver, setAssDragOver] = useState(false)
+  const [markersDragOver, setMarkersDragOver] = useState(false)
+  // Reaper's native marker CSV export writes Bar.Beat.Fraction positions,
+  // not a timecode — converting to seconds needs the project's actual
+  // tempo, which the CSV never carries (see routers/markers.py's
+  // _time_to_seconds). Defaults to Reaper's own new-project default;
+  // shared between the "Імпорт CSV" button and drag-drop below, both of
+  // which feed the same import call.
+  const [markersImportBpm, setMarkersImportBpm] = useState(120)
 
   const videoRef = useRef<VideoPlayerHandle>(null)
+
+  // Shared episode's original video sits in R2 until someone actually asks
+  // for it (see sync_service.download_episode_video's own comment) — this
+  // pulls it on demand. Mirrors DirectorWorkspace.tsx/TranslatorWorkspace.tsx's
+  // identical banner; this generic workspace is what звукорежисер/клінапер
+  // (no dedicated workspace of their own) actually land on, so they need it
+  // here too.
+  const [downloadingOriginal, setDownloadingOriginal] = useState(false)
+  async function handleDownloadOriginal() {
+    if (!backendReady || downloadingOriginal) return
+    setDownloadingOriginal(true)
+    try {
+      const result = await post<{ job_id: string }>(`/episodes/${episodeId}/download-original-video`, {})
+      upsertJob({
+        id: result.job_id, type: 'download_original_video', status: 'running', percent: 0,
+        message: 'Завантажую оригінал з хмари…', episode_id: episodeId,
+      })
+    } catch {
+      /* ignore — same best-effort posture as other job triggers here */
+    } finally {
+      setDownloadingOriginal(false)
+    }
+  }
+  const downloadingOriginalJob = [...activeJobs.values()].find(
+    (j) => j.episode_id === episodeId && j.type === 'download_original_video' && j.status === 'running'
+  )
 
   // Load episode data
   useEffect(() => {
@@ -102,6 +209,53 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     if (!backendReady) return
     get<{ power_share_enabled: boolean }>('/settings').then((s) => setPowerShareEnabled(s.power_share_enabled)).catch(() => {})
   }, [backendReady, get])
+
+  // АКТОР dropdown source — same team-actor lookup as Translator/Director
+  // workspaces (see SubtitleGrid/SubtitleEditBox's teamActors prop).
+  useEffect(() => {
+    if (!backendReady) return
+    get<Title>(`/titles/${titleId}`)
+      .then((title) => (title.team_id ? get<TeamActor[]>(`/teams/${title.team_id}/actors`) : []))
+      .then(setTeamActors)
+      .catch(() => setTeamActors([]))
+  }, [backendReady, titleId, get])
+
+  // "Звукові доріжки" tab — only shown at all once an actor has "Здати"-ed
+  // at least one recording (see ActorWorkspace.tsx's own upload UI).
+  const loadAudioSubmissions = useCallback(() => {
+    if (!backendReady) return
+    get<ActorAudioSubmission[]>(`/episodes/${episodeId}/actor-audio`).then(setAudioSubmissions).catch(() => {})
+  }, [backendReady, episodeId, get])
+  useEffect(() => { loadAudioSubmissions() }, [loadAudioSubmissions])
+
+  // Sound engineer's own fix-request UI — same shape as DirectorWorkspace's
+  // "Звук" tab (see request_actor_audio_fix/import_fix_markers), brought to
+  // parity here since this generic workspace previously had only a bare
+  // download button and nowhere to send feedback back to the actor.
+  // ONE combined "Відправити" — see DirectorWorkspace's identical
+  // handleRequestFix for why text and a staged marker CSV both go out
+  // together in a single request-fix call instead of two separate ones.
+  async function handleAudioRequestFix(submissionId: number) {
+    const message = (audioFixDrafts[submissionId] ?? '').trim()
+    const markerFilePath = audioFixMarkerFilePaths[submissionId]
+    if (!message && !markerFilePath) return
+    try {
+      await post(`/episodes/${episodeId}/actor-audio/${submissionId}/request-fix`, {
+        message, from_role: 'sound_engineer', marker_file_path: markerFilePath, bpm: markersImportBpm,
+      })
+      setAudioFixDrafts((prev) => ({ ...prev, [submissionId]: '' }))
+      setAudioFixMarkerFilePaths((prev) => { const next = { ...prev }; delete next[submissionId]; return next })
+      setAudioActionResult('Правки надіслано актору')
+      loadAudioSubmissions()
+    } catch {
+      setAudioActionResult('Не вдалося надіслати правки')
+    }
+  }
+  // Re-check when a teammate's submission was just pulled in via sync (see
+  // sync_service.py's push_actor_audio_submission) — otherwise a new
+  // submission from an actor on another device only appeared after
+  // leaving and re-entering this episode.
+  useEffect(() => { if (sharedContentUpdatedAt) loadAudioSubmissions() }, [sharedContentUpdatedAt, loadAudioSubmissions])
 
   // Live-refresh: when any background job for this episode finishes (ASS
   // import, separation, marker detection...), refetch its data automatically
@@ -167,6 +321,32 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
         continue
       }
 
+      // Same "no Episode column to update" situation as batch mode above —
+      // neither the male nor the female stem alone IS the episode's vocal,
+      // so this just opens the output folder rather than touching anything.
+      if (job.type === 'mvsep_male_female') {
+        const outputDir = job.result?.output_dir
+        if (typeof outputDir === 'string' && window.electronAPI?.openPath) {
+          window.electronAPI.openPath(outputDir).catch((err) => console.error('[mvsep-male-female] failed to open output folder:', err))
+        }
+        continue
+      }
+
+      // A multistem MVSep model (e.g. "BS Roformer SW (vocals, bass, drums,
+      // guitar, piano, other)") only has room for ONE instrumental in
+      // Episode.vocal_stem_path (it's the sum of every non-vocal stem — see
+      // mvsep_service.run_separation) — but every individual stem is still
+      // downloaded and kept on disk (extra_stems), so a normal single run
+      // opens their folder too instead of silently discarding the rest.
+      const extraStems = job.result?.extra_stems
+      if (job.type === 'separate_vocals' && extraStems && typeof extraStems === 'object' && Object.keys(extraStems).length > 0) {
+        const anyPath = Object.values(extraStems as Record<string, string>)[0]
+        const dir = anyPath.slice(0, Math.max(anyPath.lastIndexOf('/'), anyPath.lastIndexOf('\\')))
+        if (dir && window.electronAPI?.openPath) {
+          window.electronAPI.openPath(dir).catch((err) => console.error('[separate-vocals] failed to open stems folder:', err))
+        }
+      }
+
       get<Episode>(`/episodes/${episodeId}`).then(setEpisode).catch(() => {})
       get<SubtitleLine[]>(`/episodes/${episodeId}/subtitle-lines`).then(setSubtitles).catch(() => {})
       get<Marker[]>(`/episodes/${episodeId}/markers`).then(setMarkers).catch(() => {})
@@ -178,13 +358,32 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     }
   }, [activeJobs, backendReady, episodeId, titleId, get])
 
-  // Sync active subtitle to playhead
+  // Sync active subtitle to playhead. Overlapping lines (sign/overlay text
+  // sharing a time range with dialogue — see SubtitleLine.is_overlap) are
+  // normal in this data model, so more than one line can satisfy the time
+  // check at once; a plain findIndex always picks the first (topmost) one.
+  // That silently overrode an explicit row click: handleSubLineClick seeks
+  // the video to the clicked line's start_ms, which re-fires this effect,
+  // and if an earlier overlapping line also covers that timestamp the
+  // selection snapped back up to it — looked exactly like "clicking a lower
+  // row doesn't select it and scrolls back to the top" (confirmed live).
+  // Keeping the already-active line active as long as the playhead is still
+  // within ITS OWN range fixes that without changing natural forward-
+  // playback behavior (a genuinely new range still searches fresh below).
   useEffect(() => {
     if (!subtitles.length) return
-    const idx = subtitles.findIndex(
-      (s) => currentTimeMs >= s.start_ms && currentTimeMs <= s.end_ms
-    )
-    setActiveSubIndex(idx >= 0 ? idx : null)
+    setActiveSubIndex((prev) => {
+      if (prev != null) {
+        const current = subtitles[prev]
+        if (current && currentTimeMs >= current.start_ms && currentTimeMs <= current.end_ms) {
+          return prev
+        }
+      }
+      const idx = subtitles.findIndex(
+        (s) => currentTimeMs >= s.start_ms && currentTimeMs <= s.end_ms
+      )
+      return idx >= 0 ? idx : null
+    })
   }, [currentTimeMs, subtitles])
 
   // Keyboard shortcuts: Space play/pause, Left/Right seek ±2s (Shift ±10s).
@@ -276,10 +475,28 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     }
   }, [backendReady, post, titleId])
 
+  const handlePickTeamActor = useCallback(async (deviceId: string, displayName: string): Promise<Character | null> => {
+    if (!backendReady) return null
+    try {
+      const created = await post<Character>('/characters', { title_id: titleId, name: displayName, team_device_id: deviceId })
+      setCharacters((prev) => (prev.some((c) => c.id === created.id) ? prev : [...prev, created]))
+      return created
+    } catch {
+      return null
+    }
+  }, [backendReady, post, titleId])
+
+  // Any fresh edit invalidates whatever "future" redo would have restored —
+  // standard undo/redo semantics, same as every text editor.
+  const pushUndo = useCallback((snapshot: SubtitleLine[]) => {
+    subtitlesUndoStackRef.current.push(snapshot)
+    subtitlesRedoStackRef.current = []
+  }, [])
+
   const handleSubLineChange = useCallback(async (idx: number, changes: Partial<SubtitleLine>) => {
     const line = subtitles[idx]
     if (!line) return
-    subtitlesUndoStackRef.current.push(subtitles)
+    pushUndo(subtitles)
     const updated = { ...line, ...changes }
     setSubtitles((prev) => {
       const next = [...prev]
@@ -289,10 +506,10 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     if (backendReady) {
       await put(`/subtitle-lines/${line.id}`, changes).catch(() => {})
     }
-  }, [subtitles, backendReady, put])
+  }, [subtitles, backendReady, put, pushUndo])
 
   const handleAddSubLine = useCallback(async () => {
-    subtitlesUndoStackRef.current.push(subtitles)
+    pushUndo(subtitles)
     const newLine: SubtitleLine = {
       id: Date.now(),
       episode_id: episodeId,
@@ -302,24 +519,69 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
       character_id: null,
       ass_style: 'Default',
       is_overlap: false,
+      layer: 0,
+      margin_l: 0,
+      margin_r: 0,
+      margin_v: 0,
     }
+    let created = newLine
     if (backendReady) {
-      const created = await post<SubtitleLine>(`/episodes/${episodeId}/subtitle-lines`, {
+      created = await post<SubtitleLine>(`/episodes/${episodeId}/subtitle-lines`, {
         start_ms: newLine.start_ms,
         end_ms: newLine.end_ms,
         text: '',
         ass_style: 'Default',
       }).catch(() => newLine)
-      setSubtitles((prev) => [...prev, created].sort((a, b) => a.start_ms - b.start_ms))
-    } else {
-      setSubtitles((prev) => [...prev, newLine].sort((a, b) => a.start_ms - b.start_ms))
     }
-  }, [episodeId, currentTimeMs, backendReady, post, subtitles])
+    // Select the line this just created — "always have a line to type
+    // into" (see SubtitleEditBox's Enter-to-advance, which relies on this
+    // for the "advance past the last line" case). start_ms is set to
+    // currentTimeMs above, so the playhead-sync effect's own independent
+    // search converges on the same index regardless of timing — no race
+    // with that effect the way selecting an unrelated existing line could.
+    setSubtitles((prev) => {
+      const next = [...prev, created].sort((a, b) => a.start_ms - b.start_ms)
+      setActiveSubIndex(next.findIndex((l) => l.id === created.id))
+      return next
+    })
+    return created
+  }, [episodeId, currentTimeMs, backendReady, post, subtitles, pushUndo])
+
+  // SubtitleEditBox's Enter key: commit (handled by the box itself via
+  // onCommitText) then move on — to the next existing line if there is
+  // one, otherwise create a fresh one to keep typing into.
+  const handleEditBoxCommitText = useCallback((id: number, text: string) => {
+    const idx = subtitles.findIndex((l) => l.id === id)
+    if (idx >= 0) handleSubLineChange(idx, { text })
+  }, [subtitles, handleSubLineChange])
+
+  // Toolbar fields (style/actor/layer/margins/timing) — same id-to-index
+  // translation as handleEditBoxCommitText, generalized to any subset of
+  // SubtitleLine's fields instead of just text.
+  const handleEditBoxFieldChange = useCallback((id: number, changes: Partial<SubtitleLine>) => {
+    const idx = subtitles.findIndex((l) => l.id === id)
+    if (idx >= 0) handleSubLineChange(idx, changes)
+  }, [subtitles, handleSubLineChange])
+
+  const handleEditBoxAdvance = useCallback(() => {
+    if (activeSubIndex == null) return
+    const nextIdx = activeSubIndex + 1
+    if (nextIdx < subtitles.length) {
+      handleSubLineClick(nextIdx)
+    } else {
+      handleAddSubLine()
+    }
+  }, [activeSubIndex, subtitles.length, handleSubLineClick, handleAddSubLine])
+
+  const handleEditBoxNavigatePrev = useCallback(() => {
+    if (activeSubIndex == null || activeSubIndex <= 0) return
+    handleSubLineClick(activeSubIndex - 1)
+  }, [activeSubIndex, handleSubLineClick])
 
   const handleDeleteSubLine = useCallback(async (id: number) => {
     const line = subtitles.find((l) => l.id === id)
     if (!line) return
-    subtitlesUndoStackRef.current.push(subtitles)
+    pushUndo(subtitles)
     // Filtering by id (not array index) so deleting several lines in one
     // batch — e.g. multi-select + Del — can't drift: each call here is
     // independent of how many others already ran, unlike index-based
@@ -328,24 +590,22 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     if (backendReady) {
       await del(`/subtitle-lines/${id}`).catch(() => {})
     }
-  }, [subtitles, backendReady, del])
+  }, [subtitles, backendReady, del, pushUndo])
 
   const handleDeleteAllSubLines = useCallback(async () => {
     if (subtitles.length === 0) return
     if (!window.confirm(`Видалити всі ${subtitles.length} реплік? Це незворотньо.`)) return
-    subtitlesUndoStackRef.current.push(subtitles)
+    pushUndo(subtitles)
     setSubtitles([])
     if (backendReady) {
       await del(`/episodes/${episodeId}/subtitle-lines`).catch(() => {})
     }
-  }, [subtitles, backendReady, del, episodeId])
+  }, [subtitles, backendReady, del, episodeId, pushUndo])
 
-  const handleUndoSubLines = useCallback(async () => {
-    const prev = subtitlesUndoStackRef.current.pop()
-    if (!prev) return
-    setSubtitles(prev)
+  const syncRestoredSubtitles = useCallback(async (snapshot: SubtitleLine[]) => {
+    setSubtitles(snapshot)
     if (backendReady) {
-      const payload = prev.map((l) => ({
+      const payload = snapshot.map((l) => ({
         start_ms: l.start_ms,
         end_ms: l.end_ms,
         text: l.text,
@@ -358,6 +618,20 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     }
   }, [backendReady, put, episodeId])
 
+  const handleUndoSubLines = useCallback(async () => {
+    const prev = subtitlesUndoStackRef.current.pop()
+    if (!prev) return
+    subtitlesRedoStackRef.current.push(subtitles)
+    await syncRestoredSubtitles(prev)
+  }, [subtitles, syncRestoredSubtitles])
+
+  const handleRedoSubLines = useCallback(async () => {
+    const next = subtitlesRedoStackRef.current.pop()
+    if (!next) return
+    subtitlesUndoStackRef.current.push(subtitles)
+    await syncRestoredSubtitles(next)
+  }, [subtitles, syncRestoredSubtitles])
+
   // Ctrl+V inserts copies of the clipboard lines starting at the current
   // playhead, preserving whatever time gaps existed between them in the
   // original copy so multi-line pastes don't collapse onto one timestamp.
@@ -366,7 +640,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     atMs: number
   ) => {
     if (items.length === 0) return
-    subtitlesUndoStackRef.current.push(subtitles)
+    pushUndo(subtitles)
     const baseStart = items[0].start_ms
     const created: SubtitleLine[] = []
     for (let i = 0; i < items.length; i++) {
@@ -390,7 +664,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
       }
     }
     setSubtitles((prev) => [...prev, ...created].sort((a, b) => a.start_ms - b.start_ms))
-  }, [subtitles, backendReady, post, episodeId])
+  }, [subtitles, backendReady, post, episodeId, pushUndo])
 
   // Marker handlers
   const handleMarkerConfirm = useCallback(async (id: number) => {
@@ -426,6 +700,38 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
       setMarkers((prev) => [...prev, newMarker])
     }
   }, [episodeId, backendReady, post])
+
+  // Bulk-assigns every marker of one color to one actor at once — the
+  // "Кольори" legend panel's per-color picker.
+  const handleAssignMarkerColor = useCallback(async (color: string, characterId: number | null) => {
+    setMarkers((prev) => prev.map((m) => (m.color === color ? { ...m, character_id: characterId } : m)))
+    if (backendReady) {
+      await put(`/episodes/${episodeId}/markers/by-color`, { color, character_id: characterId }).catch(() => {})
+    }
+  }, [backendReady, put, episodeId])
+
+  const handleImportMarkers = useCallback(async (file: File, bpm: number) => {
+    if (!backendReady) return
+    const filePath = (file as File & { path?: string }).path ?? ''
+    if (!filePath) return
+    try {
+      const imported = await post<Marker[]>(`/episodes/${episodeId}/markers/import`, { file_path: filePath, bpm })
+      setMarkers(imported)
+    } catch {
+      /* silent — same posture as ASS import's own drag/drop error handling */
+    }
+  }, [backendReady, post, episodeId])
+
+  function handleMarkersDragOver(e: React.DragEvent) {
+    e.preventDefault()
+    setMarkersDragOver(true)
+  }
+  function handleMarkersDragLeave() { setMarkersDragOver(false) }
+  function handleMarkersDrop(e: React.DragEvent) {
+    e.preventDefault()
+    setMarkersDragOver(false)
+    if (e.dataTransfer.files.length) handleImportMarkers(e.dataTransfer.files[0], markersImportBpm)
+  }
 
   // ASS import
   async function handleAssImport(files: FileList) {
@@ -526,7 +832,10 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   // Asks where to save first (native folder dialog), same pattern as
   // handleRender above — cancelling the dialog aborts the batch run
   // entirely rather than silently falling back to the internal data dir.
-  async function handleBatchSeparate() {
+  // mvsepModels, when passed (VocalSeparationModal's own MVSep batch mode),
+  // switches the backend onto run_mvsep_batch_separation instead — each
+  // entry there spends real studio credits, unlike the free local batch.
+  async function handleBatchSeparate(mvsepModels?: Array<{ label: string; sepType: string; addOpt1: string }>) {
     if (!backendReady || !episode?.original_file_path) return
     let outputDir: string | null = null
     if (window.electronAPI?.openDirectory) {
@@ -538,13 +847,14 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     try {
       const result = await post<{ job_id: string }>(`/episodes/${episodeId}/batch-separate-vocals`, {
         output_dir: outputDir,
+        ...(mvsepModels ? { mvsep_models: mvsepModels } : {}),
       })
       upsertJob({
         id: result.job_id,
         type: 'batch_separate_vocals',
         status: 'running',
         percent: 0,
-        message: 'Пакетний рендер (усі методи)…',
+        message: mvsepModels ? 'Пакетний рендер MVSep…' : 'Пакетний рендер (усі методи)…',
         episode_id: episodeId,
       })
       setShowSeparationPanel(false)
@@ -620,6 +930,29 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
       // no error. Surfacing it the same way separationError does elsewhere.
       console.error('[detect-markers] request failed:', err)
       setMarkersError(err instanceof Error ? err.message : 'Не вдалося запустити виявлення маркерів')
+    }
+  }
+
+  // "Take a model, separate the vocal, then split THAT into male/female"
+  async function handleMvsepMaleFemale() {
+    if (!backendReady || !vocalIsolated) return
+    setMvsepSplitError(null)
+    setMvsepSplitBusy(true)
+    try {
+      const result = await post<{ job_id: string }>(`/episodes/${episodeId}/mvsep-male-female`, {})
+      upsertJob({
+        id: result.job_id,
+        type: 'mvsep_male_female',
+        status: 'running',
+        percent: 0,
+        message: 'MVSep: розділення за статтю…',
+        episode_id: episodeId,
+      })
+    } catch (err) {
+      console.error('[mvsep-male-female] request failed:', err)
+      setMvsepSplitError(err instanceof Error ? err.message : 'Не вдалося запустити розділення за статтю')
+    } finally {
+      setMvsepSplitBusy(false)
     }
   }
 
@@ -702,6 +1035,14 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
 
   const vocalIsolated = episode?.status === 'vocal_isolated' || episode?.status === 'marked' || episode?.status === 'ready'
 
+  // The sound engineer's own "Звук" tab only deals with tracks the director
+  // has actually forwarded (sent_to_sound_engineer_at set) — before that,
+  // it's still the director's own review pile (see DirectorWorkspace's
+  // "Звук" tab, which has the multi-select "Відправити звукорежисеру"
+  // action). Confirmed with the user 2026-09-08: fixes should NOT be
+  // writable on a track the sound engineer hasn't actually received yet.
+  const forwardedAudioSubmissions = audioSubmissions.filter((s) => s.sent_to_sound_engineer_at)
+
   return (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Top bar */}
@@ -753,6 +1094,18 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
           </span>
         )}
 
+        {mvsepSplitError && (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-red-900/30 text-red-300 max-w-[420px]">
+            <span className="truncate">{mvsepSplitError}</span>
+            <button
+              onClick={() => setMvsepSplitError(null)}
+              className="w-4 h-4 rounded-full flex items-center justify-center text-red-300/70 hover:text-white hover:bg-red-400/20 leading-none flex-shrink-0"
+            >
+              ✕
+            </button>
+          </span>
+        )}
+
         {renderError && (
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-red-900/30 text-red-300 max-w-[420px]">
             <span className="truncate">{renderError}</span>
@@ -773,9 +1126,9 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
                 <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/>
               </svg>
             )}
-            Імпорт ASS
+            Імпорт ASS/SRT
           </button>
-          <input ref={assInputRef} type="file" accept=".ass" className="hidden" onChange={(e) => { if (e.target.files) handleAssImport(e.target.files) }} />
+          <input ref={assInputRef} type="file" accept=".ass,.srt" className="hidden" onChange={(e) => { if (e.target.files) handleAssImport(e.target.files) }} />
 
           {/* Export SRT (per actor) + one combined full ASS, zipped together — see srt_exporter.py */}
           <button onClick={handleExportSrt} className="rh-btn-outline text-xs" disabled={!backendReady}>
@@ -795,6 +1148,39 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
             </svg>
             Ізоляція вокалу
           </button>
+
+          {/* Past isolation results — see backend's separation-history endpoints */}
+          <button onClick={openHistoryModal} className="rh-btn-outline text-xs" title="Прослухати попередні ізоляції цієї серії (зберігаються 48 годин)">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/>
+            </svg>
+            Історія
+          </button>
+
+          {/* Saves the CURRENT active instrumental out of the app's internal
+              stems folder to wherever the user picks — same mechanism as the
+              per-item button in the Історія modal below. */}
+          {episode?.vocal_stem_path && (
+            <button
+              onClick={() => saveIsolationToFolder(episode.vocal_stem_path!, 'current')}
+              disabled={savingHistory === 'current'}
+              className="rh-btn-outline text-xs"
+              title="Зберегти поточну ізоляцію у вибрану папку на диску"
+            >
+              {savingHistory === 'current' ? (
+                <Spinner size={12} />
+              ) : savedHistoryFlash === 'current' ? (
+                '✓ Збережено'
+              ) : (
+                <>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+                  </svg>
+                  Завантажити ізоляцію
+                </>
+              )}
+            </button>
+          )}
 
           {/* Detect markers */}
           <button onClick={handleDetectMarkers} className="rh-btn-outline text-xs" disabled={!vocalIsolated || !backendReady}>
@@ -859,6 +1245,10 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
           powerShareError={powerShareError}
           separationError={separationError}
           disabled={!episode?.original_file_path}
+          vocalIsolated={vocalIsolated}
+          maleFemaleEligible={mvsepEligibleForSplit}
+          maleFemaleSplitBusy={mvsepSplitBusy}
+          onMaleFemaleSplit={handleMvsepMaleFemale}
         />
       )}
 
@@ -876,8 +1266,8 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
             </div>
             <p className="text-xs text-rh-muted">
               Кожна модель дала окремий файл — прослухайте прямо тут і оберіть той, що звучить найкраще:
-              він стане інструменталом цієї серії для рендеру. Ця бібліотека тимчасова — застарілі файли
-              автоматично видаляються за кілька днів, щоб не займати місце.
+              він стане інструменталом цієї серії для рендеру. Ця бібліотека тимчасова — файли
+              автоматично видаляються через 48 годин, щоб не займати місце.
             </p>
             <div className="flex flex-col gap-1.5 max-h-[60vh] overflow-y-auto pr-1">
               {batchResults.items.map((r) => (
@@ -905,12 +1295,88 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
         </div>
       )}
 
+      {showHistoryModal && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" {...historyBackdrop}>
+          <div className="rh-card w-[480px] p-5 flex flex-col gap-3 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold">Історія ізоляцій</h2>
+              <button onClick={() => setShowHistoryModal(false)} className="text-rh-muted hover:text-white text-lg leading-none px-1">✕</button>
+            </div>
+            <p className="text-xs text-rh-muted">
+              Щоразу, коли нова ізоляція (чи вибір результату пакетного рендеру) заміняє поточний
+              інструментал, попередній автоматично потрапляє сюди — прослухайте й за потреби поверніть.
+              Зберігається 48 годин, потім видаляється автоматично.
+            </p>
+            {historyItems === null && (
+              <div className="flex justify-center py-6"><Spinner size={18} className="text-rh-accent" /></div>
+            )}
+            {historyItems?.length === 0 && (
+              <p className="text-xs text-rh-muted text-center py-4">Ще немає попередніх ізоляцій цієї серії.</p>
+            )}
+            {historyItems && historyItems.length > 0 && (
+              <div className="flex flex-col gap-1.5 max-h-[60vh] overflow-y-auto pr-1">
+                {historyItems.map((item) => (
+                  <div key={item.filename} className="flex flex-col gap-1.5 px-3 py-2 rounded-lg border border-rh-border">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="text-xs font-medium truncate">{item.model}</div>
+                        <div className="text-[10.5px] text-rh-muted">{new Date(item.created_at).toLocaleString()}</div>
+                      </div>
+                      <button
+                        onClick={() => saveIsolationToFolder(item.path, item.filename)}
+                        disabled={savingHistory === item.filename}
+                        className="rh-btn-outline text-[11px] px-2.5 py-1 flex-shrink-0"
+                        title="Зберегти файл у вибрану папку на диску"
+                      >
+                        {savingHistory === item.filename ? <Spinner size={11} /> : savedHistoryFlash === item.filename ? '✓ Збережено' : 'Завантажити'}
+                      </button>
+                      <button
+                        onClick={() => restoreHistoryItem(item.filename)}
+                        disabled={restoringHistory === item.filename}
+                        className="rh-btn-outline text-[11px] px-2.5 py-1 flex-shrink-0"
+                      >
+                        {restoringHistory === item.filename ? <Spinner size={11} /> : 'Використати'}
+                      </button>
+                    </div>
+                    <audio
+                      controls
+                      preload="none"
+                      src={`http://localhost:${backendPort}/api/stream?path=${encodeURIComponent(item.path)}`}
+                      className="w-full h-8"
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Main workspace */}
       <div ref={workspaceRef} className="flex-1 flex flex-col overflow-hidden">
         {/* Top: video + waveform — width split between them is resizable */}
         <div ref={topRowRef} className="flex p-2 flex-shrink-0" style={{ height: `${videoHeightPct}%` }}>
           {/* Video player */}
-          <div style={{ width: `${videoWidthPct}%` }} className="min-w-0">
+          <div style={{ width: `${videoWidthPct}%` }} className="min-w-0 relative">
+            {!episode?.original_file_path && episode?.remote_video_transfer_id && (
+              <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-rh-bg/90 rounded-2xl">
+                <span className="text-[11.5px] text-rh-muted px-4 text-center">
+                  Оригінальне відео є в хмарі, але ще не завантажене на цей пристрій
+                </span>
+                <button
+                  onClick={handleDownloadOriginal}
+                  disabled={!backendReady || downloadingOriginal || !!downloadingOriginalJob}
+                  className="rh-btn-primary text-xs flex items-center gap-1.5 disabled:opacity-50"
+                >
+                  {downloadingOriginalJob ? (
+                    <>
+                      <Spinner size={12} />
+                      {downloadingOriginalJob.percent}%
+                    </>
+                  ) : 'Завантажити оригінал'}
+                </button>
+              </div>
+            )}
             <VideoPlayer
               ref={videoRef}
               src={episode?.original_file_path ?? null}
@@ -934,13 +1400,19 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
           {/* Waveform */}
           <div style={{ width: `calc(${100 - videoWidthPct}% - 8px)` }} className="flex-shrink-0">
             <WaveformViewer
-              vocalStemPath={episode?.vocal_stem_path ?? null}
+              audioPath={episode?.vocal_stem_path ?? null}
               currentTime={currentTimeMs / 1000}
               duration={duration}
               markers={markers}
               onSeek={(t) => videoRef.current?.seek(t)}
               onMarkerClick={(m) => videoRef.current?.seek(m.position_seconds)}
               backendPort={backendPort}
+              label="Інструментал (без вокалу)"
+              emptyMessage="Виконайте ізоляцію вокалу для відображення форми хвилі"
+              lines={subtitles}
+              activeIndex={activeSubIndex}
+              onLineTimingChange={handleSubLineChange}
+              onLineActivate={handleSubLineClick}
             />
           </div>
         </div>
@@ -966,39 +1438,72 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
               Маркери
               <span className="ml-1.5 text-rh-muted text-xs">{markers.length}</span>
             </TabButton>
+            {forwardedAudioSubmissions.length > 0 && (
+              <TabButton active={activeTab === 'audio'} onClick={() => setActiveTab('audio')}>
+                Звукові доріжки
+                <span className="ml-1.5 text-rh-muted text-xs">{forwardedAudioSubmissions.length}</span>
+              </TabButton>
+            )}
           </div>
 
           {/* Tab content */}
           <div
             className="flex-1 overflow-hidden relative"
-            onDragOver={activeTab === 'subtitles' ? handleAssDragOver : undefined}
-            onDragLeave={activeTab === 'subtitles' ? handleAssDragLeave : undefined}
-            onDrop={activeTab === 'subtitles' ? handleAssDrop : undefined}
+            onDragOver={activeTab === 'subtitles' ? handleAssDragOver : activeTab === 'markers' ? handleMarkersDragOver : undefined}
+            onDragLeave={activeTab === 'subtitles' ? handleAssDragLeave : activeTab === 'markers' ? handleMarkersDragLeave : undefined}
+            onDrop={activeTab === 'subtitles' ? handleAssDrop : activeTab === 'markers' ? handleMarkersDrop : undefined}
           >
             {assDragOver && (
               <div className="absolute inset-0 z-10 flex items-center justify-center bg-rh-bg/90 border-2 border-dashed border-rh-accent pointer-events-none">
-                <span className="text-sm font-semibold text-rh-accent">Відпустіть, щоб імпортувати ASS-файл</span>
+                <span className="text-sm font-semibold text-rh-accent">Відпустіть, щоб імпортувати ASS/SRT-файл</span>
+              </div>
+            )}
+            {markersDragOver && (
+              <div className="absolute inset-0 z-10 flex items-center justify-center bg-rh-bg/90 border-2 border-dashed border-rh-accent pointer-events-none">
+                <span className="text-sm font-semibold text-rh-accent">Відпустіть, щоб імпортувати CSV з маркерами</span>
               </div>
             )}
             {activeTab === 'subtitles' ? (
-              <SubtitleGrid
-                lines={subtitles}
-                characters={characters}
-                activeIndex={activeSubIndex}
-                currentTimeMs={currentTimeMs}
-                onLineClick={handleSubLineClick}
-                onLineChange={handleSubLineChange}
-                onAddLine={handleAddSubLine}
-                onDeleteLine={handleDeleteSubLine}
-                onDeleteAll={handleDeleteAllSubLines}
-                onUndo={handleUndoSubLines}
-                onPasteLines={handlePasteSubLines}
-                onCreateCharacter={handleCreateCharacter}
-              />
-            ) : (
+              <div className="flex flex-col h-full overflow-hidden">
+                <SubtitleEditBox
+                  line={activeSubIndex != null ? subtitles[activeSubIndex] ?? null : null}
+                  characters={characters}
+                  teamActors={teamActors}
+                  styleOptions={Array.from(new Set(subtitles.map((l) => l.ass_style)))}
+                  onCommitText={handleEditBoxCommitText}
+                  onFieldChange={handleEditBoxFieldChange}
+                  onCreateCharacter={handleCreateCharacter}
+                  onPickTeamActor={handlePickTeamActor}
+                  onAdvance={handleEditBoxAdvance}
+                  onNavigatePrev={handleEditBoxNavigatePrev}
+                  onUndo={handleUndoSubLines}
+                  onRedo={handleRedoSubLines}
+                />
+                <div className="flex-1 min-h-0">
+                  <SubtitleGrid
+                    lines={subtitles}
+                    characters={characters}
+                    teamActors={teamActors}
+                    activeIndex={activeSubIndex}
+                    currentTimeMs={currentTimeMs}
+                    onLineClick={handleSubLineClick}
+                    onLineChange={handleSubLineChange}
+                    onAddLine={handleAddSubLine}
+                    onDeleteLine={handleDeleteSubLine}
+                    onDeleteAll={handleDeleteAllSubLines}
+                    onUndo={handleUndoSubLines}
+                    onRedo={handleRedoSubLines}
+                    onPasteLines={handlePasteSubLines}
+                    onCreateCharacter={handleCreateCharacter}
+                    onPickTeamActor={handlePickTeamActor}
+                  />
+                </div>
+              </div>
+            ) : activeTab === 'markers' ? (
               <MarkersTab
                 markers={markers}
                 characters={characters}
+                teamActors={teamActors}
                 currentTimeMs={currentTimeMs}
                 onConfirm={handleMarkerConfirm}
                 onEdit={handleMarkerEdit}
@@ -1006,7 +1511,107 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
                 onDeleteAll={handleDeleteAllMarkers}
                 onAdd={handleMarkerAdd}
                 onSeek={(t) => videoRef.current?.seek(t)}
+                onAssignColor={handleAssignMarkerColor}
+                onImport={handleImportMarkers}
+                importBpm={markersImportBpm}
+                onImportBpmChange={setMarkersImportBpm}
+                onPickTeamActor={handlePickTeamActor}
               />
+            ) : (
+              <div className="h-full overflow-y-auto p-4 flex flex-col gap-2">
+                {audioActionResult && (
+                  <div className="text-[11px] text-rh-accent flex items-center gap-2">
+                    {audioActionResult}
+                    <button onClick={() => setAudioActionResult(null)} className="text-rh-muted hover:text-white">✕</button>
+                  </div>
+                )}
+                {forwardedAudioSubmissions.map((s) => {
+                  const original = s.fix_of_submission_id
+                    ? audioSubmissions.find((o) => o.id === s.fix_of_submission_id)
+                    : null
+                  return (
+                  <div key={s.id} className="bg-rh-card border border-rh-border rounded-2xl px-4 py-3 flex flex-col gap-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[12.5px] font-bold truncate">
+                          {s.fix_of_submission_id && <span className="mr-1" title="Виправлення">🔧</span>}
+                          {s.filename}
+                        </div>
+                        <div className="text-[10.5px] text-rh-muted mt-0.5">
+                          {s.character_name ?? '—'} · {s.uploaded_by_name} · {new Date(s.created_at).toLocaleString()}
+                          {original && ` · виправлення до «${original.filename}»`}
+                          {s.fix_of_submission_id && (s.accepted_at ? ' · ✓ прийнято режисером' : ' · очікує прийняття режисером')}
+                        </div>
+                      </div>
+                      <button
+                        onClick={async () => {
+                          try {
+                            const result = await get<{ url: string }>(`/episodes/${episodeId}/actor-audio/${s.id}/url`)
+                            window.open(result.url, '_blank')
+                          } catch {
+                            /* ignore — transient signaling hiccup, same posture as the video download button */
+                          }
+                        }}
+                        className="rh-btn-outline text-xs flex-shrink-0"
+                      >
+                        Завантажити
+                      </button>
+                    </div>
+                    <div className="flex flex-col gap-2">
+                      <textarea
+                        value={audioFixDrafts[s.id] ?? ''}
+                        onChange={(e) => setAudioFixDrafts((prev) => ({ ...prev, [s.id]: e.target.value }))}
+                        placeholder="Правки для актора…"
+                        rows={3}
+                        className="bg-rh-bg border border-rh-border rounded-lg px-2 py-1.5 text-[11px] resize-y"
+                      />
+                      <div className="flex items-center gap-2 flex-wrap">
+                      <button
+                        onClick={() => handleAudioRequestFix(s.id)}
+                        disabled={!(audioFixDrafts[s.id] ?? '').trim() && !audioFixMarkerFilePaths[s.id]}
+                        className="rh-btn-primary text-[11px] px-2.5 py-1.5 flex-shrink-0 disabled:opacity-40"
+                      >
+                        Відправити
+                      </button>
+                      <button
+                        onClick={() => audioFixMarkerInputRefs.current[s.id]?.click()}
+                        className="rh-btn-outline text-[11px] px-2.5 py-1.5 flex-shrink-0"
+                        title="Скачайте доріжку, перевірте в Reaper, експортуйте маркери фіксів і додайте CSV — надішлеться разом з текстом одним натисканням «Відправити»"
+                      >
+                        {audioFixMarkerFilePaths[s.id]
+                          ? `Маркери: ${audioFixMarkerFilePaths[s.id].split(/[\\/]/).pop()}`
+                          : `Додати маркери фіксів (.csv)${s.fix_marker_count > 0 ? ` — вже ${s.fix_marker_count}` : ''}`}
+                      </button>
+                      {audioFixMarkerFilePaths[s.id] && (
+                        <button
+                          onClick={() => setAudioFixMarkerFilePaths((prev) => { const next = { ...prev }; delete next[s.id]; return next })}
+                          className="text-[10.5px] text-rh-muted hover:text-white"
+                        >
+                          ✕
+                        </button>
+                      )}
+                      <input
+                        ref={(el) => { audioFixMarkerInputRefs.current[s.id] = el }}
+                        type="file"
+                        accept=".csv"
+                        className="hidden"
+                        onChange={(e) => {
+                          const filePath = (e.target.files?.[0] as (File & { path?: string }) | undefined)?.path
+                          if (filePath) setAudioFixMarkerFilePaths((prev) => ({ ...prev, [s.id]: filePath }))
+                          e.target.value = ''
+                        }}
+                      />
+                      </div>
+                    </div>
+                    {s.fix_message && (
+                      <div className="text-[10.5px] text-rh-muted whitespace-pre-wrap">
+                        Останні правки: «{s.fix_message}»
+                      </div>
+                    )}
+                  </div>
+                  )
+                })}
+              </div>
             )}
           </div>
         </div>

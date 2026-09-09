@@ -43,6 +43,11 @@ win:
   icon: resources/icon.ico
 
 nsis:
+  # Custom uninstall-file-removal step — see resources/installer.nsh's own
+  # comment: without this, every auto-update would silently wipe data/
+  # (electron-builder's default uninstaller does RMDir /r on the whole
+  # install directory, which is where data/ now lives).
+  include: resources/installer.nsh
   # Fixed name (no ${version}, electron-builder's own default) — lets
   # README.md link to .../releases/latest/download/RaccoonHouse-Studio-Setup.exe,
   # which GitHub always resolves to whatever the CURRENT latest release's

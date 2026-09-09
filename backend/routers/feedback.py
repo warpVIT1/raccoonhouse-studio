@@ -4,17 +4,22 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..models import AppSettings, Profile
 from ..schemas import FeedbackCreate, FeedbackOut
-from ..services import discovery_service
+from ..services import device_identity_service, discovery_service
 
 router = APIRouter(prefix="/feedback", tags=["feedback"])
 
 
-def _active_nickname(db: Session) -> str:
+def _active_profile(db: Session) -> "Profile | None":
     settings = db.get(AppSettings, 1)
     if settings and settings.active_profile_id:
-        profile = db.get(Profile, settings.active_profile_id)
-        if profile and profile.name.strip():
-            return profile.name.strip()
+        return db.get(Profile, settings.active_profile_id)
+    return None
+
+
+def _active_nickname(db: Session) -> str:
+    profile = _active_profile(db)
+    if profile and profile.name.strip():
+        return profile.name.strip()
     return "Анонім"
 
 
@@ -23,8 +28,10 @@ def send_feedback(body: FeedbackCreate, db: Session = Depends(get_db)):
     message = body.message.strip()
     if not message:
         raise HTTPException(400, "Повідомлення не може бути порожнім")
+    profile = _active_profile(db)
+    device_id = device_identity_service.get_profile_id(profile.name) if profile else None
     try:
-        feedback_id = discovery_service.submit_feedback(_active_nickname(db), message)
+        feedback_id = discovery_service.submit_feedback(_active_nickname(db), message, device_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception:

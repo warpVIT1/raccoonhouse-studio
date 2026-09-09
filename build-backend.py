@@ -41,6 +41,16 @@ def main():
         "--hidden-import", "uvicorn.lifespan",
         "--hidden-import", "uvicorn.lifespan.on",
         "--hidden-import", "sqlalchemy.dialects.sqlite",
+        # pydantic checks email-validator's INSTALLED VERSION via
+        # importlib.metadata at import time (fastapi.openapi.models pulls in
+        # a Union type that touches pydantic.networks) — the module files
+        # get bundled fine on their own, but PyInstaller doesn't copy a
+        # package's .dist-info metadata by default, so that version check
+        # crashed the whole frozen exe on startup with "No package metadata
+        # was found for email-validator" (confirmed live 2026-09-08, a
+        # regression that wasn't there in earlier builds this session —
+        # likely a fastapi/pydantic version bump pulling this check in).
+        "--copy-metadata", "email-validator",
         "--hidden-import", "audio_separator",
         "--hidden-import", "silero_vad",
         "--hidden-import", "soundfile",

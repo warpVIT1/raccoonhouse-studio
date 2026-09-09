@@ -402,6 +402,7 @@ def run_distributed_separation(
             ep.vocal_only_stem_path = final_vocal_only
             ep.status = "vocal_isolated"
             bump_title_in_progress(db, ep.title_id)
+            separator_service.snapshot_current_into_history(ep, ep_dir)
             db.commit()
 
             shutil.rmtree(work_dir, ignore_errors=True)

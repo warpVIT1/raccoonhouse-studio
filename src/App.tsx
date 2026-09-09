@@ -1,9 +1,11 @@
 import React, { useEffect } from 'react'
 import { TitlesPage } from './components/TitlesPage'
 import { TitlePage } from './components/TitlePage'
-import { EpisodeWorkspace } from './components/EpisodeWorkspace'
+import { EpisodeRoleRouter } from './components/EpisodeRoleRouter'
 import { SettingsPage } from './components/SettingsPage'
 import { ModelBrowserPage } from './components/ModelBrowserPage'
+import { TeamsPage } from './components/TeamsPage'
+import { ContactPage } from './components/ContactPage'
 import { Sidebar } from './components/layout/Sidebar'
 import { TitleBar } from './components/layout/TitleBar'
 import { PowerShareConsentPopup } from './components/PowerShareConsentPopup'
@@ -11,8 +13,10 @@ import { PowerShareModelDownloadPopup } from './components/PowerShareModelDownlo
 import { PowerShareLendingBanner } from './components/PowerShareLendingBanner'
 import { PowerShareBorrowingBanner } from './components/PowerShareBorrowingBanner'
 import { ForceUpdateBanner } from './components/ForceUpdateBanner'
+import { TeamInviteBanner } from './components/TeamInviteBanner'
 import { UpdateDialog } from './components/UpdateDialog'
 import { BetaAvailableBanner } from './components/BetaAvailableBanner'
+import { BackupRestoredBanner } from './components/BackupRestoredBanner'
 import { useAppStore } from './stores/appStore'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useApi } from './hooks/useApi'
@@ -23,11 +27,15 @@ export default function App() {
   const selectedEpisodeId = useAppStore((s) => s.selectedEpisodeId)
   const showSettings = useAppStore((s) => s.showSettings)
   const showModelBrowser = useAppStore((s) => s.showModelBrowser)
+  const showTeams = useAppStore((s) => s.showTeams)
+  const showContact = useAppStore((s) => s.showContact)
   const backendReady = useAppStore((s) => s.backendReady)
   const setBackendPort = useAppStore((s) => s.setBackendPort)
   const setSelectedTitle = useAppStore((s) => s.setSelectedTitle)
   const setShowSettings = useAppStore((s) => s.setShowSettings)
   const setShowModelBrowser = useAppStore((s) => s.setShowModelBrowser)
+  const setShowTeams = useAppStore((s) => s.setShowTeams)
+  const setShowContact = useAppStore((s) => s.setShowContact)
   const setActiveProfile = useAppStore((s) => s.setActiveProfile)
   const { get } = useApi()
 
@@ -51,6 +59,10 @@ export default function App() {
     ? 'settings'
     : showModelBrowser
     ? 'browser'
+    : showTeams
+    ? 'teams'
+    : showContact
+    ? 'contact'
     : selectedEpisodeId
     ? 'episode'
     : selectedTitleId
@@ -61,6 +73,10 @@ export default function App() {
     ? 'RaccoonHouse Studio — Налаштування'
     : currentView === 'browser'
     ? 'RaccoonHouse Studio — Браузер моделей'
+    : currentView === 'teams'
+    ? 'RaccoonHouse Studio — Команди'
+    : currentView === 'contact'
+    ? "RaccoonHouse Studio — Зв'язок з розробником"
     : currentView === 'episode'
     ? 'RaccoonHouse Studio — Епізод'
     : currentView === 'title'
@@ -82,16 +98,22 @@ export default function App() {
               setShowSettings(true)
             } else if (v === 'browser') {
               setShowModelBrowser(true)
+            } else if (v === 'teams') {
+              setShowTeams(true)
+            } else if (v === 'contact') {
+              setShowContact(true)
             }
           }}
         />
         <main className="flex-1 overflow-hidden">
           {currentView === 'settings' && <SettingsPage />}
           {currentView === 'browser' && <ModelBrowserPage />}
+          {currentView === 'teams' && <TeamsPage />}
+          {currentView === 'contact' && <ContactPage />}
           {currentView === 'titles' && <TitlesPage />}
           {currentView === 'title' && <TitlePage titleId={selectedTitleId!} />}
           {currentView === 'episode' && (
-            <EpisodeWorkspace
+            <EpisodeRoleRouter
               episodeId={selectedEpisodeId!}
               titleId={selectedTitleId!}
             />
@@ -103,8 +125,10 @@ export default function App() {
       <PowerShareLendingBanner />
       <PowerShareBorrowingBanner />
       <ForceUpdateBanner />
+      <TeamInviteBanner />
       <UpdateDialog />
       <BetaAvailableBanner />
+      <BackupRestoredBanner />
     </div>
   )
 }

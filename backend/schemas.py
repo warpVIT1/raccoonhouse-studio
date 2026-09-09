@@ -84,6 +84,7 @@ class EpisodeOut(EpisodeBase):
     cleaned_video_transfer_id: Optional[str] = None
     cleaned_video_filename: Optional[str] = None
     cleaned_video_uploaded_at: Optional[datetime] = None
+    cleaned_video_sent_to_sound_engineer_at: Optional[datetime] = None
     shared_id: Optional[str] = None
 
     model_config = {"from_attributes": True}
@@ -153,6 +154,7 @@ class SubtitleLineBase(BaseModel):
     margin_l: int = 0
     margin_r: int = 0
     margin_v: int = 0
+    source_actor_name: Optional[str] = None
 
 
 class SubtitleLineCreate(SubtitleLineBase):

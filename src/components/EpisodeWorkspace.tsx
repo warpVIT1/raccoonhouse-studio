@@ -126,7 +126,6 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
       setRestoringHistory(null)
     }
   }
-  const [markersError, setMarkersError] = useState<string | null>(null)
 
   // "Take a model, separate the vocal, then split THAT into male/female"
   // (backend: run_mvsep_male_female_split) — MVSep-only, needs credits, so
@@ -184,6 +183,26 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   const downloadingOriginalJob = [...activeJobs.values()].find(
     (j) => j.episode_id === episodeId && j.type === 'download_original_video' && j.status === 'running'
   )
+
+  // The клінапер's result, once the director's reviewed and forwarded it
+  // (see Episode.cleaned_video_sent_to_sound_engineer_at) — gated the same
+  // way as DirectorWorkspace's own download button, but that gate is what
+  // makes this button show up here AT ALL (see the JSX below: hidden
+  // entirely until sent, not just disabled).
+  const [downloadingCleanedVideo, setDownloadingCleanedVideo] = useState(false)
+  const [cleanedVideoError, setCleanedVideoError] = useState<string | null>(null)
+  async function handleDownloadCleanedVideo() {
+    if (downloadingCleanedVideo) return
+    setDownloadingCleanedVideo(true)
+    try {
+      const result = await get<{ url: string }>(`/episodes/${episodeId}/cleaned-video-url`)
+      window.open(result.url, '_blank')
+    } catch {
+      setCleanedVideoError('Не вдалося отримати посилання на очищене відео')
+    } finally {
+      setDownloadingCleanedVideo(false)
+    }
+  }
 
   // Load episode data
   useEffect(() => {
@@ -277,8 +296,6 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
             setPowerShareError(job.message || 'Не вдалося отримати потужність')
           } else if (job.type === 'separate_vocals' || job.type === 'batch_separate_vocals' || job.type === 'distributed_separate_vocals') {
             setSeparationError(job.message || 'Не вдалося виконати ізоляцію вокалу')
-          } else if (job.type === 'detect_markers') {
-            setMarkersError(job.message || 'Не вдалося виявити маркери')
           } else if (job.type === 'mux_audio' || job.type === 'request_remote_render') {
             setRenderError(job.message || 'Не вдалося відрендерити фінальне відео')
           }
@@ -737,12 +754,17 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   async function handleAssImport(files: FileList) {
     const file = files[0]
     if (!file) return
+    // Same as DirectorWorkspace's own handleAssImport (see that file's
+    // comment) — always keeps actor assignments, matched server-side by
+    // exact timing with a same-line-count positional fallback.
     setImportingAss(true)
     try {
       if (backendReady) {
         const fd = new FormData()
         fd.append('file', file)
-        const result = await post<{ job_id: string }>(`/episodes/${episodeId}/import-ass`, { file_path: (file as File & { path?: string }).path ?? '' })
+        const result = await post<{ job_id: string }>(`/episodes/${episodeId}/import-ass`, {
+          file_path: (file as File & { path?: string }).path ?? '', preserve_assignments: true,
+        })
         upsertJob({ id: result.job_id, type: 'export_srt', status: 'running', percent: 0, message: 'Парсинг ASS…', episode_id: episodeId })
       }
     } catch {
@@ -909,30 +931,6 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
     }
   }
 
-  // Detect markers
-  async function handleDetectMarkers() {
-    if (!backendReady) return
-    setMarkersError(null)
-    try {
-      const result = await post<{ job_id: string }>(`/episodes/${episodeId}/detect-markers`, {})
-      upsertJob({
-        id: result.job_id,
-        type: 'detect_markers',
-        status: 'running',
-        percent: 0,
-        message: 'Виявлення маркерів…',
-        episode_id: episodeId,
-      })
-    } catch (err) {
-      // Previously silently swallowed (.catch(() => null)) — a rejection
-      // here (e.g. no vocal-only stem, see detect_markers below) produced
-      // literally no feedback: button click, nothing happens, no spinner,
-      // no error. Surfacing it the same way separationError does elsewhere.
-      console.error('[detect-markers] request failed:', err)
-      setMarkersError(err instanceof Error ? err.message : 'Не вдалося запустити виявлення маркерів')
-    }
-  }
-
   // "Take a model, separate the vocal, then split THAT into male/female"
   async function handleMvsepMaleFemale() {
     if (!backendReady || !vocalIsolated) return
@@ -1082,18 +1080,6 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
           </span>
         )}
 
-        {markersError && (
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-red-900/30 text-red-300 max-w-[420px]">
-            <span className="truncate">{markersError}</span>
-            <button
-              onClick={() => setMarkersError(null)}
-              className="w-4 h-4 rounded-full flex items-center justify-center text-red-300/70 hover:text-white hover:bg-red-400/20 leading-none flex-shrink-0"
-            >
-              ✕
-            </button>
-          </span>
-        )}
-
         {mvsepSplitError && (
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-red-900/30 text-red-300 max-w-[420px]">
             <span className="truncate">{mvsepSplitError}</span>
@@ -1119,6 +1105,20 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
         )}
 
         <div className="ml-auto flex items-center gap-2">
+          {cleanedVideoError && <span className="text-[11px] text-rh-muted">{cleanedVideoError}</span>}
+          {/* Клінапер's result, once the director's forwarded it — see
+              Episode.cleaned_video_sent_to_sound_engineer_at's own comment.
+              Hidden entirely (not just disabled) until then. */}
+          {episode?.cleaned_video_sent_to_sound_engineer_at && (
+            <button onClick={handleDownloadCleanedVideo} className="rh-btn-outline text-xs" disabled={downloadingCleanedVideo}>
+              {downloadingCleanedVideo ? <Spinner size={12} /> : (
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+              )}
+              Очищене відео від клінапера
+            </button>
+          )}
           {/* Import ASS */}
           <button onClick={() => assInputRef.current?.click()} className="rh-btn-outline text-xs" disabled={importingAss}>
             {importingAss ? <Spinner size={12} /> : (
@@ -1181,14 +1181,6 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
               )}
             </button>
           )}
-
-          {/* Detect markers */}
-          <button onClick={handleDetectMarkers} className="rh-btn-outline text-xs" disabled={!vocalIsolated || !backendReady}>
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-            </svg>
-            Авто-маркери
-          </button>
 
           {/* Export Reaper */}
           <button onClick={handleExportReaper} className="rh-btn-outline text-xs" disabled={!backendReady}>

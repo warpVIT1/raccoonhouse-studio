@@ -39,6 +39,7 @@ export interface Episode {
   cleaned_video_transfer_id?: string | null
   cleaned_video_filename?: string | null
   cleaned_video_uploaded_at?: string | null
+  cleaned_video_sent_to_sound_engineer_at?: string | null
   shared_id?: string | null
 }
 
@@ -83,6 +84,7 @@ export interface SubtitleLine {
   text: string
   character_id: number | null
   character_name?: string
+  source_actor_name?: string | null
   ass_style: string
   is_overlap: boolean
   layer: number
@@ -130,7 +132,7 @@ export interface ActorAudioFixMarker {
 
 export interface JobStatus {
   id: string
-  type: 'import_video' | 'import_video_remote' | 'separate_vocals' | 'batch_separate_vocals' | 'distributed_separate_vocals' | 'request_remote_separation' | 'detect_markers' | 'export_srt' | 'mux_audio' | 'request_remote_render' | 'install_gpu_runtime' | 'download_model' | 'install_audio_separator_update' | 'mvsep_male_female' | 'export_actor_video' | 'submit_actor_audio' | 'download_original_video' | 'submit_cleaned_video' | 'generate_actor_reaper_project'
+  type: 'import_video' | 'import_video_remote' | 'separate_vocals' | 'batch_separate_vocals' | 'distributed_separate_vocals' | 'request_remote_separation' | 'export_srt' | 'mux_audio' | 'request_remote_render' | 'install_gpu_runtime' | 'download_model' | 'install_audio_separator_update' | 'mvsep_male_female' | 'export_actor_video' | 'submit_actor_audio' | 'download_original_video' | 'submit_cleaned_video' | 'generate_actor_reaper_project'
   status: 'pending' | 'running' | 'complete' | 'error' | 'cancelled'
   percent: number
   message: string
@@ -168,6 +170,7 @@ export interface TeamMember {
   display_name: string
   is_team_admin: number
   joined_at: string
+  roles: string[]
 }
 
 export interface TeamInvite {

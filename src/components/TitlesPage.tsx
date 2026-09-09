@@ -31,6 +31,7 @@ export function TitlesPage() {
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<TitleStatus | 'all'>('all')
   const [showAddModal, setShowAddModal] = useState(false)
+  const [openFolder, setOpenFolder] = useState<string | null>(null)
 
   useEffect(() => {
     if (!backendReady) return
@@ -74,6 +75,32 @@ export function TitlesPage() {
     const matchStatus = statusFilter === 'all' || t.status === statusFilter
     return matchSearch && matchStatus
   })
+
+  // Grouped by team (2026-09-09) — someone in several teams (most visibly
+  // the app admin, who can see every team's shared titles at once) used to
+  // get one flat, unsorted grid mixing everyone's projects together. Each
+  // team's own titles now live in a collapsible folder; a title with no
+  // team_name (personal, never shared) falls into a fixed "Особисті"
+  // bucket rather than being dropped or merged into whichever team happens
+  // to sort first.
+  const PERSONAL_FOLDER = 'Особисті'
+  const folderOrder: string[] = []
+  const folders: Record<string, Title[]> = {}
+  for (const t of filtered) {
+    const key = t.team_name || PERSONAL_FOLDER
+    if (!folders[key]) { folders[key] = []; folderOrder.push(key) }
+    folders[key].push(t)
+  }
+  // Personal always last — team folders are the primary organizing unit,
+  // "just mine" is the leftover bucket, not the headline.
+  folderOrder.sort((a, b) => (a === PERSONAL_FOLDER ? 1 : b === PERSONAL_FOLDER ? -1 : a.localeCompare(b)))
+  const showFolders = folderOrder.length > 1
+  // A folder that's since become empty or renamed away (e.g. everything in
+  // it got reassigned to a different team) shouldn't strand the view open
+  // on a folder that no longer exists in folderOrder.
+  useEffect(() => {
+    if (openFolder && !folderOrder.includes(openFolder)) setOpenFolder(null)
+  }, [openFolder, folderOrder.join('|')])
 
   return (
     <div className="flex flex-col h-full">
@@ -139,6 +166,35 @@ export function TitlesPage() {
             </svg>
             <span className="text-sm">Тайтлів не знайдено</span>
           </div>
+        ) : showFolders && !openFolder ? (
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4">
+            {folderOrder.map((key) => (
+              <FolderTile key={key} name={key} titles={folders[key]} onOpen={() => setOpenFolder(key)} />
+            ))}
+          </div>
+        ) : showFolders && openFolder ? (
+          <div className="flex flex-col gap-4">
+            <button
+              onClick={() => setOpenFolder(null)}
+              className="flex items-center gap-1.5 text-sm text-rh-muted hover:text-rh-text transition-colors w-fit"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M15 18l-6-6 6-6"/>
+              </svg>
+              {openFolder}
+            </button>
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4">
+              {(folders[openFolder] || []).map((title) => (
+                <TitleCard
+                  key={title.id}
+                  title={title}
+                  onClick={() => setSelectedTitle(title.id)}
+                  onDelete={(permanent) => handleDeleteTitle(title.id, permanent)}
+                  onStatusChange={(status) => handleStatusChange(title.id, status)}
+                />
+              ))}
+            </div>
+          </div>
         ) : (
           <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4">
             {filtered.map((title) => (
@@ -164,6 +220,80 @@ export function TitlesPage() {
         />
       )}
     </div>
+  )
+}
+
+interface FolderTileProps {
+  name: string
+  titles: Title[]
+  onOpen: () => void
+}
+// One team's projects, shown as a single poster-shaped tile in the same
+// grid as regular title cards — the whole point of this grouping (see
+// TitlesPage's own folderOrder comment) is to NOT show every team's titles
+// mixed together at once. Instead of a poster image, the tile shows a
+// folder icon on a translucent gray plate, with a slow auto-advancing fade
+// carousel of whichever of this folder's titles are currently "В роботі"
+// showing through underneath — a quick glance at "what's active here"
+// without opening the folder. Clicking opens the folder's own title grid
+// (see TitlesPage's openFolder state). Per the user's own request
+// (2026-09-09, refined same day to this poster-tile form).
+function FolderTile({ name, titles, onOpen }: FolderTileProps) {
+  const inProgress = titles.filter((t) => t.status === 'in_progress' && t.poster_path)
+
+  return (
+    <div
+      onClick={onOpen}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen() } }}
+      className="rh-card flex flex-col overflow-hidden hover:border-rh-border2 transition-all duration-150 text-left group cursor-pointer"
+    >
+      <div className="aspect-[3/4] bg-rh-card2 relative overflow-hidden">
+        {inProgress.length > 0 && <FolderCarousel titles={inProgress} />}
+        {/* Translucent gray plate + folder icon on top of the carousel —
+            darker, no blur, per the user's own follow-up (2026-09-09): the
+            first pass's bg-gray-500/45 + backdrop-blur was too light and
+            smudged the carousel image underneath. */}
+        <div className="absolute inset-0 bg-black/60 flex items-center justify-center">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="1.6" className="drop-shadow-md opacity-90">
+            <path d="M16 3H8L2 7h20l-6-4z"/><rect x="2" y="7" width="20" height="14" rx="2"/>
+          </svg>
+        </div>
+        <div className="absolute inset-0 bg-rh-accent/0 group-hover:bg-rh-accent/10 transition-colors duration-150" />
+      </div>
+      <div className="p-3 flex flex-col gap-1.5">
+        <div className="font-medium text-sm text-rh-text leading-tight line-clamp-1">{name}</div>
+        <div className="text-xs text-rh-muted">{titles.length} тайтл{titles.length === 1 ? '' : 'ів'}</div>
+      </div>
+    </div>
+  )
+}
+
+// Fading poster carousel filling the tile's poster area — auto-advances
+// every 2.5s, CSS opacity cross-fade (no library, no layout shift:
+// absolutely-positioned images stacked in one fixed-size box). Sits behind
+// the gray plate + folder icon overlay, so it's decorative background, not
+// an interactive gallery — no pause-on-hover/manual controls needed.
+function FolderCarousel({ titles }: { titles: Title[] }) {
+  const [index, setIndex] = useState(0)
+  useEffect(() => {
+    if (titles.length <= 1) return
+    const id = setInterval(() => setIndex((i) => (i + 1) % titles.length), 2500)
+    return () => clearInterval(id)
+  }, [titles.length])
+  return (
+    <>
+      {titles.map((t, i) => (
+        <img
+          key={t.id}
+          src={posterSrc(t.poster_path || '')}
+          alt=""
+          className="absolute inset-0 w-full h-full object-cover transition-opacity duration-700 ease-in-out"
+          style={{ opacity: i === index ? 1 : 0 }}
+        />
+      ))}
+    </>
   )
 }
 

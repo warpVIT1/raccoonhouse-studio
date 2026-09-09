@@ -38,6 +38,13 @@ def list_profiles(db: Session = Depends(get_db)):
 def create_profile(body: ProfileCreate, db: Session = Depends(get_db)):
     data = body.model_dump()
     password = data.pop("password", None)
+    # Server-side default, not just the frontend's own (2026-09-09): every
+    # new profile starts as a plain actor regardless of what a client sends
+    # — a team admin grants anything beyond that later (see team_service.
+    # set_member_roles), self-service escalation on creation is exactly
+    # what this whole change was meant to close off.
+    if not data.get("roles"):
+        data["roles"] = ["actor"]
     profile = Profile(**data)
     if password:
         profile.password_hash = _hash_password(password)
@@ -92,6 +99,26 @@ def activate_profile(profile_id: int, body: ProfileActivateIn = ProfileActivateI
         db.add(settings)
     settings.active_profile_id = profile_id
     db.commit()
+    return _out(profile)
+
+
+@router.post("/profiles/refresh-roles", response_model=ProfileOut)
+def refresh_own_roles(db: Session = Depends(get_db)):
+    """Immediate on-demand version of sync_service.pull_own_roles's own
+    periodic pull (which otherwise only runs once on connect + every ~5
+    minutes — confirmed live 2026-09-09 as a real "my role change doesn't
+    seem to apply" complaint, since a team admin editing their OWN roles
+    via TeamsPage had to wait out that whole interval to see it reflected
+    anywhere that reads Profile.roles, e.g. EpisodeRoleRouter's tab list).
+    Called right after TeamsPage.tsx's saveMemberRoles succeeds, but only
+    when the edited device IS the caller's own — editing someone else's
+    roles has nothing for THIS device to refresh."""
+    settings = db.get(AppSettings, 1)
+    if not settings or not settings.active_profile_id:
+        raise HTTPException(400, "No active profile")
+    from ..services.sync_service import pull_own_roles
+    pull_own_roles(db)
+    profile = db.get(Profile, settings.active_profile_id)
     return _out(profile)
 
 
@@ -178,7 +205,9 @@ def telegram_login_poll(code: str, roles: str = "", db: Session = Depends(get_db
             telegram_id=telegram_id,
             telegram_username=data.get("username") or None,
             avatar_url=data.get("photo_url") or None,
-            roles=[r for r in roles.split(",") if r] or None,
+            # Server-side default, same reasoning as create_profile above —
+            # "actor" if the client sent nothing usable.
+            roles=[r for r in roles.split(",") if r] or ["actor"],
         )
         db.add(profile)
     db.commit()

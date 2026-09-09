@@ -178,19 +178,37 @@ def _run_ass_import(
     # re-uploading a corrected file (typo fixes, retiming a couple of
     # lines) used to silently wipe every already-assigned actor, since the
     # whole episode's lines get deleted and recreated below with
-    # character_id=None unconditionally. Matched by exact (start_ms,
+    # character_id=None unconditionally. Primary match is exact (start_ms,
     # end_ms) — the common case of "text/timing mostly unchanged" — not a
     # content/text match, since translated text is exactly what's expected
-    # to change between revisions. A line whose timing shifted at all
-    # loses its assignment and needs re-picking by hand, same as before.
+    # to change between revisions.
+    #
+    # Confirmed live 2026-09-09 this exact-match-only approach kept
+    # producing "it didn't offer/didn't keep the actors" reports even
+    # after preserve_assignments defaulted to True everywhere — a re-export
+    # round trip through an external tool (Aegisub, Reaper, whatever) can
+    # shift every timestamp by a millisecond of rounding, which silently
+    # fails EVERY exact match at once and looks indistinguishable from "did
+    # nothing." Added a same-line-count positional fallback: when the new
+    # file has exactly as many lines as the episode had before, any line
+    # that didn't get an exact timing match falls back to whichever
+    # character was on the line at the same position (sorted by start_ms)
+    # in the old set. Less precise than exact timing, but per the user's
+    # own call: better to carry everything over and let the director
+    # correct individual lines by hand than to silently drop every
+    # assignment on a harmless re-import.
     reporter.update(20, "Збереження призначених акторів…")
     old_assignments: dict[tuple[int, int], int] = {}
+    old_char_by_position: list[int | None] = []
     if preserve_assignments:
-        old_assignments = {
-            (row[0], row[1]): row[2]
-            for row in db.query(SubtitleLine.start_ms, SubtitleLine.end_ms, SubtitleLine.character_id)
-            .filter(SubtitleLine.episode_id == episode_id, SubtitleLine.character_id.isnot(None)).all()
-        }
+        old_rows = (
+            db.query(SubtitleLine.start_ms, SubtitleLine.end_ms, SubtitleLine.character_id)
+            .filter(SubtitleLine.episode_id == episode_id)
+            .order_by(SubtitleLine.start_ms)
+            .all()
+        )
+        old_assignments = {(row[0], row[1]): row[2] for row in old_rows if row[2] is not None}
+        old_char_by_position = [row[2] for row in old_rows]
 
     reporter.update(25, "Видалення старих субтитрів…")
     db.query(SubtitleLine).filter(SubtitleLine.episode_id == episode_id).delete()
@@ -213,6 +231,15 @@ def _run_ass_import(
 
     total = len(events)
     inserted = 0
+    # Positional rank of each event by its own Start time (not raw file
+    # order — an ASS can list overlapping lines out of chronological order)
+    # — only used as the fallback below when preserve_assignments is on and
+    # the line count matches exactly, see that comment above.
+    same_line_count = preserve_assignments and total == len(old_char_by_position)
+    position_by_index: dict[int, int] = {}
+    if same_line_count:
+        order = sorted(range(total), key=lambda idx: _timecode_to_ms(events[idx].get("Start", "0:00:00.00")))
+        position_by_index = {orig_idx: rank for rank, orig_idx in enumerate(order)}
     for i, ev in enumerate(events):
         if reporter.cancelled:
             raise RuntimeError("Скасовано")
@@ -242,18 +269,22 @@ def _run_ass_import(
         # old_assignments above) already had one; the translator/director
         # assigns a real team actor by hand via the АКТОР dropdown for
         # anything left unassigned.
+        character_id = old_assignments.get((start_ms, end_ms))
+        if character_id is None and same_line_count:
+            character_id = old_char_by_position[position_by_index[i]]
         line = SubtitleLine(
             episode_id=episode_id,
             start_ms=start_ms,
             end_ms=end_ms,
             text=text,
-            character_id=old_assignments.get((start_ms, end_ms)),
+            character_id=character_id,
             ass_style=style,
             is_overlap=is_overlap,
             layer=layer,
             margin_l=margin_l,
             margin_r=margin_r,
             margin_v=margin_v,
+            source_actor_name=actor_name or None,
         )
         db.add(line)
         inserted += 1

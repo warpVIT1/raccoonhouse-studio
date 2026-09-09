@@ -4,9 +4,10 @@ video (same file already offered via ActorWorkspace.tsx's own "Завантаж�
 button, see actor_video_service.py) if not already local, generates a
 ready-to-open .rpp Reaper project next to it — Track 1 plays that video at
 30% volume as a timing/performance reference, Track 2 is empty and armed
-for the actor's own recording, and every one of the actor's own subtitle
-lines becomes a project marker (line text as the marker name) so they can
-see exactly when and what to say scrubbing through the timeline.
+for the actor's own recording, every one of the actor's own subtitle lines
+becomes a project REGION (start+end, not just a point — see _build_rpp's
+own comment), and every studio Marker already assigned to this actor (see
+MarkersTab.tsx) becomes a plain point marker alongside them.
 
 This hand-writes the .rpp text format directly rather than going through
 the existing ReaScript-Lua export (reaper_exporter.export_reascript_lua) —
@@ -22,7 +23,7 @@ import uuid
 from pathlib import Path
 from sqlalchemy.orm import Session
 
-from ..models import Character, Episode, SubtitleLine, Title
+from ..models import Character, Episode, Marker, SubtitleLine, Title
 from ..database import SessionLocal
 from ..job_manager import ProgressReporter
 from . import discovery_service
@@ -38,7 +39,29 @@ def _rpp_escape(text: str) -> str:
     return text.replace('"', "'").replace("\n", " / ").replace("\r", "")
 
 
-def _build_rpp(video_filename: str, video_duration: float, character_name: str, lines: list[SubtitleLine]) -> str:
+def _reaper_native_color(hex_color: "str | None") -> int:
+    """RPP's own packed marker-color int: high bit (0x1000000) means "use
+    this custom color", low 3 bytes are B,G,R (reversed from the usual
+    #RRGGBB) — 0 (no high bit) means "use REAPER's default color", which is
+    what every plain marker/region already used before this. Reused for
+    per-actor Marker.color (see MarkersTab.tsx's own color picker) so a
+    marker keeps its studio-assigned color once it lands in Reaper too."""
+    if not hex_color:
+        return 0
+    hex_color = hex_color.lstrip("#")
+    if len(hex_color) != 6:
+        return 0
+    try:
+        r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    except ValueError:
+        return 0
+    return 0x1000000 | (b << 16) | (g << 8) | r
+
+
+def _build_rpp(
+    video_filename: str, video_duration: float, character_name: str,
+    lines: list[SubtitleLine], markers: list[Marker],
+) -> str:
     lines_out: list[str] = []
     lines_out.append(f'<REAPER_PROJECT 0.1 "6.0" 0')
     lines_out.append("  SAMPLERATE 48000 0 0")
@@ -70,15 +93,42 @@ def _build_rpp(video_filename: str, video_duration: float, character_name: str, 
     # timeline (how long they actually have to say it), not just a single
     # tick where it starts (confirmed live 2026-09-09, first version used
     # plain MARKER lines — visually wrong for something with a duration).
-    # RPP's own MARKER line doubles as a region when the 4th field (after
-    # the name) carries the region's END position instead of 0 — the
-    # trailing "R" makes the region-vs-marker distinction explicit rather
-    # than relying purely on that field being non-zero.
-    for i, line in enumerate(lines, start=1):
+    #
+    # CORRECTED 2026-09-09: a region is NOT one MARKER line with the end
+    # time crammed into the flags field (that was this file's first
+    # attempt, and it's what produced garbage-looking Start/End pairs in
+    # Reaper's Region/Marker Manager — that field was being read as a
+    # flags bitfield, not a timestamp). Per REAPER's actual state-chunk
+    # format (ReaTeam/Doc "State Chunk Definitions"), a region is a PAIR of
+    # MARKER lines sharing the same index: the first carries the name and
+    # start position with the region bit (&1) set in its flags field, the
+    # second is a short line at the end position with an empty name and
+    # the same flags — fields 5-9 are omitted entirely on that second line.
+    # Full field layout for the first line: index, position, name, flags,
+    # custom color (0=default), an unlabeled field (always 1 in real
+    # projects), a color-format char ("R" for our 0x1(b)(g)(r)-packed ints
+    # — see _reaper_native_color), GUID, an unlabeled trailing field
+    # (always 0).
+    idx = 0
+    for line in lines:
+        idx += 1
         start = line.start_ms / 1000.0
         end = line.end_ms / 1000.0
         name = _rpp_escape(line.text.strip()) or "…"
-        lines_out.append(f'  MARKER {i} {start:.3f} "{name}" {end:.3f} 0 1 R {_rpp_guid()}')
+        lines_out.append(f'  MARKER {idx} {start:.6f} "{name}" 1 0 1 R {_rpp_guid()} 0')
+        lines_out.append(f'  MARKER {idx} {end:.6f} "" 1')
+    # The actor's own studio markers (see routers/markers.py — placed by the
+    # sound engineer/director, e.g. "ГГ - емоційний зрив", assigned to this
+    # actor via the marker's color/character_id) — plain point markers, not
+    # regions (flags=0, no region bit), since a Marker has only one
+    # position, unlike a SubtitleLine's start/end span above. Continues the
+    # SAME index sequence (RPP marker ids are one shared namespace
+    # project-wide, regions included).
+    for m in markers:
+        idx += 1
+        name = _rpp_escape(m.reaper_name.strip()) or "МАРКЕР"
+        color = _reaper_native_color(m.color)
+        lines_out.append(f'  MARKER {idx} {m.position_seconds:.6f} "{name}" 0 {color} 1 R {_rpp_guid()} 0')
     lines_out.append(">")
     return "\n".join(lines_out) + "\n"
 
@@ -136,6 +186,22 @@ def _run_generate_actor_reaper_project(
         .all()
     )
 
+    # The actor's own studio markers (see MarkersTab.tsx — placed by the
+    # director/sound engineer, e.g. "ГГ - емоційний зрив"), same filtering
+    # convention as the actor's own "Маркери (.csv)" export
+    # (reaper_exporter._filter_markers_for_actor) — matches by either the
+    # legacy reaper_name-prefix code or the modern Marker.character_id link.
+    from .reaper_exporter import _filter_markers_for_actor, _everyone_character_ids
+    all_markers = (
+        db.query(Marker)
+        .filter(Marker.episode_id == episode_id)
+        .order_by(Marker.position_seconds)
+        .all()
+    )
+    actor_markers = _filter_markers_for_actor(
+        all_markers, char.code, character_id, _everyone_character_ids(db, ep.title_id),
+    )
+
     reporter.update(95, "Генерую проєкт Reaper…")
     # Episode.duration (matches the ORIGINAL video) isn't reliable here —
     # confirmed live 2026-09-09: it was unset for an episode pulled in via
@@ -148,7 +214,7 @@ def _run_generate_actor_reaper_project(
     from .ffmpeg_service import _probe
     probe = _probe(str(video_path))
     video_duration = float(probe.get("format", {}).get("duration", 0)) or (ep.duration or 0.0)
-    rpp_text = _build_rpp(video_filename, video_duration, char.name, lines)
+    rpp_text = _build_rpp(video_filename, video_duration, char.name, lines, actor_markers)
 
     # "{title name in English/original}_{season}_{episode}_{team}" — per
     # the user's own naming spec (2026-09-09), not the show_key convention

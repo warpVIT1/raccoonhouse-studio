@@ -172,6 +172,7 @@ CREATE TABLE IF NOT EXISTS shared_episodes (
   cleaned_video_transfer_id TEXT,  -- R2 key for клінапер's uploaded result, mirrors backend Episode.cleaned_video_transfer_id
   cleaned_video_filename TEXT,
   cleaned_video_uploaded_at TEXT,
+  cleaned_video_sent_to_sound_engineer_at TEXT,  -- director's review gate, mirrors backend Episode.cleaned_video_sent_to_sound_engineer_at
   original_size INTEGER,
   original_bitrate INTEGER,
   original_format TEXT,

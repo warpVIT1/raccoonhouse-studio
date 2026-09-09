@@ -192,7 +192,7 @@ def _run_export_actor_video(
     # notify_device's own comment). Actors pull the actual files from
     # inside the app itself (ActorWorkspace's own download buttons).
     message = f"Готово до озвучення: {ep_label}. Відео з субтитрами (480p) вже доступне в програмі."
-    notified = discovery_service.notify_actors(message)
+    notified = discovery_service.notify_actors(message, team_id=title.team_id if title else None)
 
     per_actor_notified = _send_per_actor_srts(episode_id, ep, title, db, video_filename, size)
 

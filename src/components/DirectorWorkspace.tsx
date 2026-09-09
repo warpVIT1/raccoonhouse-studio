@@ -337,25 +337,20 @@ export function DirectorWorkspace({ episodeId, titleId }: DirectorWorkspaceProps
   async function handleAssImport(files: FileList) {
     const file = files[0]
     if (!file) return
-    // A re-import already carries matching-timing assignments forward
-    // server-side by default (see subtitle_parser.py's old_assignments) —
-    // but that's silent, and not always what's wanted. Ask explicitly
-    // whenever the CURRENT episode already has any actor assigned, so the
-    // director consciously picks "keep" vs "clear" instead of it just
-    // happening either way without them noticing.
-    let preserveAssignments = true
-    if (subtitles.some((l) => l.character_id != null)) {
-      preserveAssignments = window.confirm(
-        'У поточних субтитрах вже є призначені актори.\n\n' +
-        'ОК — залишити призначення там, де тайминг рядка збігається.\n' +
-        'Скасувати — очистити всі призначення акторів при імпорті.'
-      )
-    }
+    // Always carries actor assignments forward server-side — matched by
+    // exact timing where possible, falling back to line position when the
+    // line count didn't change (see subtitle_parser.py's own comment).
+    // Used to ask via a confirm() dialog first, but that turned out
+    // unreliable in practice (confirmed live 2026-09-09 as a recurring "it
+    // didn't offer to keep them" report) and the user's own call was
+    // simpler anyway: just always keep everything, the director re-picks
+    // whatever's wrong by hand afterward — cheaper than silently losing a
+    // whole episode's casting on a routine re-import.
     setImportingAss(true)
     try {
       if (backendReady) {
         const result = await post<{ job_id: string }>(`/episodes/${episodeId}/import-ass`, {
-          file_path: (file as File & { path?: string }).path ?? '', preserve_assignments: preserveAssignments,
+          file_path: (file as File & { path?: string }).path ?? '', preserve_assignments: true,
         })
         upsertJob({ id: result.job_id, type: 'export_srt', status: 'running', percent: 0, message: 'Парсинг ASS…', episode_id: episodeId })
       }
@@ -483,6 +478,24 @@ export function DirectorWorkspace({ episodeId, titleId }: DirectorWorkspaceProps
       setAudioActionResult('Не вдалося отримати посилання на очищене відео')
     } finally {
       setDownloadingCleanedVideo(false)
+    }
+  }
+
+  // The director's explicit review gate (2026-09-09) before the sound
+  // engineer's own download button shows up at all — see Episode.
+  // cleaned_video_sent_to_sound_engineer_at's own comment.
+  const [sendingCleanedVideo, setSendingCleanedVideo] = useState(false)
+  async function handleSendCleanedVideoToSoundEngineer() {
+    if (sendingCleanedVideo) return
+    setSendingCleanedVideo(true)
+    try {
+      const result = await post<{ notified: boolean | null }>(`/episodes/${episodeId}/cleaned-video/send-to-sound-engineer`, {})
+      setAudioActionResult(result.notified ? 'Відправлено звукорежисеру' : 'Звукорежисера не знайдено в команді')
+      setEpisode((prev) => prev ? { ...prev, cleaned_video_sent_to_sound_engineer_at: new Date().toISOString() } : prev)
+    } catch {
+      setAudioActionResult('Не вдалося відправити звукорежисеру')
+    } finally {
+      setSendingCleanedVideo(false)
     }
   }
 
@@ -887,6 +900,19 @@ export function DirectorWorkspace({ episodeId, titleId }: DirectorWorkspaceProps
               )}
               Очищене відео від клінапера
             </button>
+          )}
+          {episode?.cleaned_video_transfer_id && !episode?.cleaned_video_sent_to_sound_engineer_at && (
+            <button onClick={handleSendCleanedVideoToSoundEngineer} className="rh-btn-outline text-xs" disabled={sendingCleanedVideo}>
+              {sendingCleanedVideo ? <Spinner size={12} /> : (
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/>
+                </svg>
+              )}
+              Відправити звукорежисеру
+            </button>
+          )}
+          {episode?.cleaned_video_sent_to_sound_engineer_at && (
+            <span className="text-[11px] text-rh-accent">✓ Передано звукорежисеру</span>
           )}
           <button onClick={handleSendToActors} className="rh-btn-outline text-xs" disabled={!backendReady || sendingToActors || !!actorVideoJob}>
             {sendingToActors || actorVideoJob ? <Spinner size={12} /> : (

@@ -179,6 +179,32 @@ def set_team_admin(team_id: str, device_id: str, body: dict, db: Session = Depen
     return {"ok": True}
 
 
+@router.put("/{team_id}/name")
+def rename_team(team_id: str, body: dict, db: Session = Depends(get_db)):
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    try:
+        team_service.rename_team(team_id, name, _active_profile_name(db))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return {"ok": True, "name": name}
+
+
+@router.put("/{team_id}/members/{device_id}/roles")
+def set_member_roles(team_id: str, device_id: str, body: dict, db: Session = Depends(get_db)):
+    roles = body.get("roles")
+    if not isinstance(roles, list):
+        raise HTTPException(400, "roles must be a list")
+    try:
+        team_service.set_member_roles(team_id, device_id, roles, _active_profile_name(db))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    return {"ok": True}
+
+
 @router.post("/invite")
 def invite_member(body: TeamInviteIn, db: Session = Depends(get_db)):
     try:
@@ -202,6 +228,14 @@ def respond_to_invite(body: TeamInviteRespondIn, db: Session = Depends(get_db)):
         from ..services import sync_service
         sync_service.pull_and_merge_all_teams(db)
     return {"ok": True}
+
+
+@router.get("/admin/server-stats")
+def server_stats(db: Session = Depends(get_db)):
+    try:
+        return team_service.get_server_stats(_active_profile_name(db))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
 
 
 @router.get("/users/all")

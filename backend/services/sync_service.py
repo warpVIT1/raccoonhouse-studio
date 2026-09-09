@@ -27,6 +27,7 @@ updated_at, bumped on every push) — no merge. Same trust model as every
 other shared table in this app (model catalog, ratings, etc. have no real
 conflict resolution either).
 """
+import hashlib
 import logging
 import os
 import threading
@@ -121,7 +122,7 @@ def notify_role_for_title(
         assignment = resolve_role_assignment(role, db, episode=episode, title=title)
         if assignment:
             return discovery_service.notify_device(assignment.device_id, message)
-    return fallback_broadcast_fn(message)
+    return fallback_broadcast_fn(message, team_id=title.team_id)
 
 
 def check_and_notify_late(
@@ -494,8 +495,10 @@ def push_actor_video_transfer_id(episode_id: int, db: Session) -> None:
 
 
 def push_cleaned_video_transfer_id(episode_id: int, db: Session) -> None:
-    """Pushes the клінапер's uploaded result's R2 transfer id — same shape
-    as push_actor_video_transfer_id, its own dedicated push since it changes
+    """Pushes the клінапер's uploaded result's R2 transfer id (and the
+    director's later "sent to sound engineer" gate — see Episode.
+    cleaned_video_sent_to_sound_engineer_at) — same shape as
+    push_actor_video_transfer_id, its own dedicated push since it changes
     independently of the rest of an episode's metadata."""
     ep = db.get(Episode, episode_id)
     if not ep or not ep.shared_id:
@@ -512,6 +515,7 @@ def push_cleaned_video_transfer_id(episode_id: int, db: Session) -> None:
                 "cleaned_video_transfer_id": ep.cleaned_video_transfer_id,
                 "cleaned_video_filename": ep.cleaned_video_filename,
                 "cleaned_video_uploaded_at": ep.cleaned_video_uploaded_at.isoformat() if ep.cleaned_video_uploaded_at else None,
+                "cleaned_video_sent_to_sound_engineer_at": ep.cleaned_video_sent_to_sound_engineer_at.isoformat() if ep.cleaned_video_sent_to_sound_engineer_at else None,
             }, timeout=15,
         ).raise_for_status()
     except Exception:
@@ -529,6 +533,16 @@ def push_episode_video_async(episode_id: int) -> None:
     the user is actively waiting on. Opens its own DB session (this runs
     well after any request-scoped session would have closed)."""
     threading.Thread(target=_push_episode_video, args=(episode_id,), daemon=True).start()
+
+
+def _sha256_file(path: str) -> str:
+    """Streamed so a multi-GB video never gets loaded into memory whole —
+    same chunking approach _ProgressFile already uses for uploads."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _push_episode_video(episode_id: int) -> None:
@@ -550,6 +564,17 @@ def _push_episode_video(episode_id: int) -> None:
         device_id = _team_device_id(profile.name)
         if not os.path.isfile(ep.original_file_path):
             return
+        # Dedup (2026-09-09): if this is the exact same file content as the
+        # last successful push (same hash) AND that upload is still live,
+        # skip re-uploading a multi-GB file we already have a copy of —
+        # this is what actually happens on a routine re-import of the same
+        # source video during testing/re-tagging, not a real new episode.
+        # A genuinely changed file (even a 1-byte diff, e.g. a re-encode)
+        # gets a different hash and uploads normally.
+        file_hash = _sha256_file(ep.original_file_path)
+        if ep.last_synced_video_hash == file_hash and ep.last_synced_video_transfer_id:
+            return
+        old_transfer_id = ep.last_synced_video_transfer_id
         transfer_id = f"rh-team-video-{ep.id}-{uuid.uuid4().hex}"
         size = os.path.getsize(ep.original_file_path)
         progress_file = _ProgressFile(ep.original_file_path, size)
@@ -562,7 +587,18 @@ def _push_episode_video(episode_id: int) -> None:
             "original_filename": ep.original_filename or os.path.basename(ep.original_file_path),
         }, timeout=15).raise_for_status()
         ep.last_synced_video_transfer_id = transfer_id
+        ep.last_synced_video_hash = file_hash
         db.commit()
+        # Confirmed live 2026-09-09: this never cleaned up the PREVIOUS
+        # upload before overwriting the pointer, so every re-import/re-sync
+        # of a shared episode's video left its old full-size R2 copy
+        # orphaned forever — the single largest contributor to the shared
+        # R2 bucket ballooning to 11GB+ (one episode alone had 6 leftover
+        # ~200-880MB copies from repeated test re-imports). Delete only
+        # after the new pointer is safely committed, so a failed upload
+        # above never loses the still-current old copy.
+        if old_transfer_id and old_transfer_id != transfer_id:
+            discovery_service.delete_transfer(old_transfer_id)
         _notify_team(ep.title.team_id, device_id)
     except Exception:
         logger.exception("push_episode_video: failed for episode %s", episode_id)
@@ -768,6 +804,34 @@ def delete_shared_audio_submission(shared_id: str) -> None:
 
 # --- Pull: cloud -> local ---
 
+def pull_own_roles(db: Session) -> None:
+    """Picks up a team admin's role change (see team_service.
+    set_member_roles) on the AFFECTED device itself — roles are no longer
+    self-edited locally, so this device's own copy (Profile.roles) has no
+    other way to learn an admin changed them remotely. Eventually-consistent
+    (rides the same periodic heartbeat as pull_and_merge_all_teams below,
+    not a live push) rather than a dedicated WebSocket round trip — good
+    enough for something that changes rarely and isn't time-critical."""
+    profile = _active_profile(db)
+    if not profile:
+        return
+    base = discovery_service.get_https_base()
+    if not base:
+        return
+    device_id = _team_device_id(profile.name)
+    try:
+        resp = requests.get(f"{base}/known-devices/{device_id}", timeout=15)
+        if resp.status_code == 404:
+            return
+        resp.raise_for_status()
+        remote_roles = resp.json().get("roles")
+    except Exception:
+        return
+    if isinstance(remote_roles, list) and remote_roles != (profile.roles or []):
+        profile.roles = remote_roles
+        db.commit()
+
+
 def pull_and_merge_all_teams(db: Session) -> None:
     """Convenience wrapper — pulls every team the active profile belongs to.
     Used by the periodic heartbeat fallback and the post-join/startup hook,
@@ -775,6 +839,7 @@ def pull_and_merge_all_teams(db: Session) -> None:
     profile = _active_profile(db)
     if not profile:
         return
+    pull_own_roles(db)
     try:
         teams = team_service.my_teams(profile.name)
     except Exception:

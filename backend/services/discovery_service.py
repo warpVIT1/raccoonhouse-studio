@@ -384,36 +384,46 @@ def submit_report(report: dict) -> "str | None":
 # --- Stage-handoff notifications (Worker's /notify-director + /notify-actors
 # routes, see cloudflare-signaling/src/index.ts's shared notifyTeamRole) ---
 
-def _notify_team_role(worker_path: str, message: str) -> "int | None":
+def _notify_team_role(worker_path: str, message: str, team_id: "str | None" = None) -> "int | None":
     base = get_https_base()
     if not base:
         return None
     _, _, _, team_device_id, _, _, _ = _state_provider() if _state_provider else ("?", False, False, "", [], None, None)
     if not team_device_id:
         return None
+    # `team_id` — the TITLE's own team, when the caller has one in scope
+    # (see sync_service.notify_role_for_title/actor_video_service.py's own
+    # callers) — confirmed live 2026-09-09 as a real bug when omitted: the
+    # Worker's notifyTeamRole used to resolve "which team" purely from the
+    # SENDER's own membership row with no ordering, so someone in more than
+    # one team could get an arbitrary (possibly wrong) team's roster
+    # notified instead of the team the episode/title actually belongs to.
+    # Still sent even when None — the Worker falls back to the old
+    # infer-from-sender behavior for any caller that doesn't have a title
+    # in scope to pass one from.
     resp = requests.post(
         f"{base}/{worker_path}",
-        json={"team_device_id": team_device_id, "message": message},
+        json={"team_device_id": team_device_id, "message": message, "team_id": team_id},
         timeout=15,
     )
     resp.raise_for_status()
     return resp.json()["sent"]
 
 
-def notify_director(message: str) -> "int | None":
-    return _notify_team_role("notify-director", message)
+def notify_director(message: str, team_id: "str | None" = None) -> "int | None":
+    return _notify_team_role("notify-director", message, team_id)
 
 
-def notify_actors(message: str) -> "int | None":
-    return _notify_team_role("notify-actors", message)
+def notify_actors(message: str, team_id: "str | None" = None) -> "int | None":
+    return _notify_team_role("notify-actors", message, team_id)
 
 
-def notify_sound_engineer(message: str) -> "int | None":
-    return _notify_team_role("notify-sound-engineer", message)
+def notify_sound_engineer(message: str, team_id: "str | None" = None) -> "int | None":
+    return _notify_team_role("notify-sound-engineer", message, team_id)
 
 
-def notify_translator(message: str) -> "int | None":
-    return _notify_team_role("notify-translator", message)
+def notify_translator(message: str, team_id: "str | None" = None) -> "int | None":
+    return _notify_team_role("notify-translator", message, team_id)
 
 
 def notify_all_team_admins(team_id: str, message: str) -> int:

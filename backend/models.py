@@ -42,7 +42,11 @@ class Episode(Base):
     # the track dubbing actually needs as a base to lay new voice over. Kept
     # the established column/API name to avoid rippling a rename through the
     # frontend; vocal_only_stem_path below holds the actual isolated-voice
-    # stem, used internally for VAD-based marker detection only.
+    # stem — used by separator_service.py's leak-suppression/level-dip
+    # cleanup passes and by the MVSep male/female split feature (NOT just
+    # marker detection, despite this comment's old claim — the auto-marker
+    # feature itself was removed 2026-09-09, this stem stayed since those
+    # other consumers still need it).
     vocal_stem_path: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     vocal_only_stem_path: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     # Display label for whichever method/model produced the CURRENT
@@ -73,6 +77,13 @@ class Episode(Base):
     # since we last pulled it" apart from "we already have this exact file,
     # skip re-downloading" without comparing file bytes.
     last_synced_video_transfer_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # SHA-256 of the local file that produced last_synced_video_transfer_id
+    # — lets sync_service._push_episode_video skip a redundant multi-GB
+    # re-upload (and the R2 delete-then-reupload churn that comes with it)
+    # when the exact same video content is pushed again unchanged. Purely
+    # local, never synced to D1 — a per-device cache of "what did I last
+    # actually upload," not shared/meaningful state.
+    last_synced_video_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     # The R2 transfer id for the RAW original video, known from the cloud
     # snapshot but NOT auto-downloaded (confirmed live 2026-08-19: every
     # teammate's install used to silently pull the full-size original the
@@ -106,6 +117,13 @@ class Episode(Base):
     cleaned_video_transfer_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     cleaned_video_filename: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     cleaned_video_uploaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # The director's explicit review gate (2026-09-09) — the sound engineer
+    # doesn't get a download button for the cleaner's video the moment it's
+    # uploaded; the director reviews it first and forwards it via this
+    # timestamp (see routers/episodes.py's send-cleaned-video-to-sound-
+    # engineer), same posture as ActorAudioSubmission.sent_to_sound_
+    # engineer_at for audio tracks.
+    cleaned_video_sent_to_sound_engineer_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     title: Mapped["Title"] = relationship("Title", back_populates="episodes")
     subtitle_lines: Mapped[list["SubtitleLine"]] = relationship("SubtitleLine", back_populates="episode", cascade="all, delete-orphan")
@@ -184,6 +202,16 @@ class SubtitleLine(Base):
     margin_r: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     margin_v: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     shared_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # The raw ASS "Name"/actor field from the imported file (e.g. Aegisub's
+    # actor field) — confirmed live 2026-09-09 this was read during import
+    # (subtitle_parser.py's `actor_name`) only to detect overlap (a "/" or
+    # "," in it) and otherwise silently thrown away. Kept now purely as a
+    # display hint next to the (usually empty, on a first import) АКТОР
+    # dropdown — per the user's own request: even though these names never
+    # match a real team actor/character, seeing "who spoke this originally"
+    # makes manual casting faster than an empty column. Never auto-matched
+    # to a Character — same "director assigns by hand" posture as before.
+    source_actor_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
     episode: Mapped["Episode"] = relationship("Episode", back_populates="subtitle_lines")
     character: Mapped[Optional["Character"]] = relationship("Character", back_populates="subtitle_lines")

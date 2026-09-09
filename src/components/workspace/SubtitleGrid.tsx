@@ -655,9 +655,27 @@ export function SubtitleGrid({
                     )
                   ) : (
                     <>
-                      <span className="text-xs text-rh-text-dim truncate flex-1">
-                        {characters.find((c) => c.id === line.character_id)?.name ?? '—'}
-                      </span>
+                      {(() => {
+                        const assigned = characters.find((c) => c.id === line.character_id)?.name
+                        if (assigned) {
+                          return <span className="text-xs text-rh-text-dim truncate flex-1">{assigned}</span>
+                        }
+                        // No real assignment yet — show the raw ASS "Name"
+                        // field as a hint (e.g. Aegisub's actor field) so
+                        // manual casting is faster than an empty column,
+                        // even though it never matches a real team actor.
+                        // Per the user's own request (2026-09-09).
+                        return line.source_actor_name ? (
+                          <span
+                            className="text-xs text-rh-muted/70 italic truncate flex-1"
+                            title={`З файлу: ${line.source_actor_name} (не призначено)`}
+                          >
+                            {line.source_actor_name}
+                          </span>
+                        ) : (
+                          <span className="text-xs text-rh-text-dim truncate flex-1">—</span>
+                        )
+                      })()}
                       {teamActors.length === 0 && (
                         <QuickPickButton characters={characters} onPick={(id) => applyActorId(i, id)} />
                       )}

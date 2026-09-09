@@ -1,0 +1,1 @@
+ALTER TABLE shared_episodes ADD COLUMN cleaned_video_sent_to_sound_engineer_at TEXT;

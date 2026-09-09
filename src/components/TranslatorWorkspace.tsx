@@ -183,10 +183,15 @@ export function TranslatorWorkspace({ episodeId, titleId }: TranslatorWorkspaceP
   async function handleAssImport(files: FileList) {
     const file = files[0]
     if (!file) return
+    // Same as DirectorWorkspace's own handleAssImport (see that file's
+    // comment) — always keeps actor assignments, matched server-side by
+    // exact timing with a same-line-count positional fallback.
     setImportingAss(true)
     try {
       if (backendReady) {
-        const result = await post<{ job_id: string }>(`/episodes/${episodeId}/import-ass`, { file_path: (file as File & { path?: string }).path ?? '' })
+        const result = await post<{ job_id: string }>(`/episodes/${episodeId}/import-ass`, {
+          file_path: (file as File & { path?: string }).path ?? '', preserve_assignments: true,
+        })
         // JobStatus.type has no 'import_ass' literal — 'export_srt' is a
         // harmless placeholder here too, matching EpisodeWorkspace's own
         // identical import job registration; only episode_id/status matter

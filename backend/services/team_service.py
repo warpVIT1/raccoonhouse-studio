@@ -309,6 +309,42 @@ def remove_member(team_id: str, device_id: str, profile_name: str) -> None:
     resp.raise_for_status()
 
 
+def set_member_roles(team_id: str, device_id: str, roles: list[str], profile_name: str) -> None:
+    """Job-title roles (актор/режисер/etc.) are no longer self-picked
+    (2026-09-09 — see ProfileModal.tsx/SettingsPage.tsx's removed
+    <RolePicker> self-edit spots, and models.py's Profile.roles default of
+    just ["actor"]) — a team admin (or the app admin) grants them here
+    instead. Unlike set_team_admin above, THIS one IS delegated to team
+    admins, same posture as invite/remove-member — an ordinary studio lead
+    assigning "this person is now our translator" is routine team
+    management, not the entrenchment risk admin-promotion is. Worker's own
+    PUT /known-devices/:id/roles double-checks BOTH that profile_name is
+    really a team admin of team_id AND that the target device_id is really
+    a member of team_id — this local check is the friendly early error,
+    that one is the actual enforcement."""
+    if not _is_team_admin_of(team_id, profile_name):
+        raise PermissionError("Лише адмін команди може змінювати ролі учасників")
+    own_id = device_identity_service.get_profile_id(profile_name)
+    resp = requests.put(f"{_base()}/known-devices/{device_id}/roles", json={
+        "roles": roles, "team_id": team_id, "admin_device_id": own_id,
+    }, timeout=15)
+    resp.raise_for_status()
+
+
+def rename_team(team_id: str, new_name: str, profile_name: str) -> None:
+    """Fixes a typo'd/outdated team name (2026-09-09, e.g. "RaccoonHause" ->
+    "RaccoonHouse") without recreating the team — delegated to team admins,
+    same posture as set_member_roles/invite/remove-member above (routine
+    team management, not the entrenchment risk set_team_admin guards
+    against)."""
+    if not _is_team_admin_of(team_id, profile_name):
+        raise PermissionError("Лише адмін команди може перейменувати команду")
+    resp = requests.put(f"{_base()}/teams/{team_id}/name", json={"name": new_name}, timeout=15)
+    if resp.status_code == 409:
+        raise ValueError("Ця назва вже зайнята")
+    resp.raise_for_status()
+
+
 def set_team_admin(team_id: str, device_id: str, is_admin: bool, profile_name: str) -> None:
     # App-admin only — deliberately NOT delegated to team admins (unlike
     # invite/remove-member, which they DO get). A team admin promoting their
@@ -320,6 +356,24 @@ def set_team_admin(team_id: str, device_id: str, is_admin: bool, profile_name: s
         "team_id": team_id, "device_id": device_id, "is_team_admin": is_admin,
     }, timeout=15)
     resp.raise_for_status()
+
+
+def get_server_stats(profile_name: str) -> dict:
+    """"How loaded is the server" (2026-09-09, Settings -> Адмін tab, app
+    admin only) — proxies the Worker's GET /admin/db-stats, which reports
+    both the D1 sync-metadata database's own size (db_bytes, tiny — titles/
+    episodes/subtitle rows only) and the R2 transfer bucket's real size
+    (r2_bytes/r2_object_count/percent_of_free_tier — this is where actual
+    video/audio content lives while in transit between studio PCs, and the
+    number that actually reflects "how full," confirmed live 2026-09-09
+    after the D1-only number read as implausibly small with real episode
+    video/audio already uploaded). Not literal RAM — this app has no
+    persistent server process with its own memory footprint to report."""
+    if not is_app_admin(profile_name):
+        raise PermissionError("Лише адмін програми бачить статистику сервера")
+    resp = requests.get(f"{_base()}/admin/db-stats", timeout=15)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def all_known_users(profile_name: str) -> list[dict]:

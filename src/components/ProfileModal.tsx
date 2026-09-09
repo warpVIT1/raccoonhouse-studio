@@ -3,7 +3,7 @@ import { useApi } from '../hooks/useApi'
 import { useAppStore } from '../stores/appStore'
 import { useBackdropClose } from '../hooks/useBackdropClose'
 import { Spinner } from './ui/Spinner'
-import { RolePicker, roleLabels as roleLabelsFor } from './ui/RolePicker'
+import { roleLabels as roleLabelsFor } from './ui/RolePicker'
 import type { Profile, RoleCatalogItem } from '../types'
 
 const COLORS = ['#E52128', '#3B82F6', '#A855F7', '#22C55E', '#EC4899', '#F59E0B']
@@ -73,7 +73,10 @@ export function ProfileModal({ onClose }: ProfileModalProps) {
   // the shared <RolePicker>'s own internal fetch, since that component
   // only exposes the picking UI, not the raw list.
   const [roleCatalog, setRoleCatalog] = useState<RoleCatalogItem[]>([])
-  const [selectedRoles, setSelectedRoles] = useState<string[]>([])
+  // Fixed to just "actor" now — no self-service picking (2026-09-09), see
+  // the two RolePicker removals below. Kept as state (not a bare constant)
+  // since loginWithTelegram/createProfile still read it the same way.
+  const [selectedRoles] = useState<string[]>(['actor'])
 
   useEffect(() => {
     get<Profile[]>('/profiles').then(setProfiles).catch(() => {}).finally(() => setLoading(false))
@@ -303,7 +306,13 @@ export function ProfileModal({ onClose }: ProfileModalProps) {
             <>
               <input className="rh-input w-full" placeholder="Ім'я" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
 
-              <RolePicker selected={selectedRoles} onChange={setSelectedRoles} isAdmin={!!activeProfile?.is_admin} />
+              {/* No self-service role picking (2026-09-09) — every new
+                  profile starts as a plain Актор; only a team admin can
+                  grant additional job-title roles later (see TeamsPage's
+                  member list), scoped to their own team. */}
+              <div className="text-[11px] text-rh-muted">
+                Роль у студії: <span className="text-white font-medium">Актор</span> — інші ролі видає адмін команди
+              </div>
 
               <input
                 className="rh-input w-full"
@@ -353,7 +362,9 @@ export function ProfileModal({ onClose }: ProfileModalProps) {
           ) : (
             <>
               <span className="text-[10.5px] text-rh-muted -mb-1">Ваша роль у студії</span>
-              <RolePicker selected={selectedRoles} onChange={setSelectedRoles} isAdmin={!!activeProfile?.is_admin} />
+              <div className="text-[11px] text-rh-muted">
+                <span className="text-white font-medium">Актор</span> — інші ролі видає адмін команди
+              </div>
               <button
                 onClick={loginWithTelegram}
                 disabled={telegramBusy}

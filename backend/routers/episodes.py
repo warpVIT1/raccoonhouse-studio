@@ -261,6 +261,36 @@ def get_cleaned_video_url(ep_id: int, db: Session = Depends(get_db)):
     return {"url": f"{base}/transfer/{ep.cleaned_video_transfer_id}?filename={quote(filename)}"}
 
 
+@router.post("/episodes/{ep_id}/cleaned-video/send-to-sound-engineer")
+def send_cleaned_video_to_sound_engineer(ep_id: int, db: Session = Depends(get_db)):
+    """The director's explicit review gate on the клінапер's uploaded
+    result (see Episode.cleaned_video_sent_to_sound_engineer_at's own
+    comment) — the sound engineer's own download button only shows up once
+    this has been called, same "director reviews first" posture as audio
+    fix acceptance (see actor_audio.py's accept_actor_audio_fix)."""
+    ep = db.get(Episode, ep_id)
+    if not ep:
+        raise HTTPException(404, "Episode not found")
+    if not ep.cleaned_video_transfer_id:
+        raise HTTPException(400, "Заклінапене відео ще не завантажено")
+    import datetime as dt
+    ep.cleaned_video_sent_to_sound_engineer_at = dt.datetime.utcnow()
+    db.commit()
+    if ep.shared_id:
+        from ..services.sync_service import push_cleaned_video_transfer_id
+        push_cleaned_video_transfer_id(ep_id, db)
+    title = db.get(Title, ep.title_id)
+    from ..services import discovery_service, sync_service
+    notified = None
+    if title:
+        notified = sync_service.notify_role_for_title(
+            title, "sound_engineer",
+            f"Режисер передав заклінапене відео для серії {ep.number}: {title.name_ua}",
+            discovery_service.notify_sound_engineer, db, episode=ep,
+        )
+    return {"cleaned_video_sent_to_sound_engineer_at": ep.cleaned_video_sent_to_sound_engineer_at, "notified": notified}
+
+
 @router.post("/titles/{title_id}/episodes", response_model=EpisodeOut, status_code=201)
 def create_episode(title_id: int, body: EpisodeCreate, db: Session = Depends(get_db)):
     title = db.get(Title, title_id)
@@ -630,43 +660,6 @@ async def distributed_separate_vocals(ep_id: int, request: Request, db: Session 
     # for the peer-consent broadcast).
     asyncio.create_task(
         job_manager.run_job(loop, job, lambda r: run_distributed_separation(ep_id, model, ensemble, r, model_file=model_file, params=params))
-    )
-
-    return {"job_id": job.id}
-
-
-@router.post("/episodes/{ep_id}/detect-markers")
-async def detect_markers(ep_id: int, db: Session = Depends(get_db)):
-    ep = db.get(Episode, ep_id)
-    if not ep:
-        raise HTTPException(404)
-    # VAD needs an actual voice signal to find speech gaps in — vocal_stem_path
-    # is the instrumental (vocal removed) now, so this must read
-    # vocal_only_stem_path instead. Power-share/distributed separation now
-    # transfers both stems back, so this should only ever trigger for an
-    # episode that hasn't had vocal separation run at all yet, or one
-    # separated by an older app version (pre-dual-stem-transfer) or a peer
-    # still running one.
-    if not ep.vocal_only_stem_path or not os.path.isfile(ep.vocal_only_stem_path):
-        app_logger.warning(
-            "detect-markers: episode %s has no vocal-only stem (vocal_only_stem_path=%r)",
-            ep_id, ep.vocal_only_stem_path,
-        )
-        raise HTTPException(400, "Vocal-only stem not found — run vocal isolation first")
-    app_logger.info("detect-markers: episode=%s", ep_id)
-
-    job = job_manager.create_job("detect_markers", episode_id=ep_id)
-
-    from ..services.vad_service import run_marker_detection
-    loop = asyncio.get_event_loop()
-
-    # Collect character codes for this episode's title
-    chars = db.query(Character).filter(Character.title_id == ep.title_id).all()
-    char_codes = {c.name: c.code for c in chars}
-    vocal_only_stem_path = ep.vocal_only_stem_path
-
-    asyncio.create_task(
-        job_manager.run_job(loop, job, lambda r: run_marker_detection(ep_id, vocal_only_stem_path, char_codes, r))
     )
 
     return {"job_id": job.id}

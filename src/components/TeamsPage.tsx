@@ -3,7 +3,8 @@ import { useApi } from '../hooks/useApi'
 import { useAppStore } from '../stores/appStore'
 import { Toggle } from './ui/Toggle'
 import { Spinner } from './ui/Spinner'
-import type { AppSettings, ErrorReport, FeedbackItem, KnownUser, MyTeam, SeparationReport, Team, TeamInvite, TeamMember } from '../types'
+import { RolePicker } from './ui/RolePicker'
+import type { AppSettings, ErrorReport, FeedbackItem, KnownUser, MyTeam, Profile, SeparationReport, Team, TeamInvite, TeamMember } from '../types'
 
 export function TeamsPage() {
   const { get } = useApi()
@@ -51,6 +52,7 @@ export function TeamsPage() {
 function TeamsTab() {
   const { get, post, put, del } = useApi()
   const activeProfile = useAppStore((s) => s.activeProfile)
+  const setActiveProfile = useAppStore((s) => s.setActiveProfile)
 
   const [isAppAdmin, setIsAppAdmin] = useState(false)
   const [deviceId, setDeviceId] = useState('')
@@ -63,6 +65,24 @@ function TeamsTab() {
 
   const [inviteDeviceId, setInviteDeviceId] = useState<Record<string, string>>({})
   const [inviteError, setInviteError] = useState<Record<string, string>>({})
+
+  // Team rename (2026-09-09) — presence of a team's id as a key means
+  // "currently editing", value is the draft name. Team-admin/app-admin
+  // gated the same way as renderMemberManagement's `canManage`.
+  const [renamingTeam, setRenamingTeam] = useState<Record<string, string>>({})
+  const [renameError, setRenameError] = useState<string | null>(null)
+  async function saveTeamRename(teamId: string) {
+    const name = (renamingTeam[teamId] || '').trim()
+    if (!name) return
+    setRenameError(null)
+    try {
+      await put(`/teams/${teamId}/name`, { name })
+      setRenamingTeam((prev) => { const next = { ...prev }; delete next[teamId]; return next })
+      await load()
+    } catch (e) {
+      setRenameError(e instanceof Error ? e.message : 'Не вдалося перейменувати')
+    }
+  }
 
   const [joinTeamName, setJoinTeamName] = useState('')
   const [joinPassword, setJoinPassword] = useState('')
@@ -200,6 +220,33 @@ function TeamsTab() {
     }
   }
 
+  // Job-title roles are no longer self-picked (2026-09-09) — a team admin
+  // grants them here instead, only for members of THEIR OWN team (the
+  // backend re-checks this — see team_service.set_member_roles — this is
+  // just the friendly early gate via `canManage`, already scoped per-team
+  // by whichever list called renderMemberManagement).
+  async function saveMemberRoles(teamId: string, memberDeviceId: string, roles: string[]) {
+    setMembersByTeam((prev) => ({
+      ...prev,
+      [teamId]: (prev[teamId] || []).map((m) => (m.device_id === memberDeviceId ? { ...m, roles } : m)),
+    }))
+    try {
+      await put(`/teams/${teamId}/members/${memberDeviceId}/roles`, { roles })
+      // Editing your OWN roles (a team admin managing their own row, same
+      // as this test) otherwise wouldn't show up anywhere that reads
+      // activeProfile.roles (e.g. EpisodeRoleRouter's tab list) until the
+      // next periodic sync pull, up to 5 minutes later — confirmed live
+      // 2026-09-09 as "roles I set don't apply". This forces that pull
+      // right now, only when it's actually this device being edited.
+      if (memberDeviceId === deviceId) {
+        const updated = await post<Profile>('/profiles/refresh-roles', {})
+        setActiveProfile(updated)
+      }
+    } catch {
+      await load()
+    }
+  }
+
   async function leaveTeam(teamId: string, teamName: string) {
     if (!window.confirm(`Вийти з команди "${teamName}"?`)) return
     await removeMember(teamId, deviceId)
@@ -239,28 +286,49 @@ function TeamsTab() {
       <>
         <div className="flex flex-col gap-1">
           {(membersByTeam[teamId] || []).map((m) => (
-            <div key={m.device_id} className="flex items-center gap-2 text-[11px] text-rh-text-dim font-mono">
-              <span className="flex-1 truncate">
-                {m.display_name} {m.is_team_admin ? '· тім-адмін' : ''} · {m.device_id.slice(0, 10)}
-              </span>
-              {m.device_id === deviceId ? (
-                <button onClick={() => leaveTeam(teamId, teamName)} className="text-rh-muted hover:text-red-400 text-[10.5px]">
-                  Вийти
-                </button>
+            <div key={m.device_id} className="flex flex-col gap-1 py-0.5">
+              <div className="flex items-center gap-2 text-[11px] text-rh-text-dim font-mono">
+                <span className="flex-1 truncate">
+                  {m.display_name} {m.is_team_admin ? '· тім-адмін' : ''} · {m.device_id.slice(0, 10)}
+                </span>
+                {m.device_id === deviceId ? (
+                  <button onClick={() => leaveTeam(teamId, teamName)} className="text-rh-muted hover:text-red-400 text-[10.5px]">
+                    Вийти
+                  </button>
+                ) : (
+                  <>
+                    {isAppAdmin && (
+                      <button
+                        onClick={() => toggleTeamAdmin(teamId, m.device_id, !m.is_team_admin)}
+                        className="text-amber-400/80 hover:text-amber-300 text-[10.5px]"
+                      >
+                        {m.is_team_admin ? '−admin' : '+admin'}
+                      </button>
+                    )}
+                    {canManage && (
+                      <button onClick={() => removeMember(teamId, m.device_id)} className="text-rh-muted hover:text-red-400">✕</button>
+                    )}
+                  </>
+                )}
+              </div>
+              {/* Job-title roles — editable by this team's own admin (or
+                  the app admin) only, never by the member themselves (see
+                  ProfileModal.tsx/SettingsPage.tsx's removed self-edit
+                  spots). isAdmin={false} here deliberately — a team admin
+                  picks FROM the existing role catalog, editing the catalog
+                  itself stays a true-app-admin-only action (see
+                  RolePicker's own comment). */}
+              {canManage ? (
+                <RolePicker
+                  selected={m.roles || []}
+                  onChange={(roles) => saveMemberRoles(teamId, m.device_id, roles)}
+                  isAdmin={false}
+                  className="pl-1"
+                />
               ) : (
-                <>
-                  {isAppAdmin && (
-                    <button
-                      onClick={() => toggleTeamAdmin(teamId, m.device_id, !m.is_team_admin)}
-                      className="text-amber-400/80 hover:text-amber-300 text-[10.5px]"
-                    >
-                      {m.is_team_admin ? '−admin' : '+admin'}
-                    </button>
-                  )}
-                  {canManage && (
-                    <button onClick={() => removeMember(teamId, m.device_id)} className="text-rh-muted hover:text-red-400">✕</button>
-                  )}
-                </>
+                (m.roles || []).length > 0 && (
+                  <span className="pl-1 text-[10px] text-rh-muted">{(m.roles || []).join(', ')}</span>
+                )
               )}
             </div>
           ))}
@@ -332,7 +400,37 @@ function TeamsTab() {
             {myTeams.map((t) => (
               <div key={t.id} className="px-4 py-3 border-b border-rh-border/70 last:border-b-0 flex flex-col gap-2">
                 <div className="flex items-center gap-2">
-                  <span className="text-xs font-semibold">{t.name}</span>
+                  {renamingTeam[t.id] !== undefined ? (
+                    <>
+                      <input
+                        autoFocus
+                        value={renamingTeam[t.id]}
+                        onChange={(e) => setRenamingTeam((prev) => ({ ...prev, [t.id]: e.target.value }))}
+                        onKeyDown={(e) => { if (e.key === 'Enter') saveTeamRename(t.id) }}
+                        className="bg-rh-bg border border-rh-border rounded-lg px-2 py-1 text-xs font-semibold flex-1 min-w-0"
+                      />
+                      <button onClick={() => saveTeamRename(t.id)} className="rh-btn-primary text-[10.5px] px-2 py-1">Зберегти</button>
+                      <button
+                        onClick={() => setRenamingTeam((prev) => { const next = { ...prev }; delete next[t.id]; return next })}
+                        className="rh-btn-ghost text-[10.5px] px-2 py-1"
+                      >
+                        Скасувати
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <span className="text-xs font-semibold">{t.name}</span>
+                      {(!!t.is_team_admin || isAppAdmin) && (
+                        <button
+                          onClick={() => setRenamingTeam((prev) => ({ ...prev, [t.id]: t.name }))}
+                          className="text-rh-muted hover:text-white text-[10.5px]"
+                          title="Перейменувати команду"
+                        >
+                          ✎
+                        </button>
+                      )}
+                    </>
+                  )}
                   {!!t.is_team_admin && (
                     <span className="text-[9px] font-bold uppercase tracking-wide text-amber-400 bg-amber-400/10 border border-amber-400/30 rounded px-1 py-0.5">
                       тім-адмін
@@ -344,6 +442,9 @@ function TeamsTab() {
                     </span>
                   )}
                 </div>
+                {renameError && renamingTeam[t.id] !== undefined && (
+                  <span className="text-[10.5px] text-[#FF6B70]">{renameError}</span>
+                )}
                 {renderMemberManagement(t.id, t.name, !!t.is_team_admin || isAppAdmin)}
               </div>
             ))}

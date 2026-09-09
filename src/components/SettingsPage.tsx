@@ -5,7 +5,6 @@ import { PowerSharePanel } from './PowerSharePanel'
 import { ReportsPanel } from './ReportsPanel'
 import { UpdatePanel } from './UpdatePanel'
 import { Toggle } from './ui/Toggle'
-import { RolePicker } from './ui/RolePicker'
 import type { AppSettings, Profile } from '../types'
 
 const EMPTY_SETTINGS: AppSettings = {
@@ -54,6 +53,15 @@ export function SettingsPage() {
   const [deviceIdCopied, setDeviceIdCopied] = useState(false)
   const [notificationsPaused, setNotificationsPaused] = useState(false)
   const [notificationsBusy, setNotificationsBusy] = useState(false)
+  // "How loaded is the server" (2026-09-09) — app-admin-only, see
+  // team_service.get_server_stats's own comment on what this actually
+  // measures: D1 (db_bytes) is just sync metadata and stays tiny; the real
+  // "how full" number is the R2 transfer bucket, where actual video/audio
+  // content sits while in transit between studio PCs.
+  const [serverStats, setServerStats] = useState<{
+    db_bytes: number; r2_bytes: number; r2_object_count: number; percent_of_free_tier: number
+  } | null>(null)
+  const [serverStatsError, setServerStatsError] = useState<string | null>(null)
   // Local Electron window preference (tray hide-on-close), not part of the
   // backend's AppSettings — read/written straight through electronAPI, not
   // the /settings PUT flow (see electron/main.ts). Absent entirely in a
@@ -130,6 +138,14 @@ export function SettingsPage() {
   useEffect(() => {
     if (tab !== 'admin' || !settings.active_profile?.is_admin) return
     get<{ paused: boolean }>('/settings/notifications-paused').then((r) => setNotificationsPaused(r.paused)).catch(() => {})
+  }, [tab, settings.active_profile?.is_admin, get])
+
+  useEffect(() => {
+    if (tab !== 'admin' || !settings.active_profile?.is_admin) return
+    setServerStatsError(null)
+    get<{ db_bytes: number; r2_bytes: number; r2_object_count: number; percent_of_free_tier: number }>('/teams/admin/server-stats')
+      .then(setServerStats)
+      .catch(() => setServerStatsError('Не вдалося отримати статистику сервера'))
   }, [tab, settings.active_profile?.is_admin, get])
 
   const toggleBackgroundMode = async (v: boolean) => {
@@ -224,29 +240,13 @@ export function SettingsPage() {
     }
   }
 
-  // Own roles, editable right here — see the top-right ProfileCorner card.
-  // PUT overwrites every field on the profile (see routers/profiles.py's
-  // update_profile), so the rest of the current profile is sent back
-  // unchanged alongside the new roles — never just roles alone.
-  const saveOwnRoles = async (roles: string[]) => {
-    if (!activeProfile) return
-    try {
-      const updated = await put<Profile>(`/profiles/${activeProfile.id}`, {
-        name: activeProfile.name, role: activeProfile.role, roles, color: activeProfile.color, is_admin: activeProfile.is_admin,
-      })
-      setActiveProfile(updated)
-    } catch {
-      /* RolePicker's own chip stays optimistically toggled either way */
-    }
-  }
-
   const isAdmin = !!settings.active_profile?.is_admin
 
   return (
     <main className="relative z-[1] h-full flex flex-col p-5 px-6 overflow-hidden">
       <div className="flex items-start justify-between gap-4 mb-4 flex-shrink-0">
         <h1 className="m-0 text-lg font-black">Налаштування</h1>
-        <ProfileCorner profile={activeProfile} onSaveRoles={saveOwnRoles} />
+        <ProfileCorner profile={activeProfile} />
       </div>
 
       <div className="flex-1 flex gap-5 min-h-0 max-w-[1000px]">
@@ -613,6 +613,29 @@ export function SettingsPage() {
               </div>
 
               <ReportsPanel noTopMargin />
+
+              {/* "How loaded is the server" — app-admin only (2026-09-09).
+                  Not literal RAM (see team_service.get_server_stats' own
+                  comment) — the shared D1 database's real on-disk size,
+                  the honest storage-usage number this architecture
+                  actually has available. */}
+              <div className="bg-rh-card border border-rh-border rounded-2xl overflow-hidden">
+                <div className="flex flex-col gap-1 py-3.5 px-4">
+                  <div className="text-[12.5px] font-bold">Навантаження сервера</div>
+                  {serverStatsError ? (
+                    <div className="font-mono text-[11px] text-rh-text-dim">{serverStatsError}</div>
+                  ) : serverStats ? (
+                    <div className="font-mono text-[11px] text-rh-text-dim flex flex-col gap-0.5">
+                      <div>Сховище файлів: {serverStats.percent_of_free_tier.toFixed(1)}% від безкоштовного ліміту (10 ГБ)</div>
+                      <div className="text-rh-text-dim/70">
+                        {(serverStats.r2_bytes / (1024 * 1024 * 1024)).toFixed(2)} ГБ, {serverStats.r2_object_count} файлів · База даних: {(serverStats.db_bytes / (1024 * 1024)).toFixed(1)} МБ
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="font-mono text-[11px] text-rh-text-dim">Завантаження…</div>
+                  )}
+                </div>
+              </div>
             </div>
           )}
         </div>
@@ -634,7 +657,7 @@ function TabButton({ active, onClick, label }: { active: boolean; onClick: () =>
   )
 }
 
-function ProfileCorner({ profile, onSaveRoles }: { profile: Profile | null; onSaveRoles: (roles: string[]) => void }) {
+function ProfileCorner({ profile }: { profile: Profile | null }) {
   const [avatarFailed, setAvatarFailed] = useState(false)
   useEffect(() => { setAvatarFailed(false) }, [profile?.id])
 
@@ -664,12 +687,13 @@ function ProfileCorner({ profile, onSaveRoles }: { profile: Profile | null; onSa
             <span className="text-[10px] font-normal text-sky-400 truncate">@{profile.telegram_username}</span>
           )}
         </div>
-        <RolePicker
-          selected={profile.roles ?? []}
-          onChange={onSaveRoles}
-          isAdmin={!!profile.is_admin}
-          className="mt-1.5"
-        />
+        {/* No self-service editing (2026-09-09) — roles are granted by a
+            team admin (see TeamsPage's member list) or the app admin, not
+            picked freely here anymore. Plain read-only label instead of
+            <RolePicker>. */}
+        <div className="text-[10.5px] text-rh-muted mt-1.5">
+          {(profile.roles && profile.roles.length > 0) ? profile.roles.join(', ') : 'Актор'}
+        </div>
       </div>
     </div>
   )

@@ -697,23 +697,36 @@ function contentTypeForFilename(filename: string, id: string): string {
 }
 
 // Shared by /notify-director and /notify-actors (see their route handlers
-// below) — resolves the caller's team via team_members, finds other members
-// with `role` in their known_devices.roles JSON array and a Telegram chat id
-// on file (both synced via "hello", see webSocketMessage), and fire-and-
-// forget sendMessages each. Stage-handoff notifications only differ by which
-// role they're broadcasting to.
-async function notifyTeamRole(env: Env, teamDeviceId: string, role: string, message: string): Promise<number> {
+// below) — resolves the TARGET team, finds other members with `role` in
+// their known_devices.roles JSON array and a Telegram chat id on file (both
+// synced via "hello", see webSocketMessage), and fire-and-forget
+// sendMessages each. Stage-handoff notifications only differ by which role
+// they're broadcasting to.
+//
+// `explicitTeamId`, when given, IS the team to notify — the title/episode's
+// own team_id (see backend discovery_service.py's own comment on
+// _notify_team_role) — used as-is, no lookup. Without it (older callers, or
+// a broadcast with no specific title in scope), falls back to the OLD
+// behavior of inferring the team from the sender's OWN team_members row —
+// confirmed live 2026-09-09 as a real bug for anyone in more than one team:
+// that lookup has no ORDER BY/LIMIT, so it could silently pick a DIFFERENT
+// team than the one the content actually belongs to.
+async function notifyTeamRole(env: Env, teamDeviceId: string, role: string, message: string, explicitTeamId?: string | null): Promise<number> {
   if (await areNotificationsPaused(env)) return 0;
-  const team = await env.MODELS_DB.prepare(
-    "SELECT team_id FROM team_members WHERE device_id = ?",
-  ).bind(teamDeviceId).first<{ team_id: string }>();
-  if (!team) return 0;
+  let teamId = explicitTeamId;
+  if (!teamId) {
+    const team = await env.MODELS_DB.prepare(
+      "SELECT team_id FROM team_members WHERE device_id = ?",
+    ).bind(teamDeviceId).first<{ team_id: string }>();
+    if (!team) return 0;
+    teamId = team.team_id;
+  }
   const { results } = await env.MODELS_DB.prepare(
     `SELECT kd.telegram_id AS telegram_id FROM team_members tm
      JOIN known_devices kd ON kd.device_id = tm.device_id
      WHERE tm.team_id = ? AND tm.device_id != ? AND kd.telegram_id IS NOT NULL
        AND EXISTS (SELECT 1 FROM json_each(kd.roles) WHERE value = ?)`,
-  ).bind(team.team_id, teamDeviceId, role).all<{ telegram_id: number }>();
+  ).bind(teamId, teamDeviceId, role).all<{ telegram_id: number }>();
   let sent = 0;
   for (const row of results) {
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -903,13 +916,13 @@ export default {
     // actual team-lookup + role-filter + sendMessage logic, shared with
     // /notify-actors below.
     if (url.pathname === "/notify-director" && request.method === "POST") {
-      const body = await request.json().catch(() => null) as { team_device_id?: string; message?: string } | null;
+      const body = await request.json().catch(() => null) as { team_device_id?: string; message?: string; team_id?: string | null } | null;
       const teamDeviceId = (body?.team_device_id ?? "").toString();
       const message = (body?.message ?? "").toString().slice(0, 2000);
       if (!teamDeviceId || !message) {
         return new Response("team_device_id and message are required", { status: 400 });
       }
-      const sent = await notifyTeamRole(env, teamDeviceId, "director", message);
+      const sent = await notifyTeamRole(env, teamDeviceId, "director", message, body?.team_id);
       return Response.json({ sent });
     }
 
@@ -917,13 +930,13 @@ export default {
     // above (see backend discovery_service.notify_actors and
     // routers/episodes.py's /episodes/{id}/send-to-actors).
     if (url.pathname === "/notify-actors" && request.method === "POST") {
-      const body = await request.json().catch(() => null) as { team_device_id?: string; message?: string } | null;
+      const body = await request.json().catch(() => null) as { team_device_id?: string; message?: string; team_id?: string | null } | null;
       const teamDeviceId = (body?.team_device_id ?? "").toString();
       const message = (body?.message ?? "").toString().slice(0, 2000);
       if (!teamDeviceId || !message) {
         return new Response("team_device_id and message are required", { status: 400 });
       }
-      const sent = await notifyTeamRole(env, teamDeviceId, "actor", message);
+      const sent = await notifyTeamRole(env, teamDeviceId, "actor", message, body?.team_id);
       return Response.json({ sent });
     }
 
@@ -932,13 +945,13 @@ export default {
     // routers/actor_audio.py's send-to-sound-engineer) — same shape as
     // /notify-director/-actors above.
     if (url.pathname === "/notify-sound-engineer" && request.method === "POST") {
-      const body = await request.json().catch(() => null) as { team_device_id?: string; message?: string } | null;
+      const body = await request.json().catch(() => null) as { team_device_id?: string; message?: string; team_id?: string | null } | null;
       const teamDeviceId = (body?.team_device_id ?? "").toString();
       const message = (body?.message ?? "").toString().slice(0, 2000);
       if (!teamDeviceId || !message) {
         return new Response("team_device_id and message are required", { status: 400 });
       }
-      const sent = await notifyTeamRole(env, teamDeviceId, "sound_engineer", message);
+      const sent = await notifyTeamRole(env, teamDeviceId, "sound_engineer", message, body?.team_id);
       return Response.json({ sent });
     }
 
@@ -947,13 +960,13 @@ export default {
     // import_ass) — same shape as /notify-director/-actors/-sound-engineer
     // above.
     if (url.pathname === "/notify-translator" && request.method === "POST") {
-      const body = await request.json().catch(() => null) as { team_device_id?: string; message?: string } | null;
+      const body = await request.json().catch(() => null) as { team_device_id?: string; message?: string; team_id?: string | null } | null;
       const teamDeviceId = (body?.team_device_id ?? "").toString();
       const message = (body?.message ?? "").toString().slice(0, 2000);
       if (!teamDeviceId || !message) {
         return new Response("team_device_id and message are required", { status: 400 });
       }
-      const sent = await notifyTeamRole(env, teamDeviceId, "translator", message);
+      const sent = await notifyTeamRole(env, teamDeviceId, "translator", message, body?.team_id);
       return Response.json({ sent });
     }
 
@@ -1089,7 +1102,7 @@ export default {
         actor_video_transfer_id?: string | null; original_filename?: string | null;
         translation_started_at?: string | null; sound_engineer_done_at?: string | null;
         cleaned_video_transfer_id?: string | null; cleaned_video_filename?: string | null;
-        cleaned_video_uploaded_at?: string | null;
+        cleaned_video_uploaded_at?: string | null; cleaned_video_sent_to_sound_engineer_at?: string | null;
         original_size?: number | null; original_bitrate?: number | null; original_format?: string | null;
         status?: string; subtitle_stage?: string;
       } | null;
@@ -1104,13 +1117,14 @@ export default {
          cleaned_video_transfer_id = COALESCE(?, cleaned_video_transfer_id),
          cleaned_video_filename = COALESCE(?, cleaned_video_filename),
          cleaned_video_uploaded_at = COALESCE(?, cleaned_video_uploaded_at),
+         cleaned_video_sent_to_sound_engineer_at = COALESCE(?, cleaned_video_sent_to_sound_engineer_at),
          original_size = ?, original_bitrate = ?,
          original_format = ?, status = COALESCE(?, status), subtitle_stage = COALESCE(?, subtitle_stage), updated_at = ? WHERE id = ?`,
       ).bind(body?.season ?? null, body?.number ?? null, body?.duration ?? null, body?.video_transfer_id ?? null,
              body?.actor_video_transfer_id ?? null, body?.original_filename ?? null,
              body?.translation_started_at ?? null, body?.sound_engineer_done_at ?? null,
              body?.cleaned_video_transfer_id ?? null, body?.cleaned_video_filename ?? null,
-             body?.cleaned_video_uploaded_at ?? null,
+             body?.cleaned_video_uploaded_at ?? null, body?.cleaned_video_sent_to_sound_engineer_at ?? null,
              body?.original_size ?? null, body?.original_bitrate ?? null, body?.original_format ?? null,
              body?.status ?? null, body?.subtitle_stage ?? null, now, id).run();
       return Response.json({ ok: true });
@@ -1743,10 +1757,17 @@ export default {
     if (url.pathname === "/teams/members" && request.method === "GET") {
       const teamId = url.searchParams.get("team_id");
       if (!teamId) return new Response("team_id required", { status: 400 });
+      // roles joined in from known_devices (2026-09-09) — TeamsPage's own
+      // member-management list is where a team admin now grants job-title
+      // roles (see PUT /known-devices/:id/roles above), so it needs to show
+      // each member's current roles, not just their team-admin flag.
       const { results } = await env.MODELS_DB.prepare(
-        "SELECT team_id, device_id, display_name, is_team_admin, joined_at FROM team_members WHERE team_id = ?",
-      ).bind(teamId).all<TeamMember>();
-      return Response.json(results);
+        `SELECT tm.team_id, tm.device_id, tm.display_name, tm.is_team_admin, tm.joined_at, kd.roles AS roles
+         FROM team_members tm LEFT JOIN known_devices kd ON kd.device_id = tm.device_id
+         WHERE tm.team_id = ?`,
+      ).bind(teamId).all<TeamMember & { roles: string | null }>();
+      const withParsedRoles = results.map((r) => ({ ...r, roles: r.roles ? JSON.parse(r.roles) : [] }));
+      return Response.json(withParsedRoles);
     }
 
     if (url.pathname === "/teams/members" && request.method === "DELETE") {
@@ -1768,6 +1789,25 @@ export default {
       await env.MODELS_DB.prepare("UPDATE team_members SET is_team_admin = ? WHERE team_id = ? AND device_id = ?")
         .bind(body.is_team_admin ? 1 : 0, body.team_id, body.device_id).run();
       return new Response(null, { status: 204 });
+    }
+
+    // Renames a team (2026-09-09) — team_service.rename_team checks the
+    // caller is a team admin (or app admin) of this exact team before
+    // calling this, same trust posture as /teams/members/admin just above
+    // (no re-check here, unlike PUT /known-devices/:id/roles, which trusts
+    // less since ANY team admin can target ANY device_id there).
+    const teamRenameMatch = url.pathname.match(/^\/teams\/([A-Za-z0-9_-]+)\/name$/);
+    if (teamRenameMatch && request.method === "PUT") {
+      const teamId = teamRenameMatch[1];
+      const body = await request.json().catch(() => null) as { name?: string } | null;
+      const name = body?.name?.trim();
+      if (!name) return new Response("name is required", { status: 400 });
+      try {
+        await env.MODELS_DB.prepare("UPDATE teams SET name = ? WHERE id = ?").bind(name, teamId).run();
+      } catch (e) {
+        return new Response("Ця назва вже зайнята", { status: 409 });
+      }
+      return Response.json({ ok: true, name });
     }
 
     if (url.pathname === "/teams/by-name" && request.method === "GET") {
@@ -1924,6 +1964,59 @@ export default {
       return Response.json({ paused, notified });
     }
 
+    // Team-admin-driven role management (2026-09-09) — job-title roles are
+    // no longer self-picked by the person themselves (see ProfileModal.tsx/
+    // SettingsPage.tsx's own removed <RolePicker> self-edit spots); a team
+    // admin grants them here instead, and ONLY for someone who's actually a
+    // member of the SAME team the admin administers — both membership rows
+    // are checked before the write, not just the admin's own status, so an
+    // admin of team A can never touch a person who's only in team B (even
+    // if that person happens to ALSO be in team A under a different
+    // profile — matched by device_id, the one stable identity this app has).
+    // See backend routers/teams.py's set_member_roles, the only caller.
+    const knownDeviceRolesMatch = url.pathname.match(/^\/known-devices\/([A-Za-z0-9_-]+)\/roles$/);
+    if (knownDeviceRolesMatch && request.method === "PUT") {
+      const targetDeviceId = knownDeviceRolesMatch[1];
+      const body = await request.json().catch(() => null) as {
+        roles?: string[]; team_id?: string; admin_device_id?: string;
+      } | null;
+      if (!body?.team_id || !body?.admin_device_id || !Array.isArray(body.roles)) {
+        return new Response("team_id, admin_device_id and roles are required", { status: 400 });
+      }
+      const adminRow = await env.MODELS_DB.prepare(
+        "SELECT is_team_admin FROM team_members WHERE team_id = ? AND device_id = ?",
+      ).bind(body.team_id, body.admin_device_id).first<{ is_team_admin: number }>();
+      if (!adminRow || !adminRow.is_team_admin) {
+        return new Response("Not a team admin of this team", { status: 403 });
+      }
+      const targetRow = await env.MODELS_DB.prepare(
+        "SELECT 1 FROM team_members WHERE team_id = ? AND device_id = ?",
+      ).bind(body.team_id, targetDeviceId).first();
+      if (!targetRow) {
+        return new Response("Target is not a member of this team", { status: 403 });
+      }
+      await env.MODELS_DB.prepare(
+        "UPDATE known_devices SET roles = ? WHERE device_id = ?",
+      ).bind(JSON.stringify(body.roles), targetDeviceId).run();
+      return Response.json({ ok: true, roles: body.roles });
+    }
+
+    // A device's own current roles, as an admin may have last set them —
+    // polled by the AFFECTED device itself (see backend sync_service.py's
+    // periodic pull) rather than pushed live, since there's no per-device
+    // WebSocket guaranteed connected at the moment an admin makes the
+    // change. Not app-admin-gated like the bulk /known-devices list above —
+    // a device asking for its OWN roles by its OWN id is not a privacy leak.
+    const knownDeviceMatch2 = url.pathname.match(/^\/known-devices\/([A-Za-z0-9_-]+)$/);
+    if (knownDeviceMatch2 && request.method === "GET") {
+      const deviceId = knownDeviceMatch2[1];
+      const row = await env.MODELS_DB.prepare(
+        "SELECT device_id, roles FROM known_devices WHERE device_id = ?",
+      ).bind(deviceId).first<{ device_id: string; roles: string | null }>();
+      if (!row) return new Response("Not found", { status: 404 });
+      return Response.json({ device_id: row.device_id, roles: row.roles ? JSON.parse(row.roles) : [] });
+    }
+
     if (url.pathname === "/known-devices" && request.method === "GET") {
       // App-admin gated at the backend level (team_service.all_known_users),
       // not here — same trust posture as everything else in this file.
@@ -1931,6 +2024,150 @@ export default {
         "SELECT device_id, display_name, first_seen_at, last_seen_at, roles, telegram_id, telegram_username FROM known_devices ORDER BY last_seen_at DESC",
       ).all();
       return Response.json(results);
+    }
+
+    // "How loaded is the server" (2026-09-09, app admin only Settings ->
+    // Адмін tab). Two very different stores, both reported:
+    //  - D1 (MODELS_DB) holds only lightweight sync metadata — titles,
+    //    episodes, characters, subtitle lines, markers, team/device rows.
+    //    Confirmed live 2026-09-09 this stays under ~1MB even with a real
+    //    team's data (11 episodes' worth) in it — that's correct, not a
+    //    bug, because...
+    //  - ...actual media (video/audio files in transit between studio PCs)
+    //    passes through R2 (TRANSFERS) as a store-and-forward relay, and
+    //    IS the real "how full" number the user cares about — confirmed
+    //    live 2026-09-09 at 11.9 GB / 83 objects via `wrangler r2 bucket
+    //    info`, while D1 was 0.7 MB. R2 has no querying-from-inside-a-
+    //    Worker size API (unlike D1's meta.size_after), so this lists
+    //    every object and sums `.size` — fine at this object count, would
+    //    need cursor-paginated summing if it ever grows past ~1000 objects.
+    //  `percent_of_free_tier` is R2's used bytes against Cloudflare's
+    //  documented 10GB/month free R2 storage allowance — not a hard quota
+    //  (R2 is pay-as-you-go beyond it), but the one concrete, externally
+    //  documented number to measure "how full" against without needing an
+    //  account-level Cloudflare API token (which this Worker doesn't have
+    //  — see TELEGRAM_BOT_TOKEN being the only secret configured).
+    // App-admin gated at the backend level, same trust posture as
+    // everything else here — see team_service.get_server_stats, the only
+    // caller.
+    if (url.pathname === "/admin/db-stats" && request.method === "GET") {
+      const result = await env.MODELS_DB.prepare("SELECT 1").run();
+      const dbBytes = (result.meta as { size_after?: number } | undefined)?.size_after ?? 0;
+
+      let r2Bytes = 0;
+      let r2Objects = 0;
+      let cursor: string | undefined;
+      do {
+        const listed: R2Objects = await env.TRANSFERS.list(cursor ? { cursor, limit: 1000 } : { limit: 1000 });
+        for (const o of listed.objects) r2Bytes += o.size;
+        r2Objects += listed.objects.length;
+        cursor = listed.truncated ? listed.cursor : undefined;
+      } while (cursor);
+
+      const R2_FREE_TIER_BYTES = 10 * 1024 * 1024 * 1024; // Cloudflare's documented 10GB/month free R2 storage allowance
+      return Response.json({
+        db_bytes: dbBytes,
+        r2_bytes: r2Bytes,
+        r2_object_count: r2Objects,
+        percent_of_free_tier: Math.round((r2Bytes / R2_FREE_TIER_BYTES) * 1000) / 10,
+      });
+    }
+
+    // Diagnostic companion to /admin/db-stats above (2026-09-09) — the
+    // percentage alone doesn't say WHAT's actually sitting in R2, and
+    // /transfer/:id objects are supposed to be temporary store-and-forward
+    // relay copies (deleted by discovery_service.delete_transfer once the
+    // receiving side finishes downloading — see this file's own top
+    // comment). If the real number is dominated by objects that were never
+    // cleaned up (an interrupted transfer, a deleted episode whose cleanup
+    // call never fired, etc.) that's a different fix than "buy more R2."
+    // Not wired into any frontend UI yet — used directly via curl for this
+    // one investigation.
+    if (url.pathname === "/admin/r2-objects" && request.method === "GET") {
+      const objects: { key: string; size: number; uploaded: string }[] = [];
+      let cursor: string | undefined;
+      do {
+        const listed: R2Objects = await env.TRANSFERS.list(cursor ? { cursor, limit: 1000 } : { limit: 1000 });
+        for (const o of listed.objects) objects.push({ key: o.key, size: o.size, uploaded: o.uploaded.toISOString() });
+        cursor = listed.truncated ? listed.cursor : undefined;
+      } while (cursor);
+      objects.sort((a, b) => b.size - a.size);
+      return Response.json(objects);
+    }
+
+    // One-time cleanup for the leak found+fixed 2026-09-09 (sync_service.py's
+    // _push_episode_video / cleaner_service.py's _run_submit_cleaned_video
+    // never deleted the PREVIOUS R2 copy before overwriting the pointer —
+    // now fixed going forward, this clears out what already accumulated).
+    // Only ever deletes "rh-team-video-*" objects (the full original video,
+    // sync_service.py's own upload — confirmed gated on `title.shared_id`,
+    // so shared_episodes.video_transfer_id is a fully authoritative
+    // "what's still live" list for this ONE prefix) that aren't any shared
+    // episode's current video_transfer_id, plus known throwaway debug junk
+    // (rh-test-*/smoketest456 from earlier dev-session diagnostic scripts).
+    // Deliberately leaves rh-team-actorvideo-/-cleanedvideo-/-actoraudio-
+    // alone — those aren't share-gated the same way (a purely local/
+    // unshared title can still have a live actor-video handoff in R2 with
+    // no D1 row to cross-reference against), so a blind cross-check there
+    // risks deleting something still in active use. Requires
+    // ?confirm=yes-delete so this never fires by accident.
+    if (url.pathname === "/admin/cleanup-transfers" && request.method === "POST") {
+      if (url.searchParams.get("confirm") !== "yes-delete") {
+        return new Response("Pass ?confirm=yes-delete to actually run this", { status: 400 });
+      }
+      const liveRows = await env.MODELS_DB.prepare(
+        "SELECT video_transfer_id FROM shared_episodes WHERE video_transfer_id IS NOT NULL"
+      ).all<{ video_transfer_id: string }>();
+      const liveVideoIds = new Set(liveRows.results.map((r) => r.video_transfer_id));
+
+      let deletedCount = 0;
+      let freedBytes = 0;
+      const deletedKeys: string[] = [];
+      let cursor: string | undefined;
+      do {
+        const listed: R2Objects = await env.TRANSFERS.list(cursor ? { cursor, limit: 1000 } : { limit: 1000 });
+        for (const o of listed.objects) {
+          const isOrphanedVideo = o.key.startsWith("rh-team-video-") && !liveVideoIds.has(o.key);
+          const isDebugJunk = o.key.startsWith("rh-test-") || o.key === "smoketest456";
+          if (isOrphanedVideo || isDebugJunk) {
+            await env.TRANSFERS.delete(o.key);
+            deletedCount++;
+            freedBytes += o.size;
+            deletedKeys.push(o.key);
+          }
+        }
+        cursor = listed.truncated ? listed.cursor : undefined;
+      } while (cursor);
+
+      return Response.json({ deleted_count: deletedCount, freed_bytes: freedBytes, deleted_keys: deletedKeys });
+    }
+
+    // Full wipe (2026-09-09), explicitly requested after the scoped
+    // /admin/cleanup-transfers above — deletes EVERY object in the bucket,
+    // no exceptions (live episode videos, actor audio/hardsub, error
+    // reports, feedback, the Apex model catalog config, MVSep config,
+    // telegram-login codes, all of it). D1 rows (shared_episodes etc.)
+    // are untouched — this only empties the R2 bucket the transfer_ids
+    // point at, so any surviving shared_episodes.video_transfer_id etc.
+    // will just 404 on next download until re-synced. Requires
+    // ?confirm=wipe-everything so this can never fire by accident.
+    if (url.pathname === "/admin/wipe-r2" && request.method === "POST") {
+      if (url.searchParams.get("confirm") !== "wipe-everything") {
+        return new Response("Pass ?confirm=wipe-everything to actually run this", { status: 400 });
+      }
+      let deletedCount = 0;
+      let freedBytes = 0;
+      let cursor: string | undefined;
+      do {
+        const listed: R2Objects = await env.TRANSFERS.list(cursor ? { cursor, limit: 1000 } : { limit: 1000 });
+        for (const o of listed.objects) {
+          await env.TRANSFERS.delete(o.key);
+          deletedCount++;
+          freedBytes += o.size;
+        }
+        cursor = listed.truncated ? listed.cursor : undefined;
+      } while (cursor);
+      return Response.json({ deleted_count: deletedCount, freed_bytes: freedBytes });
     }
 
     // Precise per-user cleanup for the admin "База даних" tab — deletes

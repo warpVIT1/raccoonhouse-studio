@@ -40,6 +40,7 @@ def _run_submit_cleaned_video(episode_id: int, file_path: str, reporter: Progres
     # identical fix for why a literal "." in transfer_id breaks every
     # /transfer/:id route match on the Worker side (426 "Upgrade Required").
     ext = (Path(file_path).suffix or ".mp4").lstrip(".")
+    old_transfer_id = ep.cleaned_video_transfer_id
     transfer_id = f"rh-team-cleanedvideo-{episode_id}-{uuid.uuid4().hex}{ext}"
 
     reporter.update(2, "Завантажую…")
@@ -58,6 +59,12 @@ def _run_submit_cleaned_video(episode_id: int, file_path: str, reporter: Progres
     ep.cleaned_video_filename = filename
     ep.cleaned_video_uploaded_at = dt.datetime.utcnow()
     db.commit()
+    # This class's own docstring already says "a re-upload here replaces
+    # the previous one" — true for the DB pointer, but confirmed live
+    # 2026-09-09 the old R2 object itself was never deleted, silently
+    # orphaned on every re-upload (same bug as sync_service._push_episode_video).
+    if old_transfer_id and old_transfer_id != transfer_id:
+        discovery_service.delete_transfer(old_transfer_id)
 
     title = db.get(Title, ep.title_id)
     if title and title.shared_id:

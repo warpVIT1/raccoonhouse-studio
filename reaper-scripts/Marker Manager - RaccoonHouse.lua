@@ -41,6 +41,14 @@ local WORKER_BASE = "https://raccoonhouse-signaling.raccoonhause.workers.dev"
 local EXT_NS = "RHMarkerManager"
 local RECONNECT_INTERVAL = 5.0 -- seconds between auto-retry attempts while disconnected
 local RECONNECT_MAX_ATTEMPTS = 5
+-- Cast list otherwise only ever re-fetches on a manual "ОНОВИТИ СПИСОК"
+-- click or a reconnect — confirmed live 2026-09-10 as the reason an actor
+-- un-cast from a character in the app (team_device_id cleared) kept
+-- showing in an already-open, already-connected script window: nothing
+-- was polling while conn_state == "connected". This is a silent periodic
+-- re-fetch (see silent_refresh below), separate from maybe_retry's
+-- disconnected-only retry loop.
+local AUTO_REFRESH_INTERVAL = 20.0
 
 -- ============================================================
 -- Tiny JSON (hand-rolled — REAPER ships no JSON lib, and this keeps the
@@ -433,6 +441,7 @@ local conn_state = "idle" -- "idle" | "connecting" | "connected" | "reconnecting
 local conn_error_detail = nil
 local reconnect_attempt = 0
 local next_retry_at = 0
+local next_auto_refresh_at = 0
 
 -- At most one network request in flight at a time — { kind = "snapshot" |
 -- "send", handle = <http_start() handle>, count = <marker count, "send" only> }.
@@ -552,6 +561,19 @@ local function maybe_retry()
   if reaper.time_precise() < next_retry_at then return end
   conn_state = "reconnecting"
   fetch_snapshot()
+end
+
+-- Background re-fetch while already connected (see AUTO_REFRESH_INTERVAL's
+-- own comment) — deliberately does NOT touch conn_state/status strip on
+-- start, so the UI stays exactly as-is (no "connecting…" flicker every
+-- 20s). A failure here is silently ignored — we already have working data
+-- on screen, this was just an attempt to freshen it, and the next timer
+-- tick tries again; only maybe_retry's disconnected path surfaces errors.
+local function silent_refresh()
+  if pending then return end
+  next_auto_refresh_at = reaper.time_precise() + AUTO_REFRESH_INTERVAL
+  local handle = http_start("GET", WORKER_BASE .. "/shared-titles/summary?team_id=" .. team_id, nil, 10)
+  pending = { kind = "snapshot_silent", handle = handle }
 end
 
 -- ============================================================
@@ -716,6 +738,9 @@ local function poll_pending()
   if state == "pending" then return end
   if pending.kind == "snapshot" then
     finish_snapshot(state == "done" and ok, status, body)
+  elseif pending.kind == "snapshot_silent" then
+    if state == "done" and ok and body then apply_snapshot(body) end
+    -- no else — see silent_refresh's own comment, failures here are mute
   elseif pending.kind == "send" then
     finish_send(state == "done" and ok, status, pending.count)
   end
@@ -1231,6 +1256,12 @@ local function main()
   -- Only auto-retry while looking at a screen that actually needs live data.
   if screen == "titles" or screen == "manager" then
     maybe_retry()
+  end
+  -- Cast list freshness while sitting on the manager screen already
+  -- connected — see AUTO_REFRESH_INTERVAL's own comment.
+  if screen == "manager" and conn_state == "connected" and not pending
+      and reaper.time_precise() >= next_auto_refresh_at then
+    silent_refresh()
   end
 
   if screen == "setup" then

@@ -1311,6 +1311,41 @@ export default {
       return Response.json(rows);
     }
 
+    // Additive marker batch — one INSERT batch per call, NO delete first
+    // (see the bulk-replace route right above, which the desktop app's own
+    // push_markers relies on for its "local list is authoritative" push
+    // model). This one exists for the standalone sound-engineer Reaper
+    // script (2026-09-10, reaper-scripts/Marker Manager - RaccoonHouse.lua)
+    // — it never has the episode's FULL marker set in front of it, only
+    // whatever it placed in this one REAPER session, so a bulk-replace call
+    // would wipe every marker anyone else already pushed. Same request/
+    // response shape as the bulk-replace route otherwise. No auth (same
+    // trust posture as the rest of this file) — anyone holding a real
+    // shared_episode_id can append markers to it.
+    const sharedEpisodeMarkersAddMatch = url.pathname.match(/^\/shared-episodes\/([A-Za-z0-9_-]+)\/markers\/add$/);
+    if (sharedEpisodeMarkersAddMatch && request.method === "POST") {
+      const sharedEpisodeId = sharedEpisodeMarkersAddMatch[1];
+      const body = await request.json().catch(() => null) as Array<{
+        reaper_name: string; position_seconds: number; confirmed?: boolean;
+        color?: string | null; character_id?: string | null;
+      }> | null;
+      if (!Array.isArray(body)) {
+        return new Response("expected a JSON array", { status: 400 });
+      }
+      const now = new Date().toISOString();
+      const rows = body.map((m) => ({
+        id: crypto.randomUUID(), shared_episode_id: sharedEpisodeId,
+        reaper_name: m.reaper_name, position_seconds: m.position_seconds,
+        confirmed: m.confirmed ? 1 : 0, color: m.color ?? null, character_id: m.character_id ?? null,
+        updated_at: now,
+      }));
+      await env.MODELS_DB.batch(rows.map((r) => env.MODELS_DB.prepare(
+        `INSERT INTO shared_markers (id, shared_episode_id, reaper_name, position_seconds, confirmed, color, character_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(r.id, r.shared_episode_id, r.reaper_name, r.position_seconds, r.confirmed, r.color, r.character_id, r.updated_at)));
+      return Response.json(rows);
+    }
+
     // Additive create — one row per "Здати" upload, NOT a bulk-replace
     // (unlike markers/lines above, each submission is an independent file
     // already sitting in R2 under its own transfer_id; re-pushing

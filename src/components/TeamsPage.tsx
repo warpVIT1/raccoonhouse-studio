@@ -62,6 +62,13 @@ function TeamsTab() {
   const [invites, setInvites] = useState<TeamInvite[]>([])
   const [membersByTeam, setMembersByTeam] = useState<Record<string, TeamMember[]>>({})
   const [loading, setLoading] = useState(true)
+  // One-time bridge for the standalone sound-engineer Reaper script
+  // (reaper-scripts/Marker Manager - RaccoonHouse.lua, 2026-09-10) — the
+  // Worker has no auth, so that script needs a team_id to know which
+  // team's titles/episodes/cast to fetch. It asks for this once on first
+  // run and caches it in REAPER's own ExtState after — this button is the
+  // only place a human can actually get that id to paste in.
+  const [copiedTeamId, setCopiedTeamId] = useState<string | null>(null)
 
   const [inviteDeviceId, setInviteDeviceId] = useState<Record<string, string>>({})
   const [inviteError, setInviteError] = useState<Record<string, string>>({})
@@ -441,6 +448,18 @@ function TeamsTab() {
                       кредити
                     </span>
                   )}
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(t.id).then(() => {
+                        setCopiedTeamId(t.id)
+                        setTimeout(() => setCopiedTeamId((id) => (id === t.id ? null : id)), 1500)
+                      }).catch(() => {})
+                    }}
+                    title="Для налаштування скрипта «Marker Manager» в Reaper — команда попросить цей ID один раз"
+                    className="ml-auto text-[10px] text-rh-muted hover:text-white flex-shrink-0"
+                  >
+                    {copiedTeamId === t.id ? 'Скопійовано' : 'ID для Reaper'}
+                  </button>
                 </div>
                 {renameError && renamingTeam[t.id] !== undefined && (
                   <span className="text-[10.5px] text-[#FF6B70]">{renameError}</span>

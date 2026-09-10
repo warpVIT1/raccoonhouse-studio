@@ -371,13 +371,30 @@ MODEL_ARCH = {
 # their DB table won't be affected either way — this specific re-pick was
 # ALSO pushed live via push_apex_models_to_worker so already-seeded installs
 # pick it up on their next Апекс panel open, not just fresh ones.
+#
+# Re-checked 2026-09-10 against a model-ranking doc the user provided —
+# most of the doc's headline names (Deux/Becruily, Gabox Flowers v10,
+# BS-PolarFormer, SCNet variants, Gilliaan's specialized models, most
+# MVSEP-branded entries) turned out to NOT exist in the installed
+# audio-separator 0.44.3's own registry (Separator().list_supported_model_
+# files()) at all — either newer than this pinned version or MVSEP-web-
+# service-only, not standalone downloadable checkpoints (see auto-memory
+# reference_vocal_model_doc.md). Queried the REAL registry directly instead
+# of trusting the doc's claims, and found one genuine upgrade: the MelBand
+# slot's "Inst V2" checkpoint is beaten on BOTH axes by Unwa's newer
+# "InstVoc Duality V1" checkpoint (instrumental SDR 16.1121 vs 16.0572,
+# vocals SDR 10.9604 vs 10.2547) — a jointly-optimized dual-stem model
+# rather than an instrumental-only-tuned one, and it's what actually ships
+# in this audio-separator version. Nothing else in the registry beat an
+# existing pick by enough to justify swapping (see registry query results
+# in this session's own history if re-verifying later).
 APEX_METHOD = "Апекс"
 APEX_MODELS_DEFAULT: list[tuple[str, str, str]] = [
     ("BS-Roformer-Viperx-1297", "model_bs_roformer_ep_317_sdr_12.9755.ckpt", "mdxc"),
     ("BS-Roformer-Viperx-1296", "model_bs_roformer_ep_368_sdr_12.9628.ckpt", "mdxc"),
     ("MDX23C-InstVoc HQ 2", "MDX23C-8KFFT-InstVoc_HQ_2.ckpt", "mdxc"),
     ("Kim Vocal 2", "Kim_Vocal_2.onnx", "mdx"),
-    ("MelBand Roformer Kim Inst V2 (unwa)", "melband_roformer_inst_v2.ckpt", "mdxc"),
+    ("MelBand Roformer Kim InstVoc Duality V1 (unwa)", "melband_roformer_instvoc_duality_v1.ckpt", "mdxc"),
 ]
 
 

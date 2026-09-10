@@ -319,7 +319,12 @@ def update_episode(ep_id: int, body: EpisodeUpdate, db: Session = Depends(get_db
     ep = db.get(Episode, ep_id)
     if not ep:
         raise HTTPException(404)
-    for k, v in body.model_dump(exclude_none=True).items():
+    # include=model_fields_set, NOT exclude_none=True — same bug fixed in
+    # routers/subtitles.py's update_subtitle_line (confirmed live
+    # 2026-09-10): exclude_none silently drops a field whose value is None
+    # before it ever reaches setattr, so an explicit {field: null} meant to
+    # CLEAR a nullable column would silently no-op.
+    for k, v in body.model_dump(include=body.model_fields_set).items():
         setattr(ep, k, v)
     db.commit()
     db.refresh(ep)

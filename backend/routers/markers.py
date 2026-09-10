@@ -162,7 +162,12 @@ def update_marker(marker_id: int, body: MarkerUpdate, db: Session = Depends(get_
     marker = db.get(Marker, marker_id)
     if not marker:
         raise HTTPException(404)
-    for k, v in body.model_dump(exclude_none=True).items():
+    # include=model_fields_set, NOT exclude_none=True — same bug fixed in
+    # routers/subtitles.py's update_subtitle_line (confirmed live
+    # 2026-09-10): exclude_none silently drops a field whose value is None
+    # before it ever reaches setattr, so an explicit {character_id: null}
+    # meant to unassign a marker's character would silently no-op.
+    for k, v in body.model_dump(include=body.model_fields_set).items():
         setattr(marker, k, v)
     db.commit()
     db.refresh(marker)

@@ -441,12 +441,20 @@ local pending = nil
 
 -- name defaults to "Дроп" (matches the reference script's own default) —
 -- the sound engineer types their OWN marker labels ("клацання", "потрібен
--- ретейк"...), same as in the reference. Picking a character binds
--- character_id/color alongside it but deliberately does NOT overwrite
--- whatever name is already there (confirmed live 2026-09-10 this was a
--- real regression: the character's own name was silently replacing
--- whatever the sound engineer had typed).
+-- ретейк"...), same as in the reference.
 local current_marker = { name = "Дроп", character_id = nil, character_name = nil, color = nil, overridden = false }
+
+-- Per-character name memory, keyed by character_id — confirmed live
+-- 2026-09-10 as a real gap: picking WarpVIT, typing "ВП", then picking
+-- Dimonchik and typing "ДМ", then picking WarpVIT again showed "ДМ" —
+-- there was only ever one shared name field. Each character now
+-- remembers its own last-typed name; switching characters restores
+-- THEIR name, not whatever the previous character had. Persisted to
+-- ExtState as JSON so it survives closing/reopening the script too.
+local character_names = json.decode(get_ext("CharacterNames", "")) or {}
+local function save_character_names()
+  set_ext("CharacterNames", json.encode(character_names))
+end
 local action_created = false
 local scroll_y = 0
 local last_mouse_state = 0
@@ -468,6 +476,29 @@ local function apply_snapshot(body)
   local decoded, err = json.decode(body)
   if not decoded then return false end
   snapshot = decoded
+  -- "ОНОВИТИ СПИСОК" replaces `snapshot` wholesale, but confirmed live
+  -- 2026-09-10 that left selected_title/selected_episode pointing at the
+  -- OLD (now orphaned) title/episode objects, so the manager screen's cast
+  -- list never actually changed after a refresh even though the fetch
+  -- itself succeeded. Re-point both at the matching objects (by id) in the
+  -- freshly decoded snapshot.
+  if selected_title then
+    local old_id = selected_title.id
+    local old_ep_id = selected_episode and selected_episode.id
+    selected_title = nil
+    selected_episode = nil
+    for _, t in ipairs(snapshot) do
+      if t.id == old_id then
+        selected_title = t
+        if old_ep_id then
+          for _, ep in ipairs(t.episodes or {}) do
+            if ep.id == old_ep_id then selected_episode = ep; break end
+          end
+        end
+        break
+      end
+    end
+  end
   set_ext("SnapshotCache", body)
   set_ext("SnapshotCacheAt", os.date("%d.%m, %H:%M"))
   return true
@@ -958,6 +989,10 @@ local function draw_manager_screen(mx, my, click)
       local retval, input = reaper.GetUserInputs("Назва маркера", 1, "Назва:,extrawidth=100", current_marker.name)
       if retval then
         current_marker.name = input
+        if current_marker.character_id then
+          character_names[current_marker.character_id] = input
+          save_character_names()
+        end
         save_current_preset()
       end
     end
@@ -1098,14 +1133,15 @@ local function draw_manager_screen(mx, my, click)
         gfx.x, gfx.y = px + right_w - 20 - iw - 4, cy + 5
         gfx.drawstr(idshort)
         if click and row_hover then
-          -- Deliberately does NOT touch current_marker.name — the sound
-          -- engineer's own typed label (e.g. "клацання язиком") stays
-          -- exactly as they wrote it; only the character binding + its
-          -- color change here. Per the user's own request (2026-09-10):
-          -- marker names are the sound engineer's own text, same as the
-          -- reference script, not the character's name.
+          -- Restores THIS character's own last-typed name (falling back to
+          -- the "Дроп" default the first time it's ever picked) — never
+          -- leaves behind whatever the PREVIOUSLY selected character's
+          -- name was. Confirmed live 2026-09-10: WarpVIT -> type "ВП" ->
+          -- Dimonchik -> type "ДМ" -> WarpVIT again used to still show
+          -- "ДМ", since there was only one shared name field.
           current_marker.character_id = char.id
           current_marker.character_name = char.name
+          current_marker.name = character_names[char.id] or "Дроп"
           if not current_marker.overridden then
             local cr2, cg2, cb2 = color_for_id(char.id)
             current_marker.color = { cr2, cg2, cb2 }

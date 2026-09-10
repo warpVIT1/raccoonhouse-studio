@@ -1258,6 +1258,29 @@ export default {
       return Response.json({ ok: true });
     }
 
+    // Permanent delete of one character — confirmed live 2026-09-10 as the
+    // root cause of a "duplicate persists forever" bug: the local DELETE
+    // /characters/{id} (routers/characters.py) never told the cloud at
+    // all, so a re-added actor got a BRAND NEW shared_characters row every
+    // time (POST /characters' own find-or-create had nothing local left to
+    // match against, but the old cloud row was still sitting there
+    // unreachable) — visible in the Marker Manager Reaper script's cast
+    // list as the same actor listed twice. Un-assigns (never deletes) any
+    // subtitle lines/markers/audio submissions that referenced this
+    // character, matching how a character removal already behaves locally
+    // — removing a roster slot shouldn't destroy real subtitle/marker/
+    // audio content, just its character tag.
+    if (sharedCharacterMatch && request.method === "DELETE") {
+      const id = sharedCharacterMatch[1];
+      await env.MODELS_DB.batch([
+        env.MODELS_DB.prepare("UPDATE shared_subtitle_lines SET character_id = NULL WHERE character_id = ?").bind(id),
+        env.MODELS_DB.prepare("UPDATE shared_markers SET character_id = NULL WHERE character_id = ?").bind(id),
+        env.MODELS_DB.prepare("UPDATE shared_audio_submissions SET character_id = NULL WHERE character_id = ?").bind(id),
+        env.MODELS_DB.prepare("DELETE FROM shared_characters WHERE id = ?").bind(id),
+      ]);
+      return new Response(null, { status: 204 });
+    }
+
     // Bulk replace, same posture as the local PUT /episodes/{id}/subtitle-lines
     // this mirrors — deletes everything for this shared episode and inserts
     // the given set fresh, returning the new rows (with fresh ids) so the

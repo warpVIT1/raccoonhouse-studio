@@ -449,6 +449,29 @@ def delete_shared_episode(shared_id: str, team_id: str, device_id: str, strict: 
     return True
 
 
+def delete_shared_character(shared_id: str, team_id: str, device_id: str, strict: bool = False) -> bool:
+    """Permanent cloud-side delete of one character (see the Worker's
+    DELETE /shared-characters/:id) — same strict-mode posture as
+    delete_shared_title/delete_shared_episode. Without this,
+    routers/characters.py's delete_character used to only ever remove the
+    LOCAL row, leaving the cloud-authoritative shared_characters row alive
+    forever — confirmed live 2026-09-10 as the actual cause of a "same
+    actor listed twice, permanently" bug: re-adding the same actor after a
+    local delete had nothing local left to match against (POST
+    /characters' find-or-create only looks at local rows), so it created a
+    BRAND NEW cloud row instead of reusing the orphaned one."""
+    base = discovery_service.get_https_base()
+    if not base:
+        return not strict
+    try:
+        requests.delete(f"{base}/shared-characters/{shared_id}", timeout=15).raise_for_status()
+    except Exception:
+        logger.exception("delete_shared_character: failed for shared_id %s", shared_id)
+        return not strict
+    _notify_team(team_id, device_id)
+    return True
+
+
 def push_episode(episode_id: int, db: Session) -> None:
     ep = db.get(Episode, episode_id)
     if not ep or not ep.title.shared_id:

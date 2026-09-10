@@ -3,7 +3,9 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 
 from ..database import get_db
-from ..models import AppSettings, Character, Dubber, CharacterDubberMap, Profile, Title
+from ..models import (
+    ActorAudioSubmission, AppSettings, Character, Dubber, CharacterDubberMap, Marker, Profile, SubtitleLine, Title,
+)
 from ..schemas import (
     CharacterCreate, CharacterOut, CharacterTeamActorUpdate, DubberCreate, DubberUpdate, DubberOut,
     CharacterDubberMapCreate,
@@ -104,9 +106,32 @@ def update_character(char_id: int, body: CharacterCreate, db: Session = Depends(
 
 @router.delete("/characters/{char_id}", status_code=204)
 def delete_character(char_id: int, db: Session = Depends(get_db)):
+    """Removes a character from the roster. Cloud delete FIRST, local
+    delete only after it actually succeeds — same strict posture as
+    routers/titles.py's delete_title, closing the exact same bug class:
+    confirmed live 2026-09-10 that this used to be a purely local delete,
+    so the cloud's shared_characters row stayed alive forever and a
+    re-added actor got a brand new duplicate row instead of reusing it
+    (visible as the same actor listed twice in the Marker Manager Reaper
+    script's cast list). Un-assigns (never deletes) any subtitle lines/
+    markers/audio submissions that referenced this character — removing a
+    roster slot shouldn't destroy real content, just its character tag."""
     char = db.get(Character, char_id)
     if not char:
         raise HTTPException(404)
+    if char.shared_id and char.title.team_id:
+        from ..services import device_identity_service, sync_service
+        settings = db.get(AppSettings, 1)
+        profile = db.get(Profile, settings.active_profile_id) if settings and settings.active_profile_id else None
+        if not profile:
+            raise HTTPException(400, "Немає активного профілю")
+        device_id = device_identity_service.get_profile_id(profile.name)
+        if not sync_service.delete_shared_character(char.shared_id, char.title.team_id, device_id, strict=True):
+            raise HTTPException(502, "Не вдалося видалити персонажа у хмарі — спробуйте ще раз")
+    db.query(SubtitleLine).filter(SubtitleLine.character_id == char_id).update({"character_id": None})
+    db.query(Marker).filter(Marker.character_id == char_id).update({"character_id": None})
+    db.query(ActorAudioSubmission).filter(ActorAudioSubmission.character_id == char_id).update({"character_id": None})
+    db.query(CharacterDubberMap).filter(CharacterDubberMap.character_id == char_id).delete()
     db.delete(char)
     db.commit()
 

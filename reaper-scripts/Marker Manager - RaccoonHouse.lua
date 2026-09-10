@@ -917,7 +917,10 @@ local function draw_manager_screen(mx, my, click)
     gfx.drawstr(current_marker.name ~= "" and current_marker.name or "—")
     if click and name_hover then
       local retval, input = reaper.GetUserInputs("Назва маркера", 1, "Назва:,extrawidth=100", current_marker.name)
-      if retval then current_marker.name = input end
+      if retval then
+        current_marker.name = input
+        save_current_preset()
+      end
     end
     py = py + 26
 
@@ -947,6 +950,7 @@ local function draw_manager_screen(mx, my, click)
         local cr, cg, cb = reaper.ColorFromNative(color)
         current_marker.color = { cr, cg, cb }
         current_marker.overridden = true
+        save_current_preset()
       end
     end
     py = py + 26
@@ -1064,7 +1068,14 @@ local function draw_manager_screen(mx, my, click)
             current_marker.name = char.name
           end
           current_marker.overridden = false
-          action_created = false
+          -- Matches the reference script's own row-click behavior: save
+          -- ExtState immediately on selection, same as it always called
+          -- save_settings() right in the click handler. The generated
+          -- hotkey action reads ExtState fresh every time it fires (see
+          -- create_action_script) — it was ALREADY correct the moment this
+          -- script was first saved once, so switching characters needs no
+          -- extra button click before the hotkey uses the new one.
+          save_current_preset()
         end
       end
     end

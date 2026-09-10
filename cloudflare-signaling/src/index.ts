@@ -1520,7 +1520,12 @@ export default {
       for (const title of titles as Array<{ id: string }>) {
         const [{ results: episodes }, { results: characters }] = await Promise.all([
           env.MODELS_DB.prepare("SELECT id, season, number FROM shared_episodes WHERE shared_title_id = ?").bind(title.id).all(),
-          env.MODELS_DB.prepare("SELECT id, name, code FROM shared_characters WHERE shared_title_id = ?").bind(title.id).all(),
+          // team_device_id added 2026-09-10 — the Marker Manager Reaper
+          // script filters its cast list to characters actually cast to a
+          // real actor (or the "everyone" pseudo-actor), so an unassigned
+          // character (team_device_id cleared) stops showing there without
+          // needing a whole extra route.
+          env.MODELS_DB.prepare("SELECT id, name, code, team_device_id FROM shared_characters WHERE shared_title_id = ?").bind(title.id).all(),
         ]);
         out.push({ ...title, episodes, characters });
       }

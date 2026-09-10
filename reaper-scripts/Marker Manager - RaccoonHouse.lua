@@ -659,7 +659,11 @@ local function collect_markers_for_upload()
     if retval == 0 then break end
     if not isrgn then
       local character_id = nil
-      if color ~= 0 then
+      -- EnumProjectMarkers2 can hand back nil for color (not just 0) for a
+      -- marker that's never had a custom color set — confirmed live
+      -- 2026-09-10 as a real crash ("bad argument #1 to 'ColorFromNative'
+      -- (number expected, got nil)"), `color ~= 0` alone is true for nil.
+      if color and color ~= 0 then
         local cr, cg, cb = reaper.ColorFromNative(color)
         character_id = resolve_character_id_by_color(cr, cg, cb)
       end
@@ -1081,7 +1085,16 @@ local function draw_manager_screen(mx, my, click)
   if show_right then
     local px = right_x + 10
     local py = top_off + 10
-    local characters = (selected_title and selected_title.characters) or {}
+    -- Only characters actually cast to a real actor (or the "everyone"
+    -- pseudo-actor) — confirmed live 2026-09-10 the un-cast ones (director
+    -- cleared team_device_id, unassigning the actor) kept showing here
+    -- forever, with no way to tell they'd been removed.
+    local characters = {}
+    for _, c in ipairs((selected_title and selected_title.characters) or {}) do
+      if c.team_device_id and c.team_device_id ~= "" then
+        characters[#characters + 1] = c
+      end
+    end
 
     set_rgb(0xCC, 0xCC, 0xCC, 1)
     gfx.x, gfx.y = px, py

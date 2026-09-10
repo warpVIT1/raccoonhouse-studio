@@ -439,7 +439,14 @@ local next_retry_at = 0
 -- Polled every frame in main(); nil when idle.
 local pending = nil
 
-local current_marker = { name = "", character_id = nil, character_name = nil, color = nil, overridden = false }
+-- name defaults to "Дроп" (matches the reference script's own default) —
+-- the sound engineer types their OWN marker labels ("клацання", "потрібен
+-- ретейк"...), same as in the reference. Picking a character binds
+-- character_id/color alongside it but deliberately does NOT overwrite
+-- whatever name is already there (confirmed live 2026-09-10 this was a
+-- real regression: the character's own name was silently replacing
+-- whatever the sound engineer had typed).
+local current_marker = { name = "Дроп", character_id = nil, character_name = nil, color = nil, overridden = false }
 local action_created = false
 local scroll_y = 0
 local last_mouse_state = 0
@@ -519,25 +526,34 @@ end
 -- ============================================================
 -- Reaper-native marker helpers
 -- ============================================================
-local RH_SUFFIX_PATTERN = "%s*{rh:([%w%-]+)}%s*$"
-
-local function compose_marker_name(name, character_id)
-  if character_id and character_id ~= "" then
-    return name .. " {rh:" .. character_id .. "}"
-  end
-  return name
-end
-
-local function strip_rh_suffix(name)
-  local char_id = name:match(RH_SUFFIX_PATTERN)
-  if char_id then
-    return name:gsub(RH_SUFFIX_PATTERN, ""), char_id
-  end
-  return name, nil
-end
-
+-- Character binding travels via the marker's own COLOR, never its name —
+-- per the user's own explicit call (2026-09-10): no id of any kind, short
+-- or otherwise, belongs in a marker's visible text. This also matches how
+-- the rest of RaccoonHouse Studio already works — the app's own marker
+-- workflow (MarkersTab.tsx, PUT /episodes/{id}/markers/by-color) already
+-- bulk-assigns a character to every marker of one color, so color-as-
+-- binding is the established convention here, not a new one. Each cast
+-- row's color IS color_for_id(character.id) (a pure function of the id,
+-- see that function's own comment) — so a marker created with a
+-- character's color can be matched straight back to that same character
+-- by re-computing color_for_id for every cast member and comparing.
 local function reaper_native_color(r, g, b)
   return reaper.ColorToNative(r, g, b) | 0x1000000
+end
+
+-- Resolves a marker's RGB back to a character id by exact color match
+-- against the currently loaded cast. nil if there's no cast loaded, the
+-- marker has no custom color, or nothing matches (e.g. a marker made
+-- outside this tool, or its character was since removed from the cast) —
+-- the marker still uploads, just unmapped, same as any marker that never
+-- had a character.
+local function resolve_character_id_by_color(r, g, b)
+  if not selected_title or not selected_title.characters then return nil end
+  for _, c in ipairs(selected_title.characters) do
+    local cr, cg, cb = color_for_id(c.id)
+    if cr == r and cg == g and cb == b then return c.id end
+  end
+  return nil
 end
 
 -- Mirrors the reference script's own create_action_script — writes a tiny
@@ -555,15 +571,12 @@ local function create_action_script()
 local EXT_NS = "RHMarkerManager"
 local name = reaper.GetExtState(EXT_NS, "CurrentName")
 if name == "" then name = "Маркер" end
-local char_id = reaper.GetExtState(EXT_NS, "CurrentCharacterId")
 local color_str = reaper.GetExtState(EXT_NS, "CurrentColorNative")
 local color = tonumber(color_str) or 0
-local full_name = name
-if char_id ~= "" then full_name = name .. " {rh:" .. char_id .. "}" end
 local pos = reaper.GetCursorPosition()
-reaper.AddProjectMarker2(0, false, pos, 0, full_name, -1, color)
+reaper.AddProjectMarker2(0, false, pos, 0, name, -1, color)
 reaper.UpdateTimeline()
-reaper.Undo_OnStateChange("Додано маркер: " .. full_name)
+reaper.Undo_OnStateChange("Додано маркер: " .. name)
 ]])
   f:close()
   reaper.AddRemoveReaScript(true, 0, path, true)
@@ -591,9 +604,11 @@ local function update_startup_script(enable)
   if f_out then f_out:write(new_content); f_out:close() end
 end
 
+-- No character id saved here at all — the generated action only ever
+-- needs name+color, the color itself IS the character binding (see
+-- resolve_character_id_by_color's own comment).
 local function save_current_preset()
   set_ext("CurrentName", current_marker.name)
-  set_ext("CurrentCharacterId", current_marker.character_id or "")
   local r, g, b = 0, 0, 0
   if current_marker.color then r, g, b = table.unpack(current_marker.color) end
   set_ext("CurrentColorNative", tostring(reaper_native_color(r, g, b)))
@@ -612,13 +627,17 @@ local function collect_markers_for_upload()
     local retval, isrgn, pos, _rgnend, name, _idx, color = reaper.EnumProjectMarkers2(0, i)
     if retval == 0 then break end
     if not isrgn then
-      local clean_name, char_id = strip_rh_suffix(name)
+      local character_id = nil
+      if color ~= 0 then
+        local cr, cg, cb = reaper.ColorFromNative(color)
+        character_id = resolve_character_id_by_color(cr, cg, cb)
+      end
       out[#out + 1] = {
-        reaper_name = clean_name,
+        reaper_name = name,
         position_seconds = pos,
         confirmed = true,
         color = nil, -- server-side color isn't meaningful here (see color_for_id comment) — left unset
-        character_id = char_id,
+        character_id = character_id,
       }
     end
     i = i + 1
@@ -867,24 +886,44 @@ local function draw_manager_screen(mx, my, click)
   local content_h = gfx.h - strip_h - send_bar_h
   gfx.set(0, 0, 0, 1); gfx.rect(0, 0, gfx.w, content_h)
 
+  -- Header — always present (confirmed live 2026-09-10 this screen had NO
+  -- way back to episode selection at all). Back-arrow + current episode.
+  local header_h = 20
+  local back_hover = point_in(mx, my, 4, 0, 90, header_h)
+  set_rgb(back_hover and 0xAA or 0x66, back_hover and 0xAA or 0x66, back_hover and 0xAA or 0x66, 1)
+  gfx.x, gfx.y = 8, 3
+  gfx.drawstr("← серії")
+  if selected_episode then
+    set_rgb(0x66, 0x66, 0x66, 1)
+    local ep_label = string.format("С%d Е%d", selected_episode.season or 1, selected_episode.number or 0)
+    local elw = gfx.measurestr(ep_label)
+    gfx.x, gfx.y = gfx.w - elw - 8, 3
+    gfx.drawstr(ep_label)
+  end
+  if click and back_hover then
+    screen = "episodes"
+    return
+  end
+
   local narrow = gfx.w < 560
   local left_w, right_x, right_w
+  local tabs_h = 0
 
   if narrow then
     -- Tabs: single column, switch between marker preset and cast list.
-    local tab_h = 20
+    tabs_h = 20
     local tab_w = gfx.w / 2
     for idx, name in ipairs({ "marker", "cast" }) do
       local tx = (idx - 1) * tab_w
       local active = narrow_tab == name
       set_rgb(active and 0x33 or 0x1a, active and 0x33 or 0x1a, active and 0x33 or 0x1a, 1)
-      gfx.rect(tx, 0, tab_w, tab_h)
+      gfx.rect(tx, header_h, tab_w, tabs_h)
       set_rgb(0xFF, 0xFF, 0xFF, 1)
       local label = name == "marker" and "МАРКЕР" or "КАСТ"
       local lw = gfx.measurestr(label)
-      gfx.x, gfx.y = tx + (tab_w - lw) / 2, 3
+      gfx.x, gfx.y = tx + (tab_w - lw) / 2, header_h + 3
       gfx.drawstr(label)
-      if click and point_in(mx, my, tx, 0, tab_w, tab_h) then narrow_tab = name end
+      if click and point_in(mx, my, tx, header_h, tab_w, tabs_h) then narrow_tab = name end
     end
     left_w = gfx.w
     right_x, right_w = 0, gfx.w
@@ -893,12 +932,12 @@ local function draw_manager_screen(mx, my, click)
     right_x = left_w + 1
     right_w = gfx.w - left_w - 1
     set_rgb(0x4D, 0x4D, 0x4D, 1)
-    gfx.line(left_w, 0, left_w, content_h)
+    gfx.line(left_w, header_h, left_w, content_h)
   end
 
   local show_left = (not narrow) or narrow_tab == "marker"
   local show_right = (not narrow) or narrow_tab == "cast"
-  local top_off = narrow and 20 or 0
+  local top_off = header_h + tabs_h
 
   -- ---------------- LEFT: current marker preset ----------------
   if show_left then
@@ -926,8 +965,9 @@ local function draw_manager_screen(mx, my, click)
 
     set_rgb(0x7A, 0x7A, 0x7A, 1)
     gfx.x, gfx.y = px, py + 3
-    gfx.drawstr(current_marker.character_id and ("character_id: " .. current_marker.character_id:sub(1, 8) .. "…")
-      or "character_id: —")
+    -- Human-readable, not a raw id anywhere — the character binding lives
+    -- entirely in the marker's color (see resolve_character_id_by_color).
+    gfx.drawstr("Персонаж: " .. (current_marker.character_name or "не обрано"))
     py = py + 20
 
     set_rgb(0xCC, 0xCC, 0xCC, 1)
@@ -971,7 +1011,7 @@ local function draw_manager_screen(mx, my, click)
     gfx.drawstr("Буде створено на позиції курсора:")
     set_rgb(0xFF, 0xFF, 0xFF, 1)
     gfx.x, gfx.y = px + 10, py + 20
-    gfx.drawstr(compose_marker_name(current_marker.name ~= "" and current_marker.name or "Маркер", current_marker.character_id))
+    gfx.drawstr(current_marker.name ~= "" and current_marker.name or "Маркер")
     py = py + 50
 
     -- Primary action + checkbox pinned near the bottom.
@@ -1058,14 +1098,17 @@ local function draw_manager_screen(mx, my, click)
         gfx.x, gfx.y = px + right_w - 20 - iw - 4, cy + 5
         gfx.drawstr(idshort)
         if click and row_hover then
+          -- Deliberately does NOT touch current_marker.name — the sound
+          -- engineer's own typed label (e.g. "клацання язиком") stays
+          -- exactly as they wrote it; only the character binding + its
+          -- color change here. Per the user's own request (2026-09-10):
+          -- marker names are the sound engineer's own text, same as the
+          -- reference script, not the character's name.
           current_marker.character_id = char.id
           current_marker.character_name = char.name
           if not current_marker.overridden then
             local cr2, cg2, cb2 = color_for_id(char.id)
             current_marker.color = { cr2, cg2, cb2 }
-          end
-          if current_marker.name == "" or current_marker.name == current_marker.character_name then
-            current_marker.name = char.name
           end
           current_marker.overridden = false
           -- Matches the reference script's own row-click behavior: save

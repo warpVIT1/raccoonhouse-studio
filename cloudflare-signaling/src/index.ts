@@ -1376,6 +1376,39 @@ export default {
         `INSERT INTO shared_markers (id, shared_episode_id, reaper_name, position_seconds, confirmed, color, character_id, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(r.id, r.shared_episode_id, r.reaper_name, r.position_seconds, r.confirmed, r.color, r.character_id, r.updated_at)));
+
+      // Live nudge to every device on this team — confirmed live 2026-09-10
+      // as the actual reason "Відправити на сервер" looked like it did
+      // nothing in RaccoonHouse Studio: the insert above genuinely
+      // succeeded, but nobody ever told an already-open desktop app to
+      // pull fresh data, so the new markers only surfaced on the next
+      // periodic catch-up sync (_online_signaling_loop's own 5-minute
+      // fallback — see discovery_service.py). Every OTHER push path
+      // (sync_service.py's push_markers etc.) goes through
+      // /notify-team-content, which needs a team_device_id to exclude
+      // (the pusher's own live connection) — the script has no such
+      // device/WS identity at all, so this relays to literally every
+      // team member instead of "everyone but the sender".
+      const titleRow = await env.MODELS_DB.prepare(
+        `SELECT st.team_id AS team_id FROM shared_episodes se
+         JOIN shared_titles st ON st.id = se.shared_title_id WHERE se.id = ?`,
+      ).bind(sharedEpisodeId).first<{ team_id: string }>();
+      if (titleRow) {
+        const { results: members } = await env.MODELS_DB.prepare(
+          "SELECT device_id FROM team_members WHERE team_id = ?",
+        ).bind(titleRow.team_id).all<{ device_id: string }>();
+        const targetIds = members.map((m) => m.device_id);
+        if (targetIds.length > 0) {
+          const doId = env.PEER_REGISTRY.idFromName("global");
+          const stub = env.PEER_REGISTRY.get(doId);
+          await stub.fetch("https://do/relay-to-devices", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ targetIds, payload: { kind: "shared_content_updated", team_id: titleRow.team_id } }),
+          }).catch(() => {}); // best-effort — the markers are already saved either way
+        }
+      }
+
       return Response.json(rows);
     }
 

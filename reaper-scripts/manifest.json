@@ -1,0 +1,8 @@
+[
+  {
+    "filename": "Marker Manager - RaccoonHouse.lua",
+    "title": "Менеджер Маркерів",
+    "description": "Для звукорежисера — розставляє маркери прямо в REAPER з прив'язкою до касту епізоду (або власних міток), працює навіть коли RaccoonHouse Studio закрита.",
+    "version": "1.0.0"
+  }
+]

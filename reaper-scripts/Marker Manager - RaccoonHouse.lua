@@ -780,18 +780,23 @@ local function draw_status_strip(y, w)
   set_rgb(0xB8, 0xB8, 0xB8, 1)
   gfx.x, gfx.y = 20, y + 5
   gfx.drawstr(text)
-  if sub ~= "" then
+  -- Send-result feedback takes over the RIGHT slot instead of drawing on
+  -- top of the main connection text — confirmed live 2026-09-10 both were
+  -- drawn at the exact same x,y and rendered as illegible overlapping
+  -- text. Whichever is showing wins that slot; they never fight over it.
+  local send_active = send_status and reaper.time_precise() < send_status_until
+  if send_active then
+    if send_status == "ok" then set_rgb(0x1A, 0x66, 0x1A, 1)
+    elseif send_status == "error" then set_rgb(0xE5, 0x21, 0x28, 1)
+    else set_rgb(0xB8, 0x86, 0x0B, 1) end
+    local sdw = gfx.measurestr(send_status_detail or "")
+    gfx.x, gfx.y = w - sdw - 8, y + 5
+    gfx.drawstr(send_status_detail or "")
+  elseif sub ~= "" then
     set_rgb(0x66, 0x66, 0x66, 1)
     local sw = gfx.measurestr(sub)
     gfx.x, gfx.y = w - sw - 8, y + 5
     gfx.drawstr(sub)
-  end
-  if send_status and reaper.time_precise() < send_status_until then
-    if send_status == "ok" then set_rgb(0x1A, 0x66, 0x1A, 1)
-    elseif send_status == "error" then set_rgb(0xE5, 0x21, 0x28, 1)
-    else set_rgb(0xB8, 0x86, 0x0B, 1) end
-    gfx.x, gfx.y = 20, y + 5
-    gfx.drawstr(send_status_detail or "")
   end
 end
 

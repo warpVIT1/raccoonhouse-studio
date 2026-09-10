@@ -858,7 +858,13 @@ end
 -- ============================================================
 local function draw_manager_screen(mx, my, click)
   local strip_h = 22
-  local content_h = gfx.h - strip_h
+  local send_bar_h = 26
+  -- Panels get everything ABOVE the send-bar; the send-bar itself is its
+  -- own dedicated row above the status strip. Confirmed live 2026-09-10
+  -- these two used to share the exact same y-position (both anchored to
+  -- "bottom of content_h"), so the cast list's own "ОНОВИТИ СПИСОК" button
+  -- and "ВІДПРАВИТИ НА СЕРВЕР" literally overlapped on screen.
+  local content_h = gfx.h - strip_h - send_bar_h
   gfx.set(0, 0, 0, 1); gfx.rect(0, 0, gfx.w, content_h)
 
   local narrow = gfx.w < 560
@@ -1069,14 +1075,17 @@ local function draw_manager_screen(mx, my, click)
     if click and refresh_hover then fetch_snapshot() end
   end
 
-  -- ---------------- Send-to-server (bottom-right of manager, above strip) ----------------
-  local send_w = 180
+  -- ---------------- Send-to-server — its own dedicated bar, never shares
+  -- a row with anything else (see send_bar_h comment above) ----------------
+  gfx.set(0.04, 0.04, 0.04, 1); gfx.rect(0, content_h, gfx.w, send_bar_h)
+  local send_w = math.min(220, gfx.w - 20)
+  local send_y = content_h + 2
   local send_busy = pending ~= nil and pending.kind == "send"
-  local send_hover = (not send_busy) and point_in(mx, my, gfx.w - send_w - 10, content_h - 26, send_w, 22)
-  draw_button(gfx.w - send_w - 10, content_h - 26, send_w, 22, send_busy and "ВІДПРАВЛЯЄТЬСЯ…" or "ВІДПРАВИТИ НА СЕРВЕР", send_hover, send_hover, send_busy)
+  local send_hover = (not send_busy) and point_in(mx, my, gfx.w - send_w - 10, send_y, send_w, send_bar_h - 4)
+  draw_button(gfx.w - send_w - 10, send_y, send_w, send_bar_h - 4, send_busy and "ВІДПРАВЛЯЄТЬСЯ…" or "ВІДПРАВИТИ НА СЕРВЕР", send_hover, send_hover, send_busy)
   if click and send_hover then send_to_server() end
 
-  draw_status_strip(content_h, gfx.w)
+  draw_status_strip(content_h + send_bar_h, gfx.w)
 end
 
 -- ============================================================

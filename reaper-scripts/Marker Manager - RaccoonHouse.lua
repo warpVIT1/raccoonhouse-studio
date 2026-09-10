@@ -451,7 +451,17 @@ local pending = nil
 -- name defaults to "Дроп" (matches the reference script's own default) —
 -- the sound engineer types their OWN marker labels ("клацання", "потрібен
 -- ретейк"...), same as in the reference.
-local current_marker = { name = "Дроп", character_id = nil, character_name = nil, color = nil, overridden = false }
+local current_marker = { name = "Дроп", character_id = nil, character_name = nil, preset_id = nil, color = nil, overridden = false }
+
+-- Both tables below are scoped to THIS team (key suffixed with team_id,
+-- not just a flat "CharacterNames"/"CustomPresets") — 2026-09-10 request:
+-- memory should span every episode/title of the team (a character_id is
+-- already team-wide, never per-episode, so that part was already true),
+-- but must NOT leak into a different team if this same REAPER install is
+-- ever pointed at another one later. Purely local ExtState either way —
+-- this is only ever how THIS sound engineer's own machine remembers
+-- things, never pushed to the cloud or shared with teammates.
+local function team_ext_key(base) return base .. "_" .. team_id end
 
 -- Per-character name memory, keyed by character_id — confirmed live
 -- 2026-09-10 as a real gap: picking WarpVIT, typing "ВП", then picking
@@ -460,9 +470,22 @@ local current_marker = { name = "Дроп", character_id = nil, character_name =
 -- remembers its own last-typed name; switching characters restores
 -- THEIR name, not whatever the previous character had. Persisted to
 -- ExtState as JSON so it survives closing/reopening the script too.
-local character_names = json.decode(get_ext("CharacterNames", "")) or {}
+local character_names = json.decode(get_ext(team_ext_key("CharacterNames"), "")) or {}
 local function save_character_names()
-  set_ext("CharacterNames", json.encode(character_names))
+  set_ext(team_ext_key("CharacterNames"), json.encode(character_names))
+end
+
+-- Sound engineer's OWN marker presets (2026-09-10 request) — the cast list
+-- is server-owned and read-only, but not every marker is about a
+-- character ("клацання", "потрібен ретейк", generic ЗВУК notes...). Each
+-- entry is { id, name, color = {r,g,b} }, purely local (no cloud
+-- counterpart, no id collision risk with color_for_id's hash-derived
+-- palette to worry about beyond ordinary bad luck — same as any marker
+-- color nobody claimed). `id` is only used as a stable React-style key for
+-- deleting the right row; it never travels anywhere.
+local custom_presets = json.decode(get_ext(team_ext_key("CustomPresets"), "")) or {}
+local function save_custom_presets()
+  set_ext(team_ext_key("CustomPresets"), json.encode(custom_presets))
 end
 local action_created = false
 local scroll_y = 0
@@ -1036,7 +1059,9 @@ local function draw_manager_screen(mx, my, click)
     gfx.x, gfx.y = px, py + 3
     -- Human-readable, not a raw id anywhere — the character binding lives
     -- entirely in the marker's color (see resolve_character_id_by_color).
-    gfx.drawstr("Персонаж: " .. (current_marker.character_name or "не обрано"))
+    local who = current_marker.character_name
+      or (current_marker.preset_id and "своя мітка" or "не обрано")
+    gfx.drawstr("Персонаж: " .. who)
     py = py + 20
 
     set_rgb(0xCC, 0xCC, 0xCC, 1)
@@ -1111,7 +1136,7 @@ local function draw_manager_screen(mx, my, click)
     end
   end
 
-  -- ---------------- RIGHT: cast list ----------------
+  -- ---------------- RIGHT: cast + own labels ----------------
   if show_right then
     local px = right_x + 10
     local py = top_off + 10
@@ -1142,70 +1167,158 @@ local function draw_manager_screen(mx, my, click)
     gfx.drawstr(live_label)
     py = py + 22
 
+    -- Combined scrollable list — cast (server-owned, from the cloud, no
+    -- delete) followed by the sound engineer's OWN presets (local-only,
+    -- deletable via the ✕ that appears on hover). One shared list/scroll
+    -- rather than two separate panes — there usually isn't room for both
+    -- to have their own independent scroll area at once, and this mirrors
+    -- how the original reference script had a single flat preset list.
+    local rows = {}
+    for _, c in ipairs(characters) do rows[#rows + 1] = { kind = "cast", char = c } end
+    rows[#rows + 1] = { kind = "divider", label = "МОЇ МІТКИ · " .. #custom_presets }
+    for _, p in ipairs(custom_presets) do rows[#rows + 1] = { kind = "custom", preset = p } end
+
     local list_top = py
     local list_bottom = content_h - 30
     local row_h = 25
-    local max_scroll = math.max(0, (#characters * row_h) - (list_bottom - list_top))
+    local max_scroll = math.max(0, (#rows * row_h) - (list_bottom - list_top))
     if scroll_y > max_scroll then scroll_y = max_scroll end
     if scroll_y < 0 then scroll_y = 0 end
 
-    for row_idx, char in ipairs(characters) do
+    for row_idx, row in ipairs(rows) do
       local cy = list_top + (row_idx - 1) * row_h - scroll_y
       if cy + row_h >= list_top and cy <= list_bottom then
-        local is_active = current_marker.character_id == char.id
-        local row_hover = point_in(mx, my, px, cy, right_w - 20, row_h)
-        if is_active then
-          set_rgb(0x5C, 0x0E, 0x11, 1); gfx.rect(px, cy, right_w - 20, row_h)
-          set_rgb(0xE5, 0x21, 0x28, 1); gfx.rect(px, cy, 4, row_h)
-        elseif row_hover then
-          set_rgb(0x4D, 0x4D, 0x4D, 1); gfx.rect(px, cy, right_w - 20, row_h)
-        else
-          set_rgb(0x26, 0x26, 0x26, 1); gfx.rect(px, cy, right_w - 20, row_h)
-        end
-        local cr, cg, cb = color_for_id(char.id)
-        set_rgb(cr, cg, cb, 1)
-        gfx.rect(px + (is_active and 8 or 12), cy + 5, 15, 15)
-        gfx.set(1, 1, 1, 1)
-        gfx.rect(px + (is_active and 8 or 12), cy + 5, 15, 15, 0)
-        set_rgb(0xFF, 0xFF, 0xFF, 1)
-        gfx.x, gfx.y = px + (is_active and 8 or 12) + 23, cy + 5
-        gfx.drawstr(char.name or "?")
-        set_rgb(0x99, 0x99, 0x99, 1)
-        local idshort = (char.id or ""):sub(1, 8)
-        local iw = gfx.measurestr(idshort)
-        gfx.x, gfx.y = px + right_w - 20 - iw - 4, cy + 5
-        gfx.drawstr(idshort)
-        if click and row_hover then
-          -- Restores THIS character's own last-typed name (falling back to
-          -- the "Дроп" default the first time it's ever picked) — never
-          -- leaves behind whatever the PREVIOUSLY selected character's
-          -- name was. Confirmed live 2026-09-10: WarpVIT -> type "ВП" ->
-          -- Dimonchik -> type "ДМ" -> WarpVIT again used to still show
-          -- "ДМ", since there was only one shared name field.
-          current_marker.character_id = char.id
-          current_marker.character_name = char.name
-          current_marker.name = character_names[char.id] or "Дроп"
-          if not current_marker.overridden then
-            local cr2, cg2, cb2 = color_for_id(char.id)
-            current_marker.color = { cr2, cg2, cb2 }
+        if row.kind == "divider" then
+          set_rgb(0x7A, 0x7A, 0x7A, 1)
+          gfx.x, gfx.y = px, cy + 6
+          gfx.drawstr(row.label)
+        elseif row.kind == "cast" then
+          local char = row.char
+          local is_active = current_marker.character_id == char.id
+          local row_hover = point_in(mx, my, px, cy, right_w - 20, row_h)
+          if is_active then
+            set_rgb(0x5C, 0x0E, 0x11, 1); gfx.rect(px, cy, right_w - 20, row_h)
+            set_rgb(0xE5, 0x21, 0x28, 1); gfx.rect(px, cy, 4, row_h)
+          elseif row_hover then
+            set_rgb(0x4D, 0x4D, 0x4D, 1); gfx.rect(px, cy, right_w - 20, row_h)
+          else
+            set_rgb(0x26, 0x26, 0x26, 1); gfx.rect(px, cy, right_w - 20, row_h)
           end
-          current_marker.overridden = false
-          -- Matches the reference script's own row-click behavior: save
-          -- ExtState immediately on selection, same as it always called
-          -- save_settings() right in the click handler. The generated
-          -- hotkey action reads ExtState fresh every time it fires (see
-          -- create_action_script) — it was ALREADY correct the moment this
-          -- script was first saved once, so switching characters needs no
-          -- extra button click before the hotkey uses the new one.
-          save_current_preset()
+          local cr, cg, cb = color_for_id(char.id)
+          set_rgb(cr, cg, cb, 1)
+          gfx.rect(px + (is_active and 8 or 12), cy + 5, 15, 15)
+          gfx.set(1, 1, 1, 1)
+          gfx.rect(px + (is_active and 8 or 12), cy + 5, 15, 15, 0)
+          set_rgb(0xFF, 0xFF, 0xFF, 1)
+          gfx.x, gfx.y = px + (is_active and 8 or 12) + 23, cy + 5
+          gfx.drawstr(char.name or "?")
+          set_rgb(0x99, 0x99, 0x99, 1)
+          local idshort = (char.id or ""):sub(1, 8)
+          local iw = gfx.measurestr(idshort)
+          gfx.x, gfx.y = px + right_w - 20 - iw - 4, cy + 5
+          gfx.drawstr(idshort)
+          if click and row_hover then
+            -- Restores THIS character's own last-typed name (falling back to
+            -- the "Дроп" default the first time it's ever picked) — never
+            -- leaves behind whatever the PREVIOUSLY selected character's
+            -- name was. Confirmed live 2026-09-10: WarpVIT -> type "ВП" ->
+            -- Dimonchik -> type "ДМ" -> WarpVIT again used to still show
+            -- "ДМ", since there was only one shared name field.
+            current_marker.character_id = char.id
+            current_marker.character_name = char.name
+            current_marker.preset_id = nil
+            current_marker.name = character_names[char.id] or "Дроп"
+            if not current_marker.overridden then
+              local cr2, cg2, cb2 = color_for_id(char.id)
+              current_marker.color = { cr2, cg2, cb2 }
+            end
+            current_marker.overridden = false
+            -- Matches the reference script's own row-click behavior: save
+            -- ExtState immediately on selection, same as it always called
+            -- save_settings() right in the click handler. The generated
+            -- hotkey action reads ExtState fresh every time it fires (see
+            -- create_action_script) — it was ALREADY correct the moment this
+            -- script was first saved once, so switching characters needs no
+            -- extra button click before the hotkey uses the new one.
+            save_current_preset()
+          end
+        elseif row.kind == "custom" then
+          local preset = row.preset
+          local is_active = current_marker.character_id == nil and current_marker.preset_id == preset.id
+          local row_hover = point_in(mx, my, px, cy, right_w - 20, row_h)
+          local del_w = 20
+          local del_hover = row_hover and point_in(mx, my, px + right_w - 20 - del_w, cy, del_w, row_h)
+          if is_active then
+            set_rgb(0x5C, 0x0E, 0x11, 1); gfx.rect(px, cy, right_w - 20, row_h)
+            set_rgb(0xE5, 0x21, 0x28, 1); gfx.rect(px, cy, 4, row_h)
+          elseif row_hover then
+            set_rgb(0x4D, 0x4D, 0x4D, 1); gfx.rect(px, cy, right_w - 20, row_h)
+          else
+            set_rgb(0x26, 0x26, 0x26, 1); gfx.rect(px, cy, right_w - 20, row_h)
+          end
+          local pr, pg, pb = 0x99, 0x99, 0x99
+          if preset.color then pr, pg, pb = table.unpack(preset.color) end
+          set_rgb(pr, pg, pb, 1)
+          gfx.rect(px + (is_active and 8 or 12), cy + 5, 15, 15)
+          gfx.set(1, 1, 1, 1)
+          gfx.rect(px + (is_active and 8 or 12), cy + 5, 15, 15, 0)
+          set_rgb(0xFF, 0xFF, 0xFF, 1)
+          gfx.x, gfx.y = px + (is_active and 8 or 12) + 23, cy + 5
+          gfx.drawstr(preset.name or "?")
+          if row_hover then
+            set_rgb(del_hover and 0xFF or 0x99, del_hover and 0x66 or 0x99, del_hover and 0x66 or 0x99, 1)
+            gfx.x, gfx.y = px + right_w - 20 - del_w + 5, cy + 5
+            gfx.drawstr("✕")
+          end
+          if click and del_hover then
+            for i, p in ipairs(custom_presets) do
+              if p.id == preset.id then table.remove(custom_presets, i); break end
+            end
+            save_custom_presets()
+          elseif click and row_hover then
+            -- A saved preset IS the marker — no separate per-preset name
+            -- memory needed (unlike cast rows, where the name is about
+            -- WHICH ACTOR read it, not the character itself).
+            current_marker.character_id = nil
+            current_marker.character_name = nil
+            current_marker.preset_id = preset.id
+            current_marker.name = preset.name
+            current_marker.color = preset.color and { table.unpack(preset.color) } or nil
+            current_marker.overridden = true
+            save_current_preset()
+          end
         end
       end
     end
 
+    local bottom_y = list_bottom + 4
+    local half_w = (right_w - 20 - 6) / 2
     local refresh_busy = pending ~= nil
-    local refresh_hover = (not refresh_busy) and point_in(mx, my, px, list_bottom + 4, right_w - 20, 22)
-    draw_button(px, list_bottom + 4, right_w - 20, 22, refresh_busy and "…" or "ОНОВИТИ СПИСОК", refresh_hover, false, refresh_busy)
+    local refresh_hover = (not refresh_busy) and point_in(mx, my, px, bottom_y, half_w, 22)
+    draw_button(px, bottom_y, half_w, 22, refresh_busy and "…" or "ОНОВИТИ СПИСОК", refresh_hover, false, refresh_busy)
     if click and refresh_hover then fetch_snapshot() end
+
+    local add_x = px + half_w + 6
+    local add_hover = point_in(mx, my, add_x, bottom_y, half_w, 22)
+    draw_button(add_x, bottom_y, half_w, 22, "+ СВОЯ МІТКА", add_hover, false)
+    if click and add_hover then
+      local retval, input = reaper.GetUserInputs("Нова мітка", 1, "Назва:,extrawidth=100", "")
+      if retval and input:gsub("%s+", "") ~= "" then
+        local ok, color = reaper.GR_SelectColor(0)
+        local pr, pg, pb = 0x99, 0x99, 0x99
+        if ok ~= 0 then pr, pg, pb = reaper.ColorFromNative(color) end
+        local preset = { id = reaper.genGuid(), name = input, color = { pr, pg, pb } }
+        custom_presets[#custom_presets + 1] = preset
+        save_custom_presets()
+        current_marker.character_id = nil
+        current_marker.character_name = nil
+        current_marker.preset_id = preset.id
+        current_marker.name = preset.name
+        current_marker.color = { pr, pg, pb }
+        current_marker.overridden = true
+        save_current_preset()
+      end
+    end
   end
 
   -- ---------------- Send-to-server — its own dedicated bar, never shares

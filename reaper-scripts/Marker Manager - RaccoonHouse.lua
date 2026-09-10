@@ -794,7 +794,7 @@ local function draw_titles_screen(mx, my, click)
   for _, title in ipairs(snapshot) do
     local row_hover = point_in(mx, my, 10, y, gfx.w - 20, 28)
     if row_hover then set_rgb(0x33, 0x33, 0x33, 1); gfx.rect(10, y, gfx.w - 20, 28) end
-    set_rgb(1, 1, 1, 1)
+    set_rgb(0xFF, 0xFF, 0xFF, 1)
     gfx.x, gfx.y = 18, y + 6
     gfx.drawstr((title.name_ua or "") .. ((title.name_original or "") ~= "" and ("  ·  " .. title.name_original) or ""))
     set_rgb(0x66, 0x66, 0x66, 1)
@@ -836,7 +836,7 @@ local function draw_episodes_screen(mx, my, click)
   for _, ep in ipairs(episodes) do
     local row_hover = point_in(mx, my, 10, y, gfx.w - 20, 28)
     if row_hover then set_rgb(0x33, 0x33, 0x33, 1); gfx.rect(10, y, gfx.w - 20, 28) end
-    set_rgb(1, 1, 1, 1)
+    set_rgb(0xFF, 0xFF, 0xFF, 1)
     gfx.x, gfx.y = 18, y + 6
     gfx.drawstr(string.format("Сезон %d, серія %d", ep.season or 1, ep.number or 0))
     if click and row_hover then
@@ -873,7 +873,7 @@ local function draw_manager_screen(mx, my, click)
       local active = narrow_tab == name
       set_rgb(active and 0x33 or 0x1a, active and 0x33 or 0x1a, active and 0x33 or 0x1a, 1)
       gfx.rect(tx, 0, tab_w, tab_h)
-      set_rgb(1, 1, 1, 1)
+      set_rgb(0xFF, 0xFF, 0xFF, 1)
       local label = name == "marker" and "МАРКЕР" or "КАСТ"
       local lw = gfx.measurestr(label)
       gfx.x, gfx.y = tx + (tab_w - lw) / 2, 3
@@ -906,7 +906,7 @@ local function draw_manager_screen(mx, my, click)
     local name_hover = point_in(mx, my, px, py, left_w - 20, 26)
     set_rgb(0x33, 0x33, 0x33, 1); gfx.rect(px, py, left_w - 20, 26)
     set_rgb(0x4D, 0x4D, 0x4D, 1); gfx.rect(px, py, left_w - 20, 26, 0)
-    set_rgb(1, 1, 1, 1)
+    set_rgb(0xFF, 0xFF, 0xFF, 1)
     gfx.x, gfx.y = px + 8, py + 5
     gfx.drawstr(current_marker.name ~= "" and current_marker.name or "—")
     if click and name_hover then
@@ -959,7 +959,7 @@ local function draw_manager_screen(mx, my, click)
     set_rgb(0x7A, 0x7A, 0x7A, 1)
     gfx.x, gfx.y = px + 10, py + 4
     gfx.drawstr("Буде створено на позиції курсора:")
-    set_rgb(1, 1, 1, 1)
+    set_rgb(0xFF, 0xFF, 0xFF, 1)
     gfx.x, gfx.y = px + 10, py + 20
     gfx.drawstr(compose_marker_name(current_marker.name ~= "" and current_marker.name or "Маркер", current_marker.character_id))
     py = py + 50
@@ -1039,7 +1039,7 @@ local function draw_manager_screen(mx, my, click)
         gfx.rect(px + (is_active and 8 or 12), cy + 5, 15, 15)
         gfx.set(1, 1, 1, 1)
         gfx.rect(px + (is_active and 8 or 12), cy + 5, 15, 15, 0)
-        set_rgb(1, 1, 1, 1)
+        set_rgb(0xFF, 0xFF, 0xFF, 1)
         gfx.x, gfx.y = px + (is_active and 8 or 12) + 23, cy + 5
         gfx.drawstr(char.name or "?")
         set_rgb(0x99, 0x99, 0x99, 1)

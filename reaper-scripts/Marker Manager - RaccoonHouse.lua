@@ -243,44 +243,99 @@ function json.decode(s)
 end
 
 -- ============================================================
--- Networking — curl via reaper.ExecProcess (synchronous)
+-- Networking — curl launched via reaper.ExecProcess in TRUE background
+-- mode. Confirmed live 2026-09-10: the earlier synchronous version (a
+-- plain blocking ExecProcess call) froze the ENTIRE REAPER application —
+-- not just this script's window — for the duration of every request, which
+-- felt like REAPER itself hanging. reaper.ExecProcess(cmd, -1) launches
+-- without waiting and returns immediately; completion is detected by
+-- polling (every UI frame, essentially free) for an output file that only
+-- ever appears once curl has fully finished — the whole curl+rename chain
+-- is joined with `&&`, so a failed/interrupted/offline curl run leaves no
+-- final file at all, and a poll-side timeout is what surfaces "no
+-- connection" instead of REAPER blocking on it.
 -- ============================================================
+-- CMD's own built-in `move` (unlike modern Win32 file APIs) is picky about
+-- forward slashes — confirmed live 2026-09-10 the whole curl+move chain
+-- silently failed ("system cannot find the path specified") whenever the
+-- path mixed TEMP's own backslashes with an appended "/". Always build
+-- paths with the native separator.
+local SEP = package.config:sub(1, 1)
 local function tmp_dir()
-  return os.getenv("TEMP") or os.getenv("TMP") or (reaper.GetResourcePath() .. "/Data")
+  return os.getenv("TEMP") or os.getenv("TMP") or (reaper.GetResourcePath() .. SEP .. "Data")
 end
 
--- method: "GET" or "POST". body_json: nil, or a Lua value to json.encode
--- and send as the request body. Returns ok(bool), http_status(int),
--- body(string|nil), err(string|nil).
-local function http_request(method, url, body_json, timeout_ms)
-  timeout_ms = timeout_ms or 8000
-  local cmd
+local _req_seq = 0
+local function _next_tmp(tag)
+  _req_seq = _req_seq + 1
+  return tmp_dir() .. SEP .. "rh_mm_" .. tag .. "_" .. tostring(_req_seq)
+end
+
+-- Launches a request without blocking. method: "GET"/"POST". body_json:
+-- nil, or a Lua value to json.encode as the request body. Returns a
+-- handle table to pass to http_poll().
+local function http_start(method, url, body_json, timeout_sec)
+  local body_final = _next_tmp("body") .. ".txt"
+  local body_partial = body_final .. ".part"
+  local status_final = _next_tmp("status") .. ".txt"
+  local status_partial = status_final .. ".part"
+  os.remove(body_final); os.remove(status_final)
+  os.remove(body_partial); os.remove(status_partial)
+
+  local data_arg = ""
   if body_json ~= nil then
-    local req_path = tmp_dir() .. "/rh_mm_req.json"
+    local req_path = _next_tmp("req") .. ".json"
     local f = io.open(req_path, "wb")
-    if not f then return false, 0, nil, "cant_write_temp" end
-    f:write(json.encode(body_json))
-    f:close()
-    cmd = string.format(
-      'curl -s -X %s -H "Content-Type: application/json; charset=utf-8" --data-binary @"%s" -w "\\nHTTPSTATUS:%%{http_code}" "%s"',
-      method, req_path, url
-    )
-  else
-    cmd = string.format('curl -s -w "\\nHTTPSTATUS:%%{http_code}" "%s"', url)
+    if f then
+      f:write(json.encode(body_json))
+      f:close()
+      data_arg = string.format(' -X %s -H "Content-Type: application/json; charset=utf-8" --data-binary @"%s"', method, req_path)
+    end
   end
 
-  local result = reaper.ExecProcess(cmd, timeout_ms)
-  if not result then return false, 0, nil, "exec_failed" end
+  -- Order matters: body is renamed into place BEFORE status — http_poll
+  -- only ever checks for status_final, so its mere existence guarantees
+  -- body_final is already fully written too. NO leading "cmd.exe /c" —
+  -- confirmed live 2026-09-10 that ExecProcess already runs the command
+  -- through its own shell layer (matches how curl examples elsewhere in
+  -- the ReaScript community run directly, no cmd.exe prefix); adding one
+  -- here double-wraps it and the whole chain silently fails ("system
+  -- cannot find the path specified").
+  local cmd = string.format(
+    'curl -s -o "%s" -w "%%{http_code}" %s "%s" > "%s" && move /y "%s" "%s" >nul && move /y "%s" "%s" >nul',
+    body_partial, data_arg, url, status_partial,
+    body_partial, body_final,
+    status_partial, status_final
+  )
+  reaper.ExecProcess(cmd, -1) -- fire-and-forget — does NOT block REAPER
 
-  -- result = "<curl's own exit code>\n<stdout, which is body..\nHTTPSTATUS:code>"
-  local first_nl = result:find("\n")
-  if not first_nl then return false, 0, nil, "bad_exec_result" end
-  local rest = result:sub(first_nl + 1)
-  local status_at = rest:find("HTTPSTATUS:%d+%s*$")
-  if not status_at then return false, 0, rest, "no_status_marker" end
-  local body = rest:sub(1, status_at - 1):gsub("\n$", "")
-  local code = tonumber(rest:sub(status_at):match("%d+")) or 0
-  return (code >= 200 and code < 300), code, body, nil
+  return {
+    body_final = body_final, status_final = status_final,
+    body_partial = body_partial, status_partial = status_partial,
+    started_at = reaper.time_precise(), timeout_sec = timeout_sec or 12,
+  }
+end
+
+-- Call every frame while a handle is outstanding. Returns "pending",
+-- "timeout", or "done" (+ ok, http_status, body).
+local function http_poll(handle)
+  local sf = io.open(handle.status_final, "r")
+  if sf then
+    local status_str = sf:read("*a")
+    sf:close()
+    local bf = io.open(handle.body_final, "rb")
+    local body = bf and bf:read("*a") or ""
+    if bf then bf:close() end
+    os.remove(handle.status_final)
+    os.remove(handle.body_final)
+    local code = tonumber((status_str or ""):match("%d+")) or 0
+    return "done", (code >= 200 and code < 300), code, body
+  end
+  if reaper.time_precise() - handle.started_at > handle.timeout_sec then
+    os.remove(handle.body_partial); os.remove(handle.status_partial)
+    return "timeout"
+  end
+  return "pending"
 end
 
 -- ============================================================
@@ -356,6 +411,11 @@ local conn_error_detail = nil
 local reconnect_attempt = 0
 local next_retry_at = 0
 
+-- At most one network request in flight at a time — { kind = "snapshot" |
+-- "send", handle = <http_start() handle>, count = <marker count, "send" only> }.
+-- Polled every frame in main(); nil when idle.
+local pending = nil
+
 local current_marker = { name = "", character_id = nil, character_name = nil, color = nil, overridden = false }
 local action_created = false
 local scroll_y = 0
@@ -383,22 +443,17 @@ local function apply_snapshot(body)
   return true
 end
 
-local function fetch_snapshot()
-  conn_state = "connecting"
-  -- /summary, NOT the plain /shared-titles route — that one nests every
-  -- episode's full subtitle_lines/markers/audio_submissions (confirmed
-  -- live 2026-09-10: 336KB for one real team vs 1.2KB here), which made
-  -- the initial connect visibly hang parsing it in pure Lua. This route
-  -- returns only title/episode/character names — everything this script
-  -- actually needs.
-  local ok, status, body, _err = http_request("GET", WORKER_BASE .. "/shared-titles/summary?team_id=" .. team_id, nil, 8000)
+-- Called after a "snapshot" pending request resolves (see poll_pending in
+-- the main loop) — never blocks itself, just interprets an already-
+-- finished result.
+local function finish_snapshot(ok, status, body)
   if ok and body then
     if apply_snapshot(body) then
       conn_state = "connected"
       conn_error_detail = nil
       reconnect_attempt = 0
       snapshot_is_cached = false
-      return true
+      return
     end
   end
   -- Failed — fall back to cache if we have one.
@@ -412,13 +467,25 @@ local function fetch_snapshot()
   end
   reconnect_attempt = reconnect_attempt + 1
   next_retry_at = reaper.time_precise() + RECONNECT_INTERVAL
-  return false
+end
+
+-- Launches the fetch WITHOUT blocking — result arrives later via
+-- poll_pending(). /summary, NOT the plain /shared-titles route — that one
+-- nests every episode's full subtitle_lines/markers/audio_submissions
+-- (confirmed live 2026-09-10: 336KB for one real team vs 1.2KB here).
+local function fetch_snapshot()
+  if pending then return end
+  conn_state = "connecting"
+  local handle = http_start("GET", WORKER_BASE .. "/shared-titles/summary?team_id=" .. team_id, nil, 10)
+  pending = { kind = "snapshot", handle = handle }
 end
 
 -- Called from the main loop, at most once every RECONNECT_INTERVAL, and
--- only while not already connected — keeps the "reconnecting…" status
--- strip honest without hammering the network every frame.
+-- only while not already connected/connecting/mid-request — keeps the
+-- "reconnecting…" status strip honest without hammering the network
+-- every frame.
 local function maybe_retry()
+  if pending then return end
   if conn_state == "connected" or conn_state == "connecting" then return end
   if reconnect_attempt >= RECONNECT_MAX_ATTEMPTS then return end
   if reaper.time_precise() < next_retry_at then return end
@@ -536,8 +603,22 @@ local function collect_markers_for_upload()
   return out
 end
 
+-- Called after a "send" pending request resolves (see poll_pending).
+local function finish_send(ok, status, count)
+  if ok then
+    send_status = "ok"
+    send_status_detail = string.format("Надіслано %d маркер(ів)", count)
+  else
+    send_status = "error"
+    send_status_detail = "Помилка відправки (код: " .. tostring(status) .. ")"
+  end
+  send_status_until = reaper.time_precise() + 5
+end
+
+-- Launches the upload WITHOUT blocking — result arrives later via
+-- poll_pending().
 local function send_to_server()
-  if not selected_episode then return end
+  if not selected_episode or pending then return end
   local markers = collect_markers_for_upload()
   if #markers == 0 then
     send_status = "error"
@@ -546,17 +627,22 @@ local function send_to_server()
     return
   end
   send_status = "sending"
-  local ok, status, _body, _err = http_request(
-    "POST", WORKER_BASE .. "/shared-episodes/" .. selected_episode.id .. "/markers/add", markers, 15000
-  )
-  if ok then
-    send_status = "ok"
-    send_status_detail = string.format("Надіслано %d маркер(ів)", #markers)
-  else
-    send_status = "error"
-    send_status_detail = "Помилка відправки (код: " .. tostring(status) .. ")"
+  local handle = http_start("POST", WORKER_BASE .. "/shared-episodes/" .. selected_episode.id .. "/markers/add", markers, 20)
+  pending = { kind = "send", handle = handle, count = #markers }
+end
+
+-- Polled every frame from main() — advances whatever request is currently
+-- in flight (if any) without ever blocking REAPER itself.
+local function poll_pending()
+  if not pending then return end
+  local state, ok, status, body = http_poll(pending.handle)
+  if state == "pending" then return end
+  if pending.kind == "snapshot" then
+    finish_snapshot(state == "done" and ok, status, body)
+  elseif pending.kind == "send" then
+    finish_send(state == "done" and ok, status, pending.count)
   end
-  send_status_until = reaper.time_precise() + 5
+  pending = nil
 end
 
 -- ============================================================
@@ -954,15 +1040,17 @@ local function draw_manager_screen(mx, my, click)
       end
     end
 
-    local refresh_hover = point_in(mx, my, px, list_bottom + 4, right_w - 20, 22)
-    draw_button(px, list_bottom + 4, right_w - 20, 22, "ОНОВИТИ СПИСОК", refresh_hover, false)
+    local refresh_busy = pending ~= nil
+    local refresh_hover = (not refresh_busy) and point_in(mx, my, px, list_bottom + 4, right_w - 20, 22)
+    draw_button(px, list_bottom + 4, right_w - 20, 22, refresh_busy and "…" or "ОНОВИТИ СПИСОК", refresh_hover, false, refresh_busy)
     if click and refresh_hover then fetch_snapshot() end
   end
 
   -- ---------------- Send-to-server (bottom-right of manager, above strip) ----------------
   local send_w = 180
-  local send_hover = point_in(mx, my, gfx.w - send_w - 10, content_h - 26, send_w, 22)
-  draw_button(gfx.w - send_w - 10, content_h - 26, send_w, 22, "ВІДПРАВИТИ НА СЕРВЕР", send_hover, send_hover)
+  local send_busy = pending ~= nil and pending.kind == "send"
+  local send_hover = (not send_busy) and point_in(mx, my, gfx.w - send_w - 10, content_h - 26, send_w, 22)
+  draw_button(gfx.w - send_w - 10, content_h - 26, send_w, 22, send_busy and "ВІДПРАВЛЯЄТЬСЯ…" or "ВІДПРАВИТИ НА СЕРВЕР", send_hover, send_hover, send_busy)
   if click and send_hover then send_to_server() end
 
   draw_status_strip(content_h, gfx.w)
@@ -997,6 +1085,8 @@ local function main()
     scroll_y = scroll_y - (gfx.mouse_wheel / 120) * 30
     gfx.mouse_wheel = 0
   end
+
+  poll_pending() -- advance any in-flight request; never blocks
 
   -- Only auto-retry while looking at a screen that actually needs live data.
   if screen == "titles" or screen == "manager" then

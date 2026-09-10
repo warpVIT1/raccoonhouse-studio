@@ -47,6 +47,39 @@ def _push_lines_if_shared(ep: Episode, db: Session) -> None:
         sync_service.push_subtitle_lines(ep.id, db)
 
 
+def _maybe_clear_orphaned_character(character_id: int, db: Session) -> None:
+    """Called right after a subtitle line's character_id changes away from
+    `character_id` — if nothing else in the whole title still points at
+    that Character row, and it's linked to a real team actor
+    (team_device_id), clear that link. Confirmed live 2026-09-10: the
+    subtitle grid's "— Без актора" (and picking a different actor) never
+    touched the Character row at all, only the line — so removing/
+    reassigning an actor there left them "cast" forever (still showing in
+    DirectorWorkspace's Ролі tab, and duplicating on the next pick since
+    the old team_device_id-linked row never went away for
+    routers/characters.py's find-or-create to match against). Only clears
+    the LINK (team_device_id), never deletes the Character row itself —
+    other things (Marker.character_id, ActorAudioSubmission, etc.) may
+    still reference it, and an unlinked-but-present row is exactly what a
+    brand new character looks like before any actor is ever assigned."""
+    char = db.get(Character, character_id)
+    if not char or not char.team_device_id:
+        return
+    still_used = (
+        db.query(SubtitleLine)
+        .join(Episode, SubtitleLine.episode_id == Episode.id)
+        .filter(Episode.title_id == char.title_id, SubtitleLine.character_id == character_id)
+        .first()
+    )
+    if still_used:
+        return
+    char.team_device_id = None
+    db.commit()
+    if char.shared_id:
+        from ..services.sync_service import push_character_team_actor
+        push_character_team_actor(character_id, db)
+
+
 @router.post("/episodes/{ep_id}/subtitle-lines", response_model=SubtitleLineOut, status_code=201)
 def create_subtitle_line(ep_id: int, body: SubtitleLineCreate, db: Session = Depends(get_db)):
     ep = db.get(Episode, ep_id)
@@ -68,7 +101,15 @@ def update_subtitle_line(line_id: int, body: SubtitleLineUpdate, db: Session = D
     line = db.get(SubtitleLine, line_id)
     if not line:
         raise HTTPException(404)
-    for k, v in body.model_dump(exclude_none=True).items():
+    old_character_id = line.character_id
+    # model_fields_set (which fields the request actually included), NOT
+    # exclude_none=True — confirmed live 2026-09-10 as a real bug:
+    # exclude_none drops a field whose value is None BEFORE it ever
+    # reaches setattr, so the subtitle grid's "— Без актора" sending
+    # {character_id: null} silently did nothing at all — indistinguishable
+    # from not sending character_id in the first place.
+    data = body.model_dump(include=body.model_fields_set)
+    for k, v in data.items():
         setattr(line, k, v)
     # Адмін tab's translator status ("не взявся" -> "взявся") — subtitle_stage
     # alone can't tell these apart, it stays "translating" for both (see
@@ -80,6 +121,8 @@ def update_subtitle_line(line_id: int, body: SubtitleLineUpdate, db: Session = D
         ep.translation_started_at = dt.datetime.utcnow()
     db.commit()
     db.refresh(line)
+    if "character_id" in data and old_character_id and old_character_id != line.character_id:
+        _maybe_clear_orphaned_character(old_character_id, db)
     _push_lines_if_shared(line.episode, db)
     if just_started and ep.title.shared_id:
         from ..services.sync_service import push_episode

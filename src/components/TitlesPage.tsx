@@ -567,13 +567,32 @@ function AddTitleModal({ onClose, onAdded }: AddTitleModalProps) {
 
   // Only shown at all if the active profile is in at least one team — same
   // "hide, don't just block" posture as every other team-gated UI piece.
-  // Auto-picks the team when there's exactly one; a picker only appears
-  // for someone in more than one.
   const [myTeams, setMyTeams] = useState<MyTeam[]>([])
-  const [shareTeamId, setShareTeamId] = useState<string | null>(null)
+  const [shareTeamId, setShareTeamIdState] = useState<string | null>(null)
+  // Remembers the last visibility choice (localStorage, per-browser-profile
+  // like everything else in this file) so repeatedly adding several titles
+  // in a row doesn't silently reset to "Особистий" every single time —
+  // confirmed live 2026-09-10 as a real point of confusion: nothing here
+  // ever defaulted to the last-picked team, only to whichever team happened
+  // to be first in `myTeams` once the toggle was clicked.
+  function pickShareTeam(id: string | null) {
+    setShareTeamIdState(id)
+    try { localStorage.setItem('rh-last-share-team-id', id ?? '') } catch { /* ignore */ }
+  }
   useEffect(() => {
     if (!backendReady) return
-    get<MyTeam[]>('/teams/mine').then(setMyTeams).catch(() => {})
+    get<MyTeam[]>('/teams/mine').then((teams) => {
+      setMyTeams(teams)
+      let remembered: string | null = null
+      try { remembered = localStorage.getItem('rh-last-share-team-id') || null } catch { /* ignore */ }
+      if (remembered && teams.some((t) => t.id === remembered)) {
+        setShareTeamIdState(remembered)
+      } else if (teams.length === 1) {
+        // Only one team to choose from at all — no reason to make the user
+        // click through a toggle+dropdown just to reach the one option.
+        setShareTeamIdState(teams[0].id)
+      }
+    }).catch(() => {})
   }, [backendReady, get])
 
   async function handleSave() {
@@ -656,13 +675,13 @@ function AddTitleModal({ onClose, onAdded }: AddTitleModalProps) {
               <label className="text-xs text-rh-muted mb-1 block">Видимість</label>
               <div className="flex gap-1">
                 <button
-                  onClick={() => setShareTeamId(null)}
+                  onClick={() => pickShareTeam(null)}
                   className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${shareTeamId === null ? 'bg-rh-accent text-white' : 'text-rh-muted hover:text-rh-text hover:bg-white/5'}`}
                 >
                   Особистий
                 </button>
                 <button
-                  onClick={() => setShareTeamId(myTeams[0].id)}
+                  onClick={() => pickShareTeam(myTeams[0].id)}
                   className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${shareTeamId !== null ? 'bg-rh-accent text-white' : 'text-rh-muted hover:text-rh-text hover:bg-white/5'}`}
                 >
                   Спільний з командою
@@ -672,7 +691,7 @@ function AddTitleModal({ onClose, onAdded }: AddTitleModalProps) {
                 <select
                   className="rh-input w-full mt-1.5 text-xs"
                   value={shareTeamId}
-                  onChange={(e) => setShareTeamId(e.target.value)}
+                  onChange={(e) => pickShareTeam(e.target.value)}
                 >
                   {myTeams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
                 </select>

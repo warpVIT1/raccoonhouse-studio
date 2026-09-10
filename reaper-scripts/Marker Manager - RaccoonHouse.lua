@@ -283,8 +283,9 @@ local function http_start(method, url, body_json, timeout_sec)
   os.remove(body_partial); os.remove(status_partial)
 
   local data_arg = ""
+  local req_path = nil
   if body_json ~= nil then
-    local req_path = _next_tmp("req") .. ".json"
+    req_path = _next_tmp("req") .. ".json"
     local f = io.open(req_path, "wb")
     if f then
       f:write(json.encode(body_json))
@@ -295,25 +296,45 @@ local function http_start(method, url, body_json, timeout_sec)
 
   -- Order matters: body is renamed into place BEFORE status — http_poll
   -- only ever checks for status_final, so its mere existence guarantees
-  -- body_final is already fully written too. NO leading "cmd.exe /c" —
-  -- confirmed live 2026-09-10 that ExecProcess already runs the command
-  -- through its own shell layer (matches how curl examples elsewhere in
-  -- the ReaScript community run directly, no cmd.exe prefix); adding one
-  -- here double-wraps it and the whole chain silently fails ("system
-  -- cannot find the path specified").
-  local cmd = string.format(
-    'curl -s -o "%s" -w "%%{http_code}" %s "%s" > "%s" && move /y "%s" "%s" >nul && move /y "%s" "%s" >nul',
-    body_partial, data_arg, url, status_partial,
-    body_partial, body_final,
-    status_partial, status_final
-  )
-  reaper.ExecProcess(cmd, -1) -- fire-and-forget — does NOT block REAPER
+  -- body_final is already fully written too.
+  --
+  -- Written as a tiny .bat file rather than one long inline ExecProcess
+  -- command line — confirmed live 2026-09-10 that reaper.ExecProcess does
+  -- NOT run its cmdline through a shell on its own (it launches curl.exe
+  -- directly), so ">"/"&&" in an inline string were passed to curl as
+  -- literal, meaningless arguments instead of being interpreted — visible
+  -- live as a real curl.exe console window and no output files ever
+  -- appearing. A .bat file sidesteps CMD's own notoriously fiddly
+  -- `/c "<command with its own quoted paths>"` quoting rules entirely —
+  -- every line inside the .bat is parsed on its own, plainly.
+  local bat_path = _next_tmp("run") .. ".bat"
+  local bf = io.open(bat_path, "w")
+  if bf then
+    bf:write(string.format(
+      '@echo off\r\ncurl -s -o "%s" -w "%%%%{http_code}" %s "%s" > "%s"\r\nif errorlevel 1 exit /b 1\r\nmove /y "%s" "%s" >nul\r\nmove /y "%s" "%s" >nul\r\n',
+      body_partial, data_arg, url, status_partial,
+      body_partial, body_final,
+      status_partial, status_final
+    ))
+    bf:close()
+  end
+  -- -2 = launch without waiting, minimized — confirmed does not block
+  -- REAPER, and (unlike -1) doesn't pop a visible console window in front
+  -- of it either. Still needs "cmd.exe /c" here: CreateProcess can't run a
+  -- .bat directly, it needs an actual interpreter executable.
+  reaper.ExecProcess('cmd.exe /c "' .. bat_path .. '"', -2)
 
   return {
     body_final = body_final, status_final = status_final,
     body_partial = body_partial, status_partial = status_partial,
+    bat_path = bat_path, req_path = req_path,
     started_at = reaper.time_precise(), timeout_sec = timeout_sec or 12,
   }
+end
+
+local function _cleanup_temp_files(handle)
+  os.remove(handle.bat_path)
+  if handle.req_path then os.remove(handle.req_path) end
 end
 
 -- Call every frame while a handle is outstanding. Returns "pending",
@@ -328,11 +349,13 @@ local function http_poll(handle)
     if bf then bf:close() end
     os.remove(handle.status_final)
     os.remove(handle.body_final)
+    _cleanup_temp_files(handle)
     local code = tonumber((status_str or ""):match("%d+")) or 0
     return "done", (code >= 200 and code < 300), code, body
   end
   if reaper.time_precise() - handle.started_at > handle.timeout_sec then
     os.remove(handle.body_partial); os.remove(handle.status_partial)
+    _cleanup_temp_files(handle)
     return "timeout"
   end
   return "pending"

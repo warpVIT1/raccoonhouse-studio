@@ -1497,6 +1497,36 @@ export default {
     // this avoids clock-skew bugs; only video bytes are ever large, and
     // those are fetched separately/lazily by video_transfer_id, not inline
     // here. See sync_service.py's pull_and_merge, the only caller.
+    // Trimmed companion to the full GET /shared-titles below (2026-09-10) —
+    // the standalone Marker Manager Reaper script only ever needs title/
+    // episode names and the cast list, but the full route also nests every
+    // episode's subtitle_lines/markers/audio_submissions/role_deadlines/
+    // role_assignments (N+1 queries per episode). Confirmed live: one real
+    // episode alone carried 163 markers — fetching+parsing all of that in
+    // pure Lua (no JSON lib, ReaScript's only network path is shelling out
+    // to curl) made the script visibly hang for a long time on connect.
+    // This route is the fix: same team_id param, same top-level shape
+    // (titles with nested episodes/characters) so the Lua script's parsing
+    // code doesn't need two shapes, just far less data per title.
+    if (url.pathname === "/shared-titles/summary" && request.method === "GET") {
+      const teamId = url.searchParams.get("team_id");
+      if (!teamId) {
+        return new Response("team_id is required", { status: 400 });
+      }
+      const { results: titles } = await env.MODELS_DB.prepare(
+        "SELECT id, name_ua, name_original, status FROM shared_titles WHERE team_id = ?",
+      ).bind(teamId).all();
+      const out = [];
+      for (const title of titles as Array<{ id: string }>) {
+        const [{ results: episodes }, { results: characters }] = await Promise.all([
+          env.MODELS_DB.prepare("SELECT id, season, number FROM shared_episodes WHERE shared_title_id = ?").bind(title.id).all(),
+          env.MODELS_DB.prepare("SELECT id, name, code FROM shared_characters WHERE shared_title_id = ?").bind(title.id).all(),
+        ]);
+        out.push({ ...title, episodes, characters });
+      }
+      return Response.json(out);
+    }
+
     if (url.pathname === "/shared-titles" && request.method === "GET") {
       const teamId = url.searchParams.get("team_id");
       if (!teamId) {

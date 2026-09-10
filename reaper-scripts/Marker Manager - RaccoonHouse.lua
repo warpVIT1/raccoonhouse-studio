@@ -346,7 +346,7 @@ end
 -- ============================================================
 local team_id = get_ext("TeamId", "")
 local screen = team_id == "" and "setup" or "titles" -- "setup" | "titles" | "episodes" | "manager"
-local snapshot = nil -- decoded array of titles (from GET /shared-titles)
+local snapshot = nil -- decoded array of titles (from GET /shared-titles/summary)
 local snapshot_is_cached = false
 local selected_title = nil -- table from snapshot
 local selected_episode = nil -- table from selected_title.episodes
@@ -385,7 +385,13 @@ end
 
 local function fetch_snapshot()
   conn_state = "connecting"
-  local ok, status, body, _err = http_request("GET", WORKER_BASE .. "/shared-titles?team_id=" .. team_id, nil, 8000)
+  -- /summary, NOT the plain /shared-titles route — that one nests every
+  -- episode's full subtitle_lines/markers/audio_submissions (confirmed
+  -- live 2026-09-10: 336KB for one real team vs 1.2KB here), which made
+  -- the initial connect visibly hang parsing it in pure Lua. This route
+  -- returns only title/episode/character names — everything this script
+  -- actually needs.
+  local ok, status, body, _err = http_request("GET", WORKER_BASE .. "/shared-titles/summary?team_id=" .. team_id, nil, 8000)
   if ok and body then
     if apply_snapshot(body) then
       conn_state = "connected"

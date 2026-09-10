@@ -1344,6 +1344,24 @@ export default {
       return Response.json(rows);
     }
 
+    // Lightweight read for one episode's markers (name/position/character
+    // only, no color/id/updated_at) — lets the Reaper script's "Відправити
+    // на сервер" diff against what's already there BEFORE posting, instead
+    // of blindly re-inserting the whole REAPER project's marker list every
+    // click (confirmed live 2026-09-10: every send duplicated every
+    // already-sent marker, since the additive route below has no
+    // dedup of its own — that's by design, it can't tell "already sent"
+    // from "same marker independently placed twice" on its own; the
+    // diffing has to happen client-side, which needs this read first).
+    const sharedEpisodeMarkersGetMatch = url.pathname.match(/^\/shared-episodes\/([A-Za-z0-9_-]+)\/markers$/);
+    if (sharedEpisodeMarkersGetMatch && request.method === "GET") {
+      const sharedEpisodeId = sharedEpisodeMarkersGetMatch[1];
+      const { results } = await env.MODELS_DB.prepare(
+        "SELECT reaper_name, position_seconds, character_id FROM shared_markers WHERE shared_episode_id = ?",
+      ).bind(sharedEpisodeId).all();
+      return Response.json(results);
+    }
+
     // Additive marker batch — one INSERT batch per call, NO delete first
     // (see the bulk-replace route right above, which the desktop app's own
     // push_markers relies on for its "local list is authoritative" push

@@ -737,8 +737,57 @@ local function finish_send(ok, status, count)
   send_status_until = reaper.time_precise() + 5
 end
 
--- Launches the upload WITHOUT blocking — result arrives later via
--- poll_pending().
+-- Identifies "the same marker" for diffing against what's already on the
+-- server — name + position (rounded to ms, floats otherwise almost never
+-- compare equal round-trip through JSON) + character. Two markers that
+-- genuinely differ in any of these are different markers on purpose (e.g.
+-- moved, renamed, recast); anything else is a re-send of the same one.
+local function marker_signature(m)
+  return string.format("%s|%.3f|%s", m.reaper_name or "", m.position_seconds or 0, m.character_id or "")
+end
+
+-- Called once the pre-send "what's already there" check resolves (see
+-- send_to_server/poll_pending). Only ever POSTs markers that AREN'T
+-- already on the server — confirmed live 2026-09-10 as a real bug: every
+-- click of "Відправити на сервер" re-uploaded the WHOLE current REAPER
+-- marker list via the additive route (which has no dedup of its own by
+-- design — see its own Worker-side comment), so clicking it twice
+-- duplicated everything already sent the first time. If nothing is new,
+-- this sends NO request at all rather than an empty-effect POST.
+-- Returns true when it started a follow-up "send" request (so poll_pending
+-- knows NOT to null out `pending` out from under it — see its own
+-- dispatch), false/nil otherwise.
+local function finish_send_check(ok, body, local_markers)
+  if not ok then
+    send_status = "error"
+    send_status_detail = "Не вдалося перевірити маркери на сервері — спробуйте ще раз"
+    send_status_until = reaper.time_precise() + 5
+    return false
+  end
+  local remote = (json.decode(body or "")) or {}
+  local existing = {}
+  for _, rm in ipairs(remote) do
+    existing[marker_signature(rm)] = true
+  end
+  local diff = {}
+  for _, m in ipairs(local_markers) do
+    if not existing[marker_signature(m)] then
+      diff[#diff + 1] = m
+    end
+  end
+  if #diff == 0 then
+    send_status = "ok"
+    send_status_detail = "Змін немає — усе вже надіслано"
+    send_status_until = reaper.time_precise() + 4
+    return false
+  end
+  local handle = http_start("POST", WORKER_BASE .. "/shared-episodes/" .. selected_episode.id .. "/markers/add", diff, 20)
+  pending = { kind = "send", handle = handle, count = #diff }
+  return true
+end
+
+-- Launches the pre-send check WITHOUT blocking — result arrives later via
+-- poll_pending(), which then decides whether an actual upload follows.
 local function send_to_server()
   if not selected_episode or pending then return end
   local markers = collect_markers_for_upload()
@@ -749,8 +798,8 @@ local function send_to_server()
     return
   end
   send_status = "sending"
-  local handle = http_start("POST", WORKER_BASE .. "/shared-episodes/" .. selected_episode.id .. "/markers/add", markers, 20)
-  pending = { kind = "send", handle = handle, count = #markers }
+  local handle = http_start("GET", WORKER_BASE .. "/shared-episodes/" .. selected_episode.id .. "/markers", nil, 15)
+  pending = { kind = "send_check", handle = handle, markers = markers }
 end
 
 -- Polled every frame from main() — advances whatever request is currently
@@ -764,6 +813,10 @@ local function poll_pending()
   elseif pending.kind == "snapshot_silent" then
     if state == "done" and ok and body then apply_snapshot(body) end
     -- no else — see silent_refresh's own comment, failures here are mute
+  elseif pending.kind == "send_check" then
+    -- May chain straight into a new "send" pending (see its own return
+    -- value comment) — don't null that back out if so.
+    if finish_send_check(state == "done" and ok, body, pending.markers) then return end
   elseif pending.kind == "send" then
     finish_send(state == "done" and ok, status, pending.count)
   end
@@ -1326,7 +1379,7 @@ local function draw_manager_screen(mx, my, click)
   gfx.set(0.04, 0.04, 0.04, 1); gfx.rect(0, content_h, gfx.w, send_bar_h)
   local send_w = math.min(220, gfx.w - 20)
   local send_y = content_h + 2
-  local send_busy = pending ~= nil and pending.kind == "send"
+  local send_busy = pending ~= nil and (pending.kind == "send" or pending.kind == "send_check")
   local send_hover = (not send_busy) and point_in(mx, my, gfx.w - send_w - 10, send_y, send_w, send_bar_h - 4)
   draw_button(gfx.w - send_w - 10, send_y, send_w, send_bar_h - 4, send_busy and "ВІДПРАВЛЯЄТЬСЯ…" or "ВІДПРАВИТИ НА СЕРВЕР", send_hover, send_hover, send_busy)
   if click and send_hover then send_to_server() end

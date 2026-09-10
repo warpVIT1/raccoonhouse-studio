@@ -18,6 +18,9 @@ interface Window {
     getAppVersion: () => Promise<string>
     openPath: (path: string) => Promise<void>
     saveFileToChosenFolder: (sourcePath: string) => Promise<string | null>
+    listScripts: () => Promise<Array<{ filename: string; title?: string; description?: string; version?: string }>>
+    installScriptToReaper: (filename: string) => Promise<{ ok: boolean; reason?: string; path?: string }>
+    saveScriptAs: (filename: string) => Promise<string | null>
     openExternal: (url: string) => Promise<void>
     platform: string
     openTelegramLogin: (code: string) => Promise<void>

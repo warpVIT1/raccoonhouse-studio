@@ -39,6 +39,17 @@ attempts while a screen is open) — never on every single UI frame.
 
 local WORKER_BASE = "https://raccoonhouse-signaling.raccoonhause.workers.dev"
 local EXT_NS = "RHMarkerManager"
+
+-- Bump this on every change shipped to this file, and the matching
+-- "version" field in reaper-scripts/manifest.json in the same commit —
+-- see check_for_script_update below. Independent of RaccoonHouse Studio's
+-- OWN version: this script is fetched straight from GitHub by the app's
+-- Settings → Скрипти tab (electron/main.ts's scripts:* handlers hit
+-- raw.githubusercontent.com directly), not bundled into an app release,
+-- so a script fix ships the moment it's pushed — nobody has to wait for
+-- or install a new RaccoonHouse Studio version to get it.
+local SCRIPT_VERSION = "1.0.0"
+local MANIFEST_URL = "https://raw.githubusercontent.com/warpVIT1/raccoonhouse-studio/master/reaper-scripts/manifest.json"
 local RECONNECT_INTERVAL = 5.0 -- seconds between auto-retry attempts while disconnected
 local RECONNECT_MAX_ATTEMPTS = 5
 -- Cast list otherwise only ever re-fetches on a manual "ОНОВИТИ СПИСОК"
@@ -447,6 +458,61 @@ local next_auto_refresh_at = 0
 -- "send", handle = <http_start() handle>, count = <marker count, "send" only> }.
 -- Polled every frame in main(); nil when idle.
 local pending = nil
+
+-- ============================================================
+-- Self-update check — fires once at startup, entirely separate from
+-- `pending` above (this has nothing to do with team_id/screen state, so it
+-- shouldn't have to wait its turn behind whatever the main flow is doing).
+-- ============================================================
+local update_check_handle = nil
+local update_check_done = false
+local update_available_version = nil -- nil until a genuinely NEWER version is found
+
+-- Numeric, dotted-version compare ("1.2.0" > "1.10.0" is handled correctly,
+-- unlike a plain string compare) — true only if `remote` is strictly newer
+-- than `current`. Missing/malformed segments count as 0, so "1.2" and
+-- "1.2.0" compare equal.
+local function version_is_newer(remote, current)
+  local function parts(v)
+    local t = {}
+    for n in tostring(v or ""):gmatch("%d+") do t[#t + 1] = tonumber(n) end
+    return t
+  end
+  local r, c = parts(remote), parts(current)
+  for i = 1, math.max(#r, #c) do
+    local rv, cv = r[i] or 0, c[i] or 0
+    if rv ~= cv then return rv > cv end
+  end
+  return false
+end
+
+local function start_update_check()
+  update_check_handle = http_start("GET", MANIFEST_URL, nil, 10)
+end
+
+-- Polled every frame from main(), independent of `pending` — checks the
+-- SAME manifest.json the app's own Settings → Скрипти tab reads (see
+-- electron/main.ts's scripts:list), so both surfaces always agree about
+-- what the current version actually is. A failure here (no internet, repo
+-- unreachable) just leaves update_available_version nil forever this
+-- session — never blocks or nags, tries again next time the script starts.
+local function poll_update_check()
+  if update_check_done or not update_check_handle then return end
+  local state, ok, _status, body = http_poll(update_check_handle)
+  if state == "pending" then return end
+  update_check_done = true
+  if not ok or not body then return end
+  local manifest = json.decode(body)
+  if not manifest then return end
+  local _is_new, script_path = reaper.get_action_context()
+  local own_filename = script_path and script_path:match("([^\\/]+)$") or nil
+  for _, entry in ipairs(manifest) do
+    if entry.filename == own_filename and entry.version and version_is_newer(entry.version, SCRIPT_VERSION) then
+      update_available_version = entry.version
+      break
+    end
+  end
+end
 
 -- name defaults to "Дроп" (matches the reference script's own default) —
 -- the sound engineer types their OWN marker labels ("клацання", "потрібен
@@ -881,6 +947,17 @@ local function draw_status_strip(y, w)
   set_rgb(0xB8, 0xB8, 0xB8, 1)
   gfx.x, gfx.y = 20, y + 5
   gfx.drawstr(text)
+  -- Update notice — appended right after the connection text rather than
+  -- fighting the RIGHT slot (already send-result/sub territory, see
+  -- below). Only ever appears once poll_update_check finds a genuinely
+  -- newer manifest.json version than SCRIPT_VERSION; see that function's
+  -- own comment for why this can't just self-update in place.
+  if update_available_version then
+    local tw = gfx.measurestr(text)
+    set_rgb(0xE0, 0xB0, 0x20, 1)
+    gfx.x, gfx.y = 20 + tw + 14, y + 5
+    gfx.drawstr("🔔 Є оновлення " .. update_available_version .. " — RaccoonHouse Studio → Налаштування → Скрипти")
+  end
   -- Send-result feedback takes over the RIGHT slot instead of drawing on
   -- top of the main connection text — confirmed live 2026-09-10 both were
   -- drawn at the exact same x,y and rendered as illegible overlapping
@@ -1394,6 +1471,7 @@ local function init()
   gfx.init("Менеджер Маркерів — RaccoonHouse", saved_w, saved_h, saved_dock)
   gfx.setfont(1, "Arial", 16)
   if screen == "titles" and not snapshot then fetch_snapshot() end
+  start_update_check()
 end
 
 local function main()
@@ -1418,6 +1496,7 @@ local function main()
   end
 
   poll_pending() -- advance any in-flight request; never blocks
+  poll_update_check() -- separate one-shot check, see its own comment
 
   -- Only auto-retry while looking at a screen that actually needs live data.
   if screen == "titles" or screen == "manager" then

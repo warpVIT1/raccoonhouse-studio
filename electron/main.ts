@@ -733,6 +733,97 @@ ipcMain.handle('fs:saveFileToChosenFolder', async (_event, sourcePath: string) =
   return destPath
 })
 
+// Settings → "Скрипти" tab (2026-09-10) — hand-maintained REAPER tools this
+// studio ships alongside the app (currently just the Marker Manager, see
+// reaper-scripts/Marker Manager - RaccoonHouse.lua's own header). Fetched
+// straight from the public GitHub repo's raw content at runtime, NOT
+// bundled into the app build — the whole point (explicit ask 2026-09-10)
+// is that fixing a script and pushing it ships that fix immediately,
+// without anyone needing to install a new RaccoonHouse Studio version
+// first. reaper-scripts/manifest.json is the single source of truth for
+// what's available (filename/title/description/version) — the script
+// itself also reads this exact same file to self-report an available
+// update (see its own check_for_script_update), so the two surfaces can
+// never disagree about the current version.
+const SCRIPTS_MANIFEST_URL = 'https://raw.githubusercontent.com/warpVIT1/raccoonhouse-studio/master/reaper-scripts/manifest.json'
+const SCRIPTS_RAW_BASE = 'https://raw.githubusercontent.com/warpVIT1/raccoonhouse-studio/master/reaper-scripts/'
+
+interface ScriptManifestEntry {
+  filename: string
+  title?: string
+  description?: string
+  version?: string
+}
+
+async function fetchScriptManifest(): Promise<ScriptManifestEntry[]> {
+  const resp = await fetch(SCRIPTS_MANIFEST_URL)
+  if (!resp.ok) throw new Error(`manifest fetch failed: ${resp.status}`)
+  const data = await resp.json()
+  return Array.isArray(data) ? data : []
+}
+
+// Re-validates the requested filename against a fresh manifest fetch
+// rather than trusting whatever the renderer sent back — cheap, and means
+// a stale/tampered filename can never reach an arbitrary raw.githubusercontent
+// path outside reaper-scripts/.
+async function fetchScriptContent(filename: string): Promise<Buffer | null> {
+  const manifest = await fetchScriptManifest()
+  if (!manifest.some((e) => e.filename === filename)) return null
+  const resp = await fetch(SCRIPTS_RAW_BASE + encodeURIComponent(filename))
+  if (!resp.ok) return null
+  return Buffer.from(await resp.arrayBuffer())
+}
+
+// Lets a fetch failure reject through to the renderer (ipcMain.handle
+// propagates a thrown error as a rejected promise) rather than silently
+// collapsing to an empty list — ScriptsPanel.tsx needs to tell "genuinely
+// zero scripts" apart from "couldn't reach GitHub" to show the right
+// message.
+ipcMain.handle('scripts:list', () => fetchScriptManifest())
+
+// One-click install straight into REAPER's own Scripts folder
+// (%APPDATA%\REAPER\Scripts on Windows — REAPER's resource path regardless
+// of where reaper.exe itself lives, so this works even for a
+// Program-Files install) — the sound engineer still has to add it as an
+// action inside REAPER (Actions → Load ReaScript) themselves, same as any
+// hand-distributed script; there's no REAPER-side API to automate that
+// last step from outside a running REAPER instance.
+ipcMain.handle('scripts:installToReaper', async (_event, filename: string) => {
+  let content: Buffer | null
+  try {
+    content = await fetchScriptContent(filename)
+  } catch {
+    return { ok: false, reason: 'network' }
+  }
+  if (!content) return { ok: false, reason: 'not-found' }
+  const reaperDir = path.join(app.getPath('appData'), 'REAPER')
+  if (!fs.existsSync(reaperDir)) return { ok: false, reason: 'no-reaper' }
+  const scriptsFolder = path.join(reaperDir, 'Scripts')
+  fs.mkdirSync(scriptsFolder, { recursive: true })
+  const dest = path.join(scriptsFolder, filename)
+  fs.writeFileSync(dest, content)
+  return { ok: true, path: dest }
+})
+
+// Plain "save this script somewhere I choose" — same pick-a-folder-then-
+// write shape as fs:saveFileToChosenFolder above, just fetching the
+// content fresh from GitHub instead of copying a local file.
+ipcMain.handle('scripts:saveAs', async (_event, filename: string) => {
+  if (!win) return null
+  let content: Buffer | null
+  try {
+    content = await fetchScriptContent(filename)
+  } catch {
+    return null
+  }
+  if (!content) return null
+  const result = await dialog.showOpenDialog(win, { properties: ['openDirectory'] })
+  if (result.canceled || !result.filePaths[0]) return null
+  const destPath = path.join(result.filePaths[0], filename)
+  fs.writeFileSync(destPath, content)
+  return destPath
+})
+
 ipcMain.handle('shell:openExternal', async (_event, url: string) => {
   if (!/^https:\/\/github\.com\//.test(url)) return // only ever used for the beta-release-page link above
   await shell.openExternal(url)

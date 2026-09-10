@@ -29,6 +29,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getBackgroundMode: () => ipcRenderer.invoke('get:backgroundMode'),
   setBackgroundMode: (enabled: boolean) => ipcRenderer.invoke('set:backgroundMode', enabled),
 
+  // Settings → "Скрипти" tab — see electron/main.ts's scriptsDir()/
+  // scripts:* handlers.
+  listScripts: () => ipcRenderer.invoke('scripts:list'),
+  installScriptToReaper: (filename: string) => ipcRenderer.invoke('scripts:installToReaper', filename),
+  saveScriptAs: (filename: string) => ipcRenderer.invoke('scripts:saveAs', filename),
+
   // Auto-update
   checkForUpdate: () => ipcRenderer.invoke('update:check'),
   downloadUpdate: () => ipcRenderer.invoke('update:download'),

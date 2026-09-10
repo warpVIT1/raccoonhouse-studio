@@ -3,6 +3,7 @@ import { useApi } from '../hooks/useApi'
 import { useAppStore } from '../stores/appStore'
 import { PowerSharePanel } from './PowerSharePanel'
 import { ReportsPanel } from './ReportsPanel'
+import { ScriptsPanel } from './ScriptsPanel'
 import { UpdatePanel } from './UpdatePanel'
 import { Toggle } from './ui/Toggle'
 import type { AppSettings, Profile } from '../types'
@@ -35,7 +36,7 @@ const EMPTY_SETTINGS: AppSettings = {
   backup_directory: null,
 }
 
-type SettingsTab = 'general' | 'performance' | 'collab' | 'updates' | 'admin'
+type SettingsTab = 'general' | 'performance' | 'collab' | 'scripts' | 'updates' | 'admin'
 
 export function SettingsPage() {
   const { get, put, post } = useApi()
@@ -254,6 +255,7 @@ export function SettingsPage() {
           <TabButton active={tab === 'general'} onClick={() => setTab('general')} label="Загальні" />
           <TabButton active={tab === 'performance'} onClick={() => setTab('performance')} label="Продуктивність" />
           <TabButton active={tab === 'collab'} onClick={() => setTab('collab')} label="Спільна робота" />
+          <TabButton active={tab === 'scripts'} onClick={() => setTab('scripts')} label="Скрипти" />
           <TabButton active={tab === 'updates'} onClick={() => setTab('updates')} label="Оновлення" />
           {isAdmin && <TabButton active={tab === 'admin'} onClick={() => setTab('admin')} label="Адмін" />}
         </nav>
@@ -554,6 +556,8 @@ export function SettingsPage() {
               noTopMargin
             />
           )}
+
+          {tab === 'scripts' && <ScriptsPanel noTopMargin />}
 
           {tab === 'updates' && <UpdatePanel isAdmin={isAdmin} noTopMargin />}
 

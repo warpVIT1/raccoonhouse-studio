@@ -477,6 +477,16 @@ interface TeamInvite {
   created_at: string;
   status: string; // pending | accepted | declined
 }
+interface TeamJoinRequest {
+  id: string;
+  team_id: string;
+  device_id: string;
+  display_name: string;
+  telegram_id: number | null;
+  telegram_username: string | null;
+  created_at: string;
+  status: string; // pending | accepted | declined
+}
 interface CreditGrant {
   device_id: string;
   enabled: number;
@@ -1962,6 +1972,55 @@ export default {
       return Response.json({ ok: true });
     }
 
+    if (url.pathname === "/teams/join-requests" && request.method === "GET") {
+      // Admin-facing list for TeamsPage.tsx's "Заявки на вступ" section —
+      // scoped to one team at a time (the backend proxy checks the caller
+      // is actually that team's admin before calling this, same gate
+      // invite_member uses).
+      const teamId = url.searchParams.get("team_id");
+      if (!teamId) return new Response("team_id required", { status: 400 });
+      const { results } = await env.MODELS_DB.prepare(
+        `SELECT id, team_id, device_id, display_name, telegram_username, created_at
+         FROM team_join_requests WHERE team_id = ? AND status = 'pending' ORDER BY created_at ASC`,
+      ).bind(teamId).all();
+      return Response.json(results);
+    }
+
+    if (url.pathname === "/teams/join-requests/respond" && request.method === "POST") {
+      const body = await request.json().catch(() => null) as { request_id?: string; accept?: boolean } | null;
+      if (!body || typeof body.request_id !== "string" || typeof body.accept !== "boolean") {
+        return new Response("request_id and accept are required", { status: 400 });
+      }
+      const reqRow = await env.MODELS_DB.prepare("SELECT * FROM team_join_requests WHERE id = ?").bind(body.request_id).first<TeamJoinRequest>();
+      if (!reqRow || reqRow.status !== "pending") {
+        return new Response("request not found or already resolved", { status: 404 });
+      }
+      await env.MODELS_DB.prepare("UPDATE team_join_requests SET status = ? WHERE id = ?")
+        .bind(body.accept ? "accepted" : "declined", body.request_id).run();
+      let teamName = reqRow.team_id;
+      if (body.accept) {
+        await env.MODELS_DB.prepare(
+          `INSERT INTO team_members (team_id, device_id, display_name, is_team_admin, joined_at) VALUES (?, ?, ?, 0, ?)
+           ON CONFLICT(team_id, device_id) DO NOTHING`,
+        ).bind(reqRow.team_id, reqRow.device_id, reqRow.display_name.slice(0, 100), new Date().toISOString()).run();
+        const team = await env.MODELS_DB.prepare("SELECT name FROM teams WHERE id = ?").bind(reqRow.team_id).first<{ name: string }>();
+        if (team) teamName = team.name;
+      }
+      if (reqRow.telegram_id) {
+        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: reqRow.telegram_id,
+            text: body.accept
+              ? `✅ Вашу заявку до команди «${teamName}» прийнято!`
+              : `❌ Вашу заявку до команди «${teamName}» відхилено.`,
+          }),
+        }).catch(() => {});
+      }
+      return Response.json({ ok: true });
+    }
+
     const teamCreditsMatch = url.pathname.match(/^\/teams\/([A-Za-z0-9]+)\/credits$/);
     if (teamCreditsMatch && request.method === "PUT") {
       // Lets the app admin flip a team's credits_enabled after creation, not
@@ -1986,6 +2045,7 @@ export default {
       await env.MODELS_DB.batch([
         env.MODELS_DB.prepare("DELETE FROM team_members WHERE team_id = ?").bind(teamId),
         env.MODELS_DB.prepare("DELETE FROM team_invites WHERE team_id = ?").bind(teamId),
+        env.MODELS_DB.prepare("DELETE FROM team_join_requests WHERE team_id = ?").bind(teamId),
         env.MODELS_DB.prepare("DELETE FROM teams WHERE id = ?").bind(teamId),
       ]);
       return new Response(null, { status: 204 });
@@ -2255,6 +2315,7 @@ export default {
         env.MODELS_DB.prepare("DELETE FROM team_members WHERE device_id = ?").bind(deviceId),
         env.MODELS_DB.prepare("DELETE FROM credit_grants WHERE device_id = ?").bind(deviceId),
         env.MODELS_DB.prepare("DELETE FROM team_invites WHERE invited_device_id = ? OR created_by_device_id = ?").bind(deviceId, deviceId),
+        env.MODELS_DB.prepare("DELETE FROM team_join_requests WHERE device_id = ?").bind(deviceId),
       ]);
       return new Response(null, { status: 204 });
     }
@@ -2445,6 +2506,84 @@ export default {
           }),
         }).catch(() => {}); // best-effort — a failed confirmation message shouldn't fail the login itself
       }
+
+      // `join <team_id>` — lets a person who has already logged into the app
+      // via Telegram once (so their telegram_id is on file in known_devices,
+      // see the /start block above) request to join a team without an admin
+      // having to type their device_id by hand. Creates a pending
+      // team_join_requests row; team admins accept/decline it from
+      // TeamsPage.tsx's "Заявки на вступ" section. Does NOT touch
+      // team_invites or /teams/join (name+password) at all — additional
+      // path, not a replacement.
+      const joinMatch = message?.text?.match(/^join\s+(\S+)/i);
+      if (joinMatch && message?.from) {
+        const teamId = joinMatch[1].trim();
+        const from = message.from;
+        const reply = (text: string) =>
+          fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: from.id, text }),
+          }).catch(() => {});
+
+        const device = await env.MODELS_DB.prepare(
+          "SELECT device_id, display_name FROM known_devices WHERE telegram_id = ? ORDER BY last_seen_at DESC LIMIT 1",
+        ).bind(from.id).first<{ device_id: string; display_name: string }>();
+        if (!device) {
+          await reply("Спочатку увійдіть у RaccoonHouse Studio через Telegram (кнопка входу в застосунку), а потім повторіть команду join.");
+          return new Response("OK");
+        }
+
+        const team = await env.MODELS_DB.prepare("SELECT id, name FROM teams WHERE id = ?").bind(teamId).first<{ id: string; name: string }>();
+        if (!team) {
+          await reply("Команду з таким ID не знайдено. Перевірте ID — адмін команди може скопіювати його у вкладці «Команди».");
+          return new Response("OK");
+        }
+
+        const alreadyMember = await env.MODELS_DB.prepare(
+          "SELECT 1 FROM team_members WHERE team_id = ? AND device_id = ?",
+        ).bind(team.id, device.device_id).first();
+        if (alreadyMember) {
+          await reply(`Ви вже у складі команди «${team.name}».`);
+          return new Response("OK");
+        }
+
+        const alreadyPending = await env.MODELS_DB.prepare(
+          "SELECT 1 FROM team_join_requests WHERE team_id = ? AND device_id = ? AND status = 'pending'",
+        ).bind(team.id, device.device_id).first();
+        if (alreadyPending) {
+          await reply(`Заявку на вступ до команди «${team.name}» вже надіслано, очікуйте підтвердження адміна.`);
+          return new Response("OK");
+        }
+
+        await env.MODELS_DB.prepare(
+          `INSERT INTO team_join_requests (id, team_id, device_id, display_name, telegram_id, telegram_username, created_at, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+        ).bind(
+          crypto.randomUUID(), team.id, device.device_id, device.display_name,
+          from.id, from.username || null, new Date().toISOString(),
+        ).run();
+
+        await reply(`Заявку на вступ до команди «${team.name}» надіслано. Очікуйте підтвердження адміна.`);
+
+        const { results: admins } = await env.MODELS_DB.prepare(
+          `SELECT kd.telegram_id AS telegram_id FROM team_members tm
+           JOIN known_devices kd ON kd.device_id = tm.device_id
+           WHERE tm.team_id = ? AND tm.is_team_admin = 1 AND kd.telegram_id IS NOT NULL`,
+        ).bind(team.id).all<{ telegram_id: number }>();
+        for (const admin of admins) {
+          await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: admin.telegram_id,
+              text: `Нова заявка на вступ до команди «${team.name}» від ${device.display_name}. Прийняти чи відхилити можна у вкладці «Команди» → «Заявки на вступ».`,
+            }),
+          }).catch(() => {});
+        }
+        return new Response("OK");
+      }
+
       return new Response("OK"); // Telegram just needs any 200 — the content is ignored
     }
 

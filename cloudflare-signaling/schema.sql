@@ -95,6 +95,27 @@ CREATE TABLE IF NOT EXISTS team_invites (
   status TEXT NOT NULL DEFAULT 'pending'
 );
 
+-- The reverse direction of team_invites: a person types `join <team_id>` to
+-- the Telegram bot (see /telegram-bot/webhook) instead of an admin inviting
+-- them by device_id. `device_id` is resolved from the sender's telegram_id
+-- via known_devices (they must have logged into the app + linked Telegram
+-- at least once already, via the existing /start <code> flow, for this
+-- lookup to succeed). Surfaced to team admins in TeamsPage.tsx as "Заявки
+-- на вступ"; accepting inserts into team_members exactly like
+-- team_invites/respond does. The name-based join flow (/teams/join) is
+-- untouched by this — this is an additional path, not a replacement.
+CREATE TABLE IF NOT EXISTS team_join_requests (
+  id TEXT PRIMARY KEY,
+  team_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  telegram_id INTEGER,
+  telegram_username TEXT,
+  created_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE INDEX IF NOT EXISTS idx_team_join_requests_team ON team_join_requests(team_id);
+
 -- Per-person credit-access override, independent of team membership — a
 -- credits_enabled=1 team only makes credit usage POSSIBLE for its members,
 -- the app admin still has to individually flip this per device_id for it to

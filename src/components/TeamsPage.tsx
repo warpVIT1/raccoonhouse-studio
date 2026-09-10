@@ -4,7 +4,7 @@ import { useAppStore } from '../stores/appStore'
 import { Toggle } from './ui/Toggle'
 import { Spinner } from './ui/Spinner'
 import { RolePicker } from './ui/RolePicker'
-import type { AppSettings, ErrorReport, FeedbackItem, KnownUser, MyTeam, Profile, SeparationReport, Team, TeamInvite, TeamMember } from '../types'
+import type { AppSettings, ErrorReport, FeedbackItem, KnownUser, MyTeam, Profile, SeparationReport, Team, TeamInvite, TeamJoinRequest, TeamMember } from '../types'
 
 export function TeamsPage() {
   const { get } = useApi()
@@ -61,6 +61,11 @@ function TeamsTab() {
   const [previewTeam, setPreviewTeam] = useState<Team | null>(null)
   const [invites, setInvites] = useState<TeamInvite[]>([])
   const [membersByTeam, setMembersByTeam] = useState<Record<string, TeamMember[]>>({})
+  // Pending `join <team_id>` bot requests (see cloudflare-signaling's
+  // /telegram-bot/webhook `join` branch) — only fetched for teams the
+  // current user actually admins, same scoping as the invite-by-id form
+  // in renderMemberManagement below.
+  const [joinRequestsByTeam, setJoinRequestsByTeam] = useState<Record<string, TeamJoinRequest[]>>({})
   const [loading, setLoading] = useState(true)
   // One-time bridge for the standalone sound-engineer Reaper script
   // (reaper-scripts/Marker Manager - RaccoonHouse.lua, 2026-09-10) — the
@@ -143,6 +148,17 @@ function TeamsTab() {
         members[t.id] = await get<TeamMember[]>(`/teams/${t.id}/members`)
       }))
       setMembersByTeam(members)
+
+      const adminTeams = mine.filter((t) => t.is_team_admin || admin?.is_app_admin)
+      const requests: Record<string, TeamJoinRequest[]> = {}
+      await Promise.all(adminTeams.map(async (t) => {
+        try {
+          requests[t.id] = await get<TeamJoinRequest[]>(`/teams/join-requests?team_id=${t.id}`)
+        } catch {
+          requests[t.id] = []
+        }
+      }))
+      setJoinRequestsByTeam(requests)
     } catch {
       // ignore — retried on next poll
     } finally {
@@ -164,6 +180,15 @@ function TeamsTab() {
   async function respondInvite(inviteId: string, accept: boolean) {
     try {
       await post('/teams/invites/respond', { invite_id: inviteId, accept, display_name: activeProfile?.name || '?' })
+      await load()
+    } catch {
+      // ignore
+    }
+  }
+
+  async function respondJoinRequest(teamId: string, requestId: string, accept: boolean) {
+    try {
+      await post('/teams/join-requests/respond', { request_id: requestId, accept, team_id: teamId })
       await load()
     } catch {
       // ignore
@@ -203,6 +228,17 @@ function TeamsTab() {
       try {
         const members = await get<TeamMember[]>(`/teams/${teamId}/members`)
         setMembersByTeam((s) => ({ ...s, [teamId]: members }))
+      } catch {
+        // ignore
+      }
+    }
+    // App-admin "Усі команди" view — same join-requests fetch as `load()`
+    // does for "Мої команди", just lazy since it covers every team, not
+    // only ones the app admin personally belongs to.
+    if (!joinRequestsByTeam[teamId]) {
+      try {
+        const requests = await get<TeamJoinRequest[]>(`/teams/join-requests?team_id=${teamId}`)
+        setJoinRequestsByTeam((s) => ({ ...s, [teamId]: requests }))
       } catch {
         // ignore
       }
@@ -340,6 +376,22 @@ function TeamsTab() {
             </div>
           ))}
         </div>
+        {canManage && (joinRequestsByTeam[teamId] || []).length > 0 && (
+          <div className="flex flex-col gap-1.5 mt-2 pt-2 border-t border-rh-border/50">
+            <div className="text-[10.5px] font-bold text-rh-text-dim">
+              Заявки на вступ ({(joinRequestsByTeam[teamId] || []).length})
+            </div>
+            {(joinRequestsByTeam[teamId] || []).map((r) => (
+              <div key={r.id} className="flex items-center gap-2 text-[11px]">
+                <span className="flex-1 truncate">
+                  {r.display_name}{r.telegram_username ? ` (@${r.telegram_username})` : ''}
+                </span>
+                <button onClick={() => respondJoinRequest(teamId, r.id, false)} className="rh-btn-ghost text-[10.5px] px-2 py-1">Відхилити</button>
+                <button onClick={() => respondJoinRequest(teamId, r.id, true)} className="rh-btn-primary text-[10.5px] px-2 py-1">Прийняти</button>
+              </div>
+            ))}
+          </div>
+        )}
         {canManage && (
           <div className="flex flex-col gap-1 mt-1">
             <div className="flex gap-1.5">
@@ -474,7 +526,9 @@ function TeamsTab() {
               <div className="px-4 py-3 border-b border-rh-border/70 text-[12.5px] font-bold">Вступити в команду</div>
               <div className="px-4 py-3 flex flex-col gap-2">
                 <p className="text-[10.5px] text-rh-text-dim -mt-1">
-                  Введіть точну назву команди, яку вам повідомив адмін
+                  Введіть точну назву команди, яку вам повідомив адмін.
+                  Або напишіть Telegram-боту <span className="font-mono">join &lt;ID команди&gt;</span> — адмін
+                  прийме заявку в цьому розділі.
                 </p>
                 <input
                   value={joinTeamName}

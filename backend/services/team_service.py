@@ -299,6 +299,27 @@ def respond_to_invite(invite_id: str, accept: bool, display_name: str) -> None:
     resp.raise_for_status()
 
 
+def list_join_requests(team_id: str, profile_name: str) -> list[dict]:
+    """Pending `join <team_id>` bot requests for one team — admin-only,
+    same gate as invite_member. See migrate_team_join_requests.sql /
+    the Worker's /telegram-bot/webhook `join` branch for how a row here
+    gets created in the first place."""
+    if not _is_team_admin_of(team_id, profile_name):
+        raise PermissionError("Лише адмін команди може бачити заявки")
+    resp = requests.get(f"{_base()}/teams/join-requests", params={"team_id": team_id}, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def respond_to_join_request(request_id: str, accept: bool, team_id: str, profile_name: str) -> None:
+    if not _is_team_admin_of(team_id, profile_name):
+        raise PermissionError("Лише адмін команди може приймати заявки")
+    resp = requests.post(f"{_base()}/teams/join-requests/respond", json={
+        "request_id": request_id, "accept": accept,
+    }, timeout=15)
+    resp.raise_for_status()
+
+
 def remove_member(team_id: str, device_id: str, profile_name: str) -> None:
     # Removing yourself (leaving the team) is always allowed, regardless of
     # admin status — only removing SOMEONE ELSE needs team-admin/app-admin.

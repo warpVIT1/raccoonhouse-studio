@@ -180,6 +180,15 @@ export interface TeamInvite {
   created_at: string
 }
 
+export interface TeamJoinRequest {
+  id: string
+  team_id: string
+  device_id: string
+  display_name: string
+  telegram_username: string | null
+  created_at: string
+}
+
 export interface KnownUser {
   device_id: string
   display_name: string

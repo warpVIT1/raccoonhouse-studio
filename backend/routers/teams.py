@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..models import AppSettings, Profile
-from ..schemas import TeamCreateIn, TeamInviteIn, TeamInviteRespondIn, TeamJoinIn
+from ..schemas import TeamCreateIn, TeamInviteIn, TeamInviteRespondIn, TeamJoinIn, TeamJoinRequestRespondIn
 from ..services import device_identity_service, team_service
 
 router = APIRouter(prefix="/teams", tags=["teams"])
@@ -225,6 +225,29 @@ def respond_to_invite(body: TeamInviteRespondIn, db: Session = Depends(get_db)):
     if body.accept:
         # Same immediate catch-up as /join above — this is the other entry
         # point into a team (invite-accept vs type-name-and-password).
+        from ..services import sync_service
+        sync_service.pull_and_merge_all_teams(db)
+    return {"ok": True}
+
+
+@router.get("/join-requests")
+def join_requests(team_id: str, db: Session = Depends(get_db)):
+    """Admin-facing — pending `join <team_id>` bot requests for one team.
+    Fed by TeamsPage.tsx's "Заявки на вступ" section, rendered per-team
+    only for that team's admin (or the app admin), same gate as /invite."""
+    try:
+        return team_service.list_join_requests(team_id, _active_profile_name(db))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+
+
+@router.post("/join-requests/respond")
+def respond_to_join_request(body: TeamJoinRequestRespondIn, db: Session = Depends(get_db)):
+    try:
+        team_service.respond_to_join_request(body.request_id, body.accept, body.team_id, _active_profile_name(db))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    if body.accept:
         from ..services import sync_service
         sync_service.pull_and_merge_all_teams(db)
     return {"ok": True}

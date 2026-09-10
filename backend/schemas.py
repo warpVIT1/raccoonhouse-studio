@@ -541,6 +541,12 @@ class TeamInviteRespondIn(BaseModel):
     display_name: str
 
 
+class TeamJoinRequestRespondIn(BaseModel):
+    request_id: str
+    accept: bool
+    team_id: str
+
+
 class PowerShareRespondIn(BaseModel):
     """Posted by the local user (on the peer machine) clicking Так/Ні."""
     request_id: str

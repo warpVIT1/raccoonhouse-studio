@@ -17,7 +17,7 @@ interface Window {
     getBackendPort: () => Promise<number>
     getAppVersion: () => Promise<string>
     openPath: (path: string) => Promise<void>
-    saveFileToChosenFolder: (sourcePath: string) => Promise<string | null>
+    saveFileToChosenFolder: (sourcePaths: string | string[]) => Promise<string | null>
     listScripts: () => Promise<Array<{ filename: string; title?: string; description?: string; version?: string }>>
     installScriptToReaper: (filename: string) => Promise<{ ok: boolean; reason?: string; path?: string }>
     saveScriptAs: (filename: string) => Promise<string | null>
@@ -31,6 +31,7 @@ interface Window {
     getBackgroundMode: () => Promise<boolean>
     setBackgroundMode: (enabled: boolean) => Promise<void>
     checkForUpdate: () => Promise<void>
+    getUpdateState: () => Promise<Record<string, unknown> | null>
     downloadUpdate: () => Promise<void>
     installUpdate: () => Promise<void>
     onUpdateStatus: (callback: (status: Record<string, unknown>) => void) => () => void

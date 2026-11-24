@@ -32,6 +32,7 @@ class TitleOut(TitleBase):
     episode_count: int = 0
     shared_id: Optional[str] = None
     team_id: Optional[str] = None
+    hikka_slug: Optional[str] = None
     # Resolved server-side (team_service.get_team) rather than left for the
     # frontend to look up — someone can be in several teams, so just
     # showing "спільний" next to a title's episode count isn't enough to
@@ -111,6 +112,11 @@ class SendToActorRequest(BaseModel):
 
 class CharacterOut(CharacterBase):
     id: int
+    image_url: Optional[str] = None
+    source_name: Optional[str] = None
+    # Lines tagged with this character (per episode when the list call got an
+    # episode_id, otherwise across the whole title). Never stored.
+    line_count: int = 0
     dubber_id: Optional[int] = None
     dubber_name: Optional[str] = None
 
@@ -135,6 +141,20 @@ class DubberOut(DubberBase):
     profile_id: Optional[int] = None
 
     model_config = {"from_attributes": True}
+
+
+class SkippedRoleName(BaseModel):
+    name: str
+    count: int
+
+
+class RolesFromSubtitlesOut(BaseModel):
+    created: int = 0
+    existing: int = 0
+    assigned_lines: int = 0
+    # Names from the ASS "Name" column that are not real roles (signs, titles,
+    # overlaps like "A / B"): their lines stay unassigned.
+    skipped: List[SkippedRoleName] = []
 
 
 class CharacterDubberMapCreate(BaseModel):
@@ -565,6 +585,40 @@ class HikkaAnimeResult(BaseModel):
 
 class PosterFromUrlRequest(BaseModel):
     image_url: str
+    hikka_slug: Optional[str] = None
+
+
+class HikkaSlugRequest(BaseModel):
+    slug: str
+
+
+class CharacterRenameRequest(BaseModel):
+    name: str
+
+
+class CharacterImageUpload(BaseModel):
+    data_url: str
+
+
+class CharacterImageRequest(BaseModel):
+    image_url: Optional[str] = None
+
+
+class CharacterImageCandidate(BaseModel):
+    slug: Optional[str] = None
+    name_ua: Optional[str] = None
+    name_en: Optional[str] = None
+    name_ja: Optional[str] = None
+    image: str
+    main: bool = False
+    source: str = "hikka"
+    score: float
+
+
+class CharacterImageSuggestion(BaseModel):
+    character_id: int
+    auto_applied: bool = False
+    candidates: List[CharacterImageCandidate] = []
 
 
 class ApexModelCreate(BaseModel):

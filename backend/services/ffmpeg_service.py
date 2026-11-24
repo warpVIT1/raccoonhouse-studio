@@ -128,14 +128,35 @@ def run_import_ffmpeg_only(
     # so subtitles/markers/actors are editable as soon as THIS finishes,
     # without also waiting on a 480p transcode that isn't needed for editing.
     audio_out = str(Path(out_dir) / "audio_full.flac")
-    if not os.path.isfile(audio_out):
+    # Written to a temp file and only renamed into place on success, so a
+    # cancelled/failed ffmpeg run can never leave a truncated audio_full.flac
+    # that later imports would treat as valid. The .src marker records which
+    # source file the FLAC came from, so re-importing a different video into
+    # the same episode re-extracts instead of silently reusing old audio.
+    audio_tmp = audio_out + ".tmp"
+    marker_path = audio_out + ".src"
+    try:
+        _st = os.stat(file_path)
+        source_sig = f"{os.path.abspath(file_path)}|{_st.st_size}|{_st.st_mtime_ns}"
+    except OSError:
+        source_sig = ""
+    existing_sig = None
+    if os.path.isfile(marker_path):
+        try:
+            existing_sig = Path(marker_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            existing_sig = None
+    # No marker = FLAC from before this check existed: keep reusing it.
+    reuse_audio = os.path.isfile(audio_out) and (existing_sig is None or existing_sig == source_sig)
+    if not reuse_audio:
         cmd_audio = [
             _ffmpeg_bin(), "-y",
             "-i", file_path,
             "-vn",           # no video
             "-c:a", "flac",  # lossless
             "-compression_level", "0",  # fastest
-            audio_out,
+            "-f", "flac",
+            audio_tmp,
         ]
         app_logger.info("run_import_ffmpeg_only: running ffmpeg: %s", " ".join(cmd_audio))
         proc = subprocess.Popen(
@@ -143,6 +164,7 @@ def run_import_ffmpeg_only(
             encoding="utf-8", errors="replace",
         )
         watcher = _spawn_cancel_watcher(proc, is_cancelled)
+        extracted_ok = False
         try:
             stderr_tail: list[str] = []
             for line in proc.stderr:
@@ -160,17 +182,28 @@ def run_import_ffmpeg_only(
                     except Exception:
                         pass
             proc.wait()
+            if is_cancelled and is_cancelled():
+                raise RuntimeError("Скасовано")
+            if proc.returncode != 0:
+                app_logger.error(
+                    "run_import_ffmpeg_only: ffmpeg exited with code %s, last output:\n%s",
+                    proc.returncode, "".join(stderr_tail),
+                )
+                raise RuntimeError("ffmpeg audio extraction failed")
+            os.replace(audio_tmp, audio_out)
+            try:
+                Path(marker_path).write_text(source_sig, encoding="utf-8")
+            except OSError:
+                app_logger.warning("run_import_ffmpeg_only: could not write %s", marker_path)
+            extracted_ok = True
         finally:
             if watcher:
                 watcher.set()
-        if is_cancelled and is_cancelled():
-            raise RuntimeError("Скасовано")
-        if proc.returncode != 0:
-            app_logger.error(
-                "run_import_ffmpeg_only: ffmpeg exited with code %s, last output:\n%s",
-                proc.returncode, "".join(stderr_tail),
-            )
-            raise RuntimeError("ffmpeg audio extraction failed")
+            if not extracted_ok:
+                try:
+                    os.remove(audio_tmp)
+                except OSError:
+                    pass
 
     progress(100, "ffmpeg: аудіо готове")
     return {
@@ -242,6 +275,32 @@ def run_import_pipeline(
         db.close()
 
 
+def _copy_file_with_progress(src: str, dest: str, on_progress, is_cancelled) -> None:
+    """Chunked copy so a multi-GB video reports progress and can be cancelled
+    (shutil.copy2 does neither). A half-written copy is deleted on cancel."""
+    total = os.path.getsize(src) or 1
+    copied = 0
+    try:
+        with open(src, "rb") as fin, open(dest, "wb") as fout:
+            while True:
+                chunk = fin.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                fout.write(chunk)
+                copied += len(chunk)
+                if on_progress:
+                    on_progress(int(copied * 100 / total))
+                if is_cancelled and is_cancelled():
+                    raise RuntimeError("Скасовано")
+    except BaseException:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        raise
+    shutil.copystat(src, dest, follow_symlinks=True)
+
+
 def run_mux_ffmpeg_only(
     original_video_path: str,
     mixed_audio_path: str,
@@ -249,93 +308,66 @@ def run_mux_ffmpeg_only(
     duration: Optional[float] = None,
     on_progress=None,   # Optional[Callable[[int, str], None]] — no DB/job coupling
     is_cancelled=None,  # Optional[Callable[[], bool]]
+    vocal_audio_path: Optional[str] = None,
 ) -> dict:
-    """Core ffmpeg mux routine, independent of any Episode/DB — used both for
+    """Core render routine, independent of any Episode/DB — used both for
     local render (run_mux_pipeline below) and a power-shared render request
     run entirely on a peer machine (which has no record of this episode at
     all — see power_share_service.run_render_job_for_peer). Mirrors
-    run_import_ffmpeg_only's split between a pure-ffmpeg core and a DB-aware
-    wrapper for the same reason."""
+    run_import_ffmpeg_only's split between a pure-core and a DB-aware
+    wrapper for the same reason.
+
+    Produces THREE separate files in out_dir:
+      1. the original video, untouched (a byte-for-byte copy — nothing in it
+         is re-encoded or dropped: audio, subtitles, fonts, chapters intact),
+      2. <name>_instrumental.flac — the instrumental, lossless,
+      3. <name>_vocals.flac — the cut-out vocal, lossless (only when there is
+         one: a power-share peer only ever receives the instrumental).
+    The FLACs are not muxed into the video on purpose — they are the working
+    files the studio takes on to Reaper."""
     os.makedirs(out_dir, exist_ok=True)
 
     def progress(pct, msg):
         if on_progress:
             on_progress(pct, msg)
 
-    progress(5, "ffmpeg: аналіз оригінального відео…")
-    probe = _probe(original_video_path)
+    stem = Path(original_video_path).stem
+    video_out = str(Path(out_dir) / Path(original_video_path).name)
+    instrumental_out = str(Path(out_dir) / (stem + "_instrumental.flac"))
+    vocal_out = str(Path(out_dir) / (stem + "_vocals.flac"))
+    has_vocal = bool(vocal_audio_path and os.path.isfile(vocal_audio_path))
 
-    # Find original audio stream info
-    audio_streams = [s for s in probe.get("streams", []) if s.get("codec_type") == "audio"]
-    orig_codec = audio_streams[0].get("codec_name", "aac") if audio_streams else "aac"
-    orig_bitrate = str(int(audio_streams[0].get("bit_rate", "192000")) // 1000) + "k" if audio_streams else "192k"
-    if not duration:
-        duration = float(probe.get("format", {}).get("duration", 0)) or 0
-
-    progress(15, "ffmpeg: мультиплексую фінальне відео…")
-
-    out_name = Path(original_video_path).stem + "_dub" + Path(original_video_path).suffix
-    out_path = str(Path(out_dir) / out_name)
-
-    cmd = [
-        _ffmpeg_bin(), "-y",
-        "-i", original_video_path,
-        "-i", mixed_audio_path,
-        "-map", "0:v",          # video from original
-        "-map", "1:a",          # audio from mixed
-        "-c:v", "copy",         # no re-encode video
-        "-c:a", orig_codec,
-        "-b:a", orig_bitrate,
-        out_path,
-    ]
-
-    app_logger.info("run_mux_ffmpeg_only: running ffmpeg: %s", " ".join(cmd))
-    proc = subprocess.Popen(
-        cmd, stderr=subprocess.PIPE, text=True,
-        encoding="utf-8", errors="replace",
-    )
-    watcher = _spawn_cancel_watcher(proc, is_cancelled)
-    try:
-        stderr_tail: list[str] = []
-        for line in proc.stderr:
-            stderr_tail.append(line)
-            if len(stderr_tail) > 200:
-                stderr_tail.pop(0)
-            if is_cancelled and is_cancelled():
-                proc.kill()
-                raise RuntimeError("Скасовано")
-            if "time=" in line and duration:
-                try:
-                    t = _parse_time(line)
-                    pct = min(90, int(15 + 75 * t / duration))
-                    progress(pct, "ffmpeg: мультиплексую фінальне відео…")
-                except Exception:
-                    pass
-        proc.wait()
-    finally:
-        if watcher:
-            watcher.set()
+    # 1. Original video — skipped when the output folder IS the video's own
+    # folder (it is already there, and copying a file onto itself would
+    # truncate it).
+    progress(5, "Копіюю оригінальне відео…")
+    same_file = os.path.exists(video_out) and os.path.samefile(original_video_path, video_out)
+    if not same_file:
+        _copy_file_with_progress(
+            original_video_path, video_out,
+            lambda pct: progress(5 + int(pct * 0.65), "Копіюю оригінальне відео…"),
+            is_cancelled,
+        )
     if is_cancelled and is_cancelled():
         raise RuntimeError("Скасовано")
-    if proc.returncode != 0:
-        app_logger.error(
-            "run_mux_ffmpeg_only: ffmpeg exited with code %s, last output:\n%s",
-            proc.returncode, "".join(stderr_tail),
-        )
-        raise RuntimeError("ffmpeg mux failed")
 
-    # Alongside the muxed video, also keep a standalone lossless FLAC of the
-    # exact same audio that went into it — the video's own audio track gets
-    # re-encoded above to match the ORIGINAL container's codec (often lossy,
-    # e.g. AAC), so this is the only copy of the final dub audio that stays
-    # bit-for-bit lossless, useful on its own (Reaper, archival) without
-    # needing to re-extract it from the video.
-    progress(95, "ffmpeg: зберігаю аудіо окремим FLAC-файлом…")
-    flac_out_path = str(Path(out_dir) / (Path(original_video_path).stem + "_dub.flac"))
-    _ensure_flac_copy(mixed_audio_path, flac_out_path)
+    # 2. Instrumental as FLAC
+    progress(72, "ffmpeg: зберігаю інструментал (FLAC)…")
+    _ensure_flac_copy(mixed_audio_path, instrumental_out)
+    if is_cancelled and is_cancelled():
+        raise RuntimeError("Скасовано")
+
+    # 3. Vocal as FLAC
+    if has_vocal:
+        progress(88, "ffmpeg: зберігаю вокал (FLAC)…")
+        _ensure_flac_copy(vocal_audio_path, vocal_out)
 
     progress(100, "Готово")
-    return {"output_path": out_path, "audio_output_path": flac_out_path}
+    return {
+        "output_path": video_out,
+        "audio_output_path": instrumental_out,
+        "vocal_output_path": vocal_out if has_vocal else None,
+    }
 
 
 def convert_to_flac(input_path: str, output_path: str) -> str:
@@ -403,6 +435,7 @@ def _run_mux_pipeline(
     result = run_mux_ffmpeg_only(
         original_video_path, mixed_audio_path, str(out_dir), duration=ep.duration,
         on_progress=reporter.update, is_cancelled=lambda: reporter.cancelled,
+        vocal_audio_path=ep.vocal_only_stem_path,
     )
 
     ep.status = "ready"

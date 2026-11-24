@@ -1,7 +1,8 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { Spinner } from './ui/Spinner'
 import { useBackdropClose } from '../hooks/useBackdropClose'
 import { MiniMarkdown } from '../utils/miniMarkdown'
+import { UPDATE_RECHECK_EVENT } from './ForceUpdateBanner'
 
 interface UpdateState {
   status: string
@@ -11,8 +12,8 @@ interface UpdateState {
   releaseNotes?: string
 }
 
-// Shown automatically the moment a check (on launch, then every 4h) finds a
-// newer version — separate from UpdatePanel in Settings (which is for a
+// Shown automatically the moment a check (on launch, then every 10 min and
+// whenever the window regains focus) finds a newer version — separate from UpdatePanel in Settings (which is for a
 // manual, on-demand check). Clicking "Оновити" is the only click needed —
 // it downloads and then installs itself the moment the download finishes,
 // no second "are you sure, install now?" prompt.
@@ -20,7 +21,36 @@ export function UpdateDialog() {
   const [state, setState] = useState<UpdateState>({ status: 'idle' })
   const [dismissed, setDismissed] = useState(false)
   const [autoInstall, setAutoInstall] = useState(false)
-  const backdrop = useBackdropClose(() => setDismissed(true))
+  // Version the person already clicked "Пізніше" on. Checks now repeat every
+  // few minutes, and each one re-announces 'available' — without this the
+  // dialog would pop back up over their work every time.
+  const dismissedVersion = useRef<string | null>(null)
+  const stateRef = useRef(state)
+  stateRef.current = state
+  function dismiss() {
+    dismissedVersion.current = stateRef.current.version ?? null
+    setDismissed(true)
+  }
+  const backdrop = useBackdropClose(dismiss)
+
+  // The launch-time check can finish before this component has subscribed
+  // below, and its 'available' event is one-shot — pull the current state
+  // once on mount so an update found at startup is never missed.
+  useEffect(() => {
+    window.electronAPI?.getUpdateState?.().then((s) => {
+      if (!s) return
+      const next = s as unknown as UpdateState
+      setState(next)
+      setDismissed(false)
+    }).catch(() => {})
+  }, [])
+
+  // An admin's "please update" notice re-opens a dismissed update dialog.
+  useEffect(() => {
+    const reopen = () => { dismissedVersion.current = null }
+    window.addEventListener(UPDATE_RECHECK_EVENT, reopen)
+    return () => window.removeEventListener(UPDATE_RECHECK_EVENT, reopen)
+  }, [])
 
   useEffect(() => {
     if (!window.electronAPI?.onUpdateStatus) return
@@ -28,7 +58,7 @@ export function UpdateDialog() {
       const next = s as unknown as UpdateState
       setState(next)
       if (next.status === 'available') {
-        setDismissed(false)
+        if (next.version !== dismissedVersion.current) setDismissed(false)
         setAutoInstall(false)
       }
       if (next.status === 'downloaded' && autoInstall) {
@@ -68,7 +98,7 @@ export function UpdateDialog() {
         )}
 
         <div className="flex gap-2 justify-end">
-          <button onClick={() => setDismissed(true)} className="rh-btn-ghost">
+          <button onClick={dismiss} className="rh-btn-ghost">
             Пізніше
           </button>
           {state.status === 'available' && (

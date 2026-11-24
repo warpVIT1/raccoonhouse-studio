@@ -16,6 +16,7 @@ export interface Title {
   shared_id?: string | null
   team_id?: string | null
   team_name?: string | null
+  hikka_slug?: string | null
 }
 
 export interface Episode {
@@ -31,6 +32,7 @@ export interface Episode {
   status: EpisodeStatus
   created_at: string
   vocal_stem_path?: string | null
+  vocal_only_stem_path?: string | null
   subtitle_count?: number
   subtitle_stage: string
   actor_video_transfer_id?: string | null
@@ -51,6 +53,36 @@ export interface Character {
   dubber_id: number | null
   dubber_name?: string
   team_device_id?: string | null
+  image_url?: string | null
+  // Original name from the subtitle file (kept when the role is renamed).
+  source_name?: string | null
+  // Lines tagged with this character (per episode when the list was requested with one).
+  line_count?: number
+}
+
+export interface RolesFromSubtitlesResult {
+  created: number
+  existing: number
+  assigned_lines: number
+  skipped: Array<{ name: string; count: number }>
+}
+
+// One Hikka character offered for a local character (ranked by match score).
+export interface CharacterImageCandidate {
+  slug: string | null
+  name_ua: string | null
+  name_en: string | null
+  name_ja: string | null
+  image: string
+  main: boolean
+  source: string
+  score: number
+}
+
+export interface CharacterImageSuggestion {
+  character_id: number
+  auto_applied: boolean
+  candidates: CharacterImageCandidate[]
 }
 
 // A team member with the 'actor' role, as returned by GET /teams/{id}/actors

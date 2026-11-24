@@ -1,19 +1,36 @@
 """
 Build script: packages the Python backend into a standalone app folder using
 PyInstaller.
-Run: python build-backend.py
-Output: backend-dist/raccoonhouse-backend/raccoonhouse-backend.exe
+Run: python build-backend.py            -> full backend, backend-dist/
+     python build-backend.py --actor    -> actor-lite backend, backend-dist-actor/
+Output: <dist>/raccoonhouse-backend/raccoonhouse-backend.exe
+
+--actor builds the SAME backend/main.py (every router still registers —
+routers/episodes.py etc. only import audio_separator/torch/onnxruntime/etc.
+LAZILY inside the function bodies that actually run a separation, never at
+module load — confirmed by grepping for top-level imports of them; the only
+module-level importer is lib_runtime_service.py, which nothing on the actor
+role's own path calls). So excluding those packages here doesn't remove any
+routes, it just means the handful of separation/MVSep/model-browser endpoints
+an actor-only frontend build never calls would 500 if somehow hit — the ML
+weight (torch/sklearn/transformers/cv2/pyarrow/librosa+numba/onnxruntime/
+audio_separator/silero_vad, ~860MB of backend-dist's ~1.2GB) is the whole
+reason a separate lightweight installer for dabbers (actor-role profiles)
+was worth building at all.
 """
 import os
 import shutil
 import subprocess
 import sys
 
+ACTOR_LITE = "--actor" in sys.argv
+
 def main():
-    print("Building Python backend with PyInstaller...")
+    print(f"Building Python backend with PyInstaller ({'actor-lite' if ACTOR_LITE else 'full'})...")
 
     project_root = os.path.dirname(os.path.abspath(__file__))
     backend_src = os.path.join(project_root, "backend")
+    dist_name = "backend-dist-actor" if ACTOR_LITE else "backend-dist"
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
@@ -27,7 +44,7 @@ def main():
         "--onedir",
         "--noconfirm",
         "--name", "raccoonhouse-backend",
-        "--distpath", "backend-dist",
+        "--distpath", dist_name,
         "--workpath", "build-pyinstaller",
         "--specpath", "build-pyinstaller",
         "--hidden-import", "uvicorn.logging",
@@ -51,12 +68,7 @@ def main():
         # regression that wasn't there in earlier builds this session —
         # likely a fastapi/pydantic version bump pulling this check in).
         "--copy-metadata", "email-validator",
-        "--hidden-import", "audio_separator",
-        "--hidden-import", "silero_vad",
         "--hidden-import", "soundfile",
-        "--hidden-import", "librosa",
-        "--collect-all", "audio_separator",
-        "--collect-all", "silero_vad",
         # librosa's optional resampling backends — only imported lazily
         # inside a code path VR Arch models hit (which one depends on the
         # input's actual sample rate). A plain --hidden-import isn't enough
@@ -68,17 +80,24 @@ def main():
         # existed but contained nothing but a data/ subfolder, and
         # _internal/samplerate didn't exist at all). --collect-all forces
         # the whole package in, same as audio_separator/silero_vad above.
-        "--collect-all", "samplerate",
-        "--collect-all", "resampy",
-        # onnxruntime's CPU pieces (onnxruntime.dll, provider bridge, Python
-        # bindings) ship in the installer so CPU mode always works out of the
-        # box. The CUDA provider DLL itself (~712MB) is deliberately EXCLUDED
-        # below — GPU support is opt-in and downloaded on demand (see
-        # gpu_runtime_service.py) rather than bundled, to keep the installer
-        # small. Do NOT add nvidia_cublas_cu12/nvidia_cudnn_cu12/
-        # nvidia_cuda_runtime_cu12/nvidia_cufft_cu12 collect-all here — same
-        # reason, they're downloaded into the app's userData dir instead.
-        "--collect-all", "onnxruntime",
+        # None of this (nor onnxruntime below) is bundled at all in an
+        # --actor build — an actor's own page never separates audio.
+        *([] if ACTOR_LITE else [
+            "--collect-all", "audio_separator",
+            "--collect-all", "silero_vad",
+            "--collect-all", "samplerate",
+            "--collect-all", "resampy",
+            # onnxruntime's CPU pieces (onnxruntime.dll, provider bridge,
+            # Python bindings) ship in the installer so CPU mode always works
+            # out of the box. The CUDA provider DLL itself (~712MB) is
+            # deliberately EXCLUDED below — GPU support is opt-in and
+            # downloaded on demand (see gpu_runtime_service.py) rather than
+            # bundled, to keep the installer small. Do NOT add
+            # nvidia_cublas_cu12/nvidia_cudnn_cu12/nvidia_cuda_runtime_cu12/
+            # nvidia_cufft_cu12 collect-all here — same reason, they're
+            # downloaded into the app's userData dir instead.
+            "--collect-all", "onnxruntime",
+        ]),
         # Simply not adding --collect-all for the nvidia-*-cu12 packages
         # above is NOT enough — onnxruntime's own code imports nvidia.cublas
         # etc. in a try/except at module load (probing for a usable CUDA lib
@@ -96,6 +115,35 @@ def main():
         "--exclude-module", "nvidia_cufft_cu12",
         "--exclude-module", "nvidia_cuda_nvrtc_cu12",
         "--exclude-module", "nvidia_nvjitlink_cu12",
+        # --actor: strip the entire vocal-separation/ML stack outright, not
+        # just skip collecting it — PyInstaller's static import analysis
+        # still follows a dynamic "from . import audio_separator"/
+        # "import torch" inside a lazily-called function body, so without
+        # these excludes it would pull the whole tree back in anyway (same
+        # reason the nvidia excludes above are needed alongside not
+        # collect-all'ing them). audio_separator/silero_vad are the only
+        # direct importers of torch/onnxruntime/etc. in this codebase
+        # (see this file's own module docstring) — excluding just those two
+        # plus their own heaviest transitive deps covers it.
+        *([
+            "--exclude-module", "audio_separator",
+            "--exclude-module", "silero_vad",
+            "--exclude-module", "torch",
+            "--exclude-module", "torchvision",
+            "--exclude-module", "torchaudio",
+            "--exclude-module", "onnxruntime",
+            "--exclude-module", "transformers",
+            "--exclude-module", "sklearn",
+            "--exclude-module", "scipy",
+            "--exclude-module", "cv2",
+            "--exclude-module", "pyarrow",
+            "--exclude-module", "librosa",
+            "--exclude-module", "numba",
+            "--exclude-module", "llvmlite",
+            "--exclude-module", "resampy",
+            "--exclude-module", "samplerate",
+            "--exclude-module", "lib_runtime_service",
+        ] if ACTOR_LITE else []),
         # Absolute source path: PyInstaller resolves relative --add-data paths against
         # --specpath, not the invocation cwd, so a relative "backend" here would
         # (and did) resolve to build-pyinstaller/backend and fail to be found.
@@ -107,6 +155,10 @@ def main():
     if result.returncode != 0:
         print("Build failed!", file=sys.stderr)
         sys.exit(1)
+
+    if ACTOR_LITE:
+        print(f"Backend built successfully: {dist_name}/raccoonhouse-backend/raccoonhouse-backend.exe")
+        return
 
     # onnxruntime-gpu ships its CUDA provider DLL AND a pile of cuBLAS/cuDNN/
     # cuFFT/cudart/nvrtc/nvJitLink DLLs directly inside onnxruntime/capi/
@@ -121,7 +173,7 @@ def main():
     # (not a fixed filename list) since exact cuDNN/CUDA version suffixes in
     # these names shift with onnxruntime-gpu version bumps.
     capi_dir = os.path.join(
-        project_root, "backend-dist", "raccoonhouse-backend", "_internal",
+        project_root, dist_name, "raccoonhouse-backend", "_internal",
         "onnxruntime", "capi",
     )
     NVIDIA_RUNTIME_PATTERNS = (
@@ -140,7 +192,7 @@ def main():
         if stripped:
             print(f"Stripped {len(stripped)} bundled NVIDIA runtime DLLs ({freed / 1e9:.2f} GB): {', '.join(stripped)}")
 
-    print("Backend built successfully: backend-dist/raccoonhouse-backend/raccoonhouse-backend.exe")
+    print(f"Backend built successfully: {dist_name}/raccoonhouse-backend/raccoonhouse-backend.exe")
 
 if __name__ == "__main__":
     main()

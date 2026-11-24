@@ -1,0 +1,87 @@
+# Actor-lite installer — for dabbers (profiles whose only role is "actor"):
+# just the Актор tab (download the episode video/markers, upload/re-upload
+# takes — see ActorWorkspace.tsx) plus team join/sync, none of the
+# separation/GPU/model-browser UI (see src/buildVariant.ts) and none of the
+# backend weight that UI would need (see build-backend.py's --actor flag,
+# which is what must have produced backend-dist-actor/ before packaging
+# this). Team sync and actor-audio upload/download go through the same
+# Worker/R2 relay as the full app — nothing about that path is trimmed.
+#
+# A different appId/productName/install-dir/artifact name than the main
+# config on purpose, so both can be installed side by side on the same PC
+# without clobbering each other, and a distinct `publish.channel` so
+# electron-updater on each build only ever matches ITS OWN release feed —
+# see electron/main.ts's BUILD_VARIANT-gated autoUpdater.channel. Build with
+# `npm run build:exe:actor` / `npm run publish:actor` (see package.json),
+# never electron-builder's default config resolution — both configs exist
+# side by side and must always be pointed to explicitly with --config.
+appId: com.raccoonhouse.studio.actor
+productName: RaccoonHouse Studio Actor
+copyright: "RaccoonHouse Studio"
+
+publish:
+  provider: github
+  owner: warpVIT1
+  repo: raccoonhouse-studio
+  channel: actor
+
+directories:
+  output: release-actor
+  buildResources: resources
+
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - "!node_modules"
+  - "!backend"
+  - "!backend-dist"
+  - "!backend-dist-actor"
+  - "!src"
+
+extraResources:
+  - from: backend-dist-actor/
+    to: backend/
+    filter:
+      - "**/*"
+  - from: resources/bin/
+    to: bin/
+    filter:
+      - "**/*"
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: resources/icon.ico
+
+nsis:
+  include: resources/installer.nsh
+  # _DUB suffix (not "Actor") — matches how the studio refers to actor-role
+  # profiles ("дабери"), same fixed-name/latest-download-link reasoning as
+  # the main config's own artifactName comment.
+  artifactName: RaccoonHouse-Studio-Setup_DUB.exe
+  oneClick: false
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: RaccoonHouse Studio — Актор
+  installerIcon: resources/icon.ico
+  uninstallerIcon: resources/icon.ico
+  installerHeader: resources/installer-header.bmp
+  installerSidebar: resources/installer-sidebar.bmp
+  runAfterFinish: true
+  # NSISBI treats warnings (incl. the harmless Korean missing-langstring one)
+  # as fatal — same as the main config, see its own comment.
+  warningsAsErrors: false
+  # Kept even though this build is far smaller than the full one (no ML/GPU
+  # stack) — the exact installed size hasn't been measured yet, and the
+  # standard NSIS binary electron-builder ships can't embed a single archive
+  # over ~2GB (see electron-builder.yml's own comment for the failure mode).
+  # Cheap insurance: NSISBI handles a smaller archive exactly as well.
+  customNsisBinary:
+    url: https://github.com/SoundSafari/NSISBI-ElectronBuilder/releases/download/1.0.0/nsisbi-electronbuilder-3.10.3.7z
+    checksum: WRmZUsACjIc2s7bvsFGFRofK31hfS7riPlcfI1V9uFB2Q8s7tidgI/9U16+X0I9X2ZhNxi8N7Z3gKvm6ojvLvg==
+
+compression: maximum

@@ -38,6 +38,39 @@ const EMPTY_SETTINGS: AppSettings = {
 
 type SettingsTab = 'general' | 'performance' | 'collab' | 'scripts' | 'updates' | 'admin'
 
+type R2Category = { id: string; bytes: number; count: number; newest: string | null; oldest: string | null }
+type R2Object = { key: string; size: number; uploaded: string }
+
+// Category ids come from the Worker's own R2_CATEGORIES list.
+const R2_CATEGORY_LABELS: Record<string, string> = {
+  episode_video: 'Відео серій',
+  actor_video: 'Відео акторів',
+  cleaned_video: 'Очищене відео',
+  actor_audio: 'Аудіо акторів',
+  log_snapshot: 'Знімки журналів',
+  reports: 'Звіти про розділення',
+  feedback: 'Фідбек',
+  errors: 'Помилки',
+  test_junk: 'Тестове сміття',
+  other: 'Інше (конфіги)',
+}
+
+// "other" holds live config (Apex catalog, MVSep config, telegram codes) —
+// the Worker refuses to purge it, so the UI must not offer the button.
+const R2_PURGEABLE = (id: string) => id !== 'other'
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} ГБ`
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} МБ`
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} КБ`
+  return `${bytes} Б`
+}
+
+function formatDate(iso: string | null): string {
+  if (!iso) return '—'
+  return new Date(iso).toLocaleString('uk-UA', { dateStyle: 'short', timeStyle: 'short' })
+}
+
 export function SettingsPage() {
   const { get, put, post } = useApi()
   const [settings, setSettings] = useState<AppSettings>(EMPTY_SETTINGS)
@@ -63,6 +96,15 @@ export function SettingsPage() {
     db_bytes: number; r2_bytes: number; r2_object_count: number; percent_of_free_tier: number
   } | null>(null)
   const [serverStatsError, setServerStatsError] = useState<string | null>(null)
+  // Per-category breakdown of the same R2 bucket serverStats totals, so the
+  // panel can answer "what is actually taking up the space" and clear one
+  // category at a time (see the Worker's R2_CATEGORIES).
+  const [r2Breakdown, setR2Breakdown] = useState<R2Category[] | null>(null)
+  const [r2Objects, setR2Objects] = useState<R2Object[] | null>(null)
+  const [r2ObjectsOpen, setR2ObjectsOpen] = useState(false)
+  const [r2Busy, setR2Busy] = useState<string | null>(null)
+  const [r2Error, setR2Error] = useState<string | null>(null)
+  const [statsReloadKey, setStatsReloadKey] = useState(0)
   // Local Electron window preference (tray hide-on-close), not part of the
   // backend's AppSettings — read/written straight through electronAPI, not
   // the /settings PUT flow (see electron/main.ts). Absent entirely in a
@@ -147,7 +189,38 @@ export function SettingsPage() {
     get<{ db_bytes: number; r2_bytes: number; r2_object_count: number; percent_of_free_tier: number }>('/teams/admin/server-stats')
       .then(setServerStats)
       .catch(() => setServerStatsError('Не вдалося отримати статистику сервера'))
-  }, [tab, settings.active_profile?.is_admin, get])
+    get<R2Category[]>('/teams/admin/r2-breakdown')
+      .then(setR2Breakdown)
+      .catch(() => setR2Breakdown([]))
+  }, [tab, settings.active_profile?.is_admin, get, statsReloadKey])
+
+  // Full object list is a second full bucket scan, so it's only fetched when
+  // the admin actually opens the detail view rather than on every tab visit.
+  useEffect(() => {
+    if (!r2ObjectsOpen || r2Objects) return
+    get<R2Object[]>('/teams/admin/r2-objects')
+      .then(setR2Objects)
+      .catch(() => setR2Error('Не вдалося отримати список файлів'))
+  }, [r2ObjectsOpen, r2Objects, get])
+
+  const purgeR2Category = async (cat: R2Category) => {
+    const label = R2_CATEGORY_LABELS[cat.id] ?? cat.id
+    const confirmed = window.confirm(
+      `Видалити всі файли з категорії «${label}»?\n\n${cat.count} файлів, ${formatBytes(cat.bytes)}.\n\nЦю дію не можна скасувати.`
+    )
+    if (!confirmed) return
+    setR2Busy(cat.id)
+    setR2Error(null)
+    try {
+      await post(`/teams/admin/r2-purge/${cat.id}`)
+      setR2Objects(null)
+      setStatsReloadKey((k) => k + 1)
+    } catch {
+      setR2Error(`Не вдалося очистити «${label}»`)
+    } finally {
+      setR2Busy(null)
+    }
+  }
 
   const toggleBackgroundMode = async (v: boolean) => {
     setBackgroundMode(v)
@@ -624,17 +697,89 @@ export function SettingsPage() {
                   the honest storage-usage number this architecture
                   actually has available. */}
               <div className="bg-rh-card border border-rh-border rounded-2xl overflow-hidden">
-                <div className="flex flex-col gap-1 py-3.5 px-4">
-                  <div className="text-[12.5px] font-bold">Навантаження сервера</div>
+                <div className="flex flex-col gap-3 py-3.5 px-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-[12.5px] font-bold">Навантаження сервера</div>
+                    <button
+                      onClick={() => { setR2Objects(null); setStatsReloadKey((k) => k + 1) }}
+                      className="flex-none bg-transparent border border-rh-border rounded-lg px-2.5 py-1 text-[11px] font-semibold text-rh-muted hover:border-rh-accent/40 hover:text-white transition-colors"
+                    >
+                      Оновити
+                    </button>
+                  </div>
+
                   {serverStatsError ? (
                     <div className="font-mono text-[11px] text-rh-text-dim">{serverStatsError}</div>
                   ) : serverStats ? (
-                    <div className="font-mono text-[11px] text-rh-text-dim flex flex-col gap-0.5">
-                      <div>Сховище файлів: {serverStats.percent_of_free_tier.toFixed(1)}% від безкоштовного ліміту (10 ГБ)</div>
-                      <div className="text-rh-text-dim/70">
-                        {(serverStats.r2_bytes / (1024 * 1024 * 1024)).toFixed(2)} ГБ, {serverStats.r2_object_count} файлів · База даних: {(serverStats.db_bytes / (1024 * 1024)).toFixed(1)} МБ
+                    <>
+                      <div className="flex flex-col gap-1.5">
+                        <div className="h-1.5 bg-rh-bg rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all ${serverStats.percent_of_free_tier > 80 ? 'bg-[#FF6B70]' : 'bg-rh-accent'}`}
+                            style={{ width: `${Math.min(serverStats.percent_of_free_tier, 100)}%` }}
+                          />
+                        </div>
+                        <div className="font-mono text-[11px] text-rh-text-dim">
+                          {formatBytes(serverStats.r2_bytes)} з 10 ГБ ({serverStats.percent_of_free_tier.toFixed(1)}%) · {serverStats.r2_object_count} файлів · База даних: {formatBytes(serverStats.db_bytes)}
+                        </div>
                       </div>
-                    </div>
+
+                      {r2Breakdown === null ? (
+                        <div className="font-mono text-[11px] text-rh-text-dim">Розрахунок по категоріях…</div>
+                      ) : r2Breakdown.length === 0 ? (
+                        <div className="font-mono text-[11px] text-rh-text-dim">Сховище порожнє</div>
+                      ) : (
+                        <div className="flex flex-col gap-1">
+                          {r2Breakdown.map((cat) => (
+                            <div key={cat.id} className="flex items-center gap-2 py-1.5 border-t border-rh-border/50">
+                              <div className="flex-1 min-w-0">
+                                <div className="text-[11.5px] font-semibold truncate">{R2_CATEGORY_LABELS[cat.id] ?? cat.id}</div>
+                                <div className="font-mono text-[10.5px] text-rh-text-dim/70">
+                                  {cat.count} файлів · оновлено {formatDate(cat.newest)}
+                                </div>
+                              </div>
+                              <div className="flex-none font-mono text-[11px] text-rh-text-dim w-[70px] text-right">
+                                {formatBytes(cat.bytes)}
+                              </div>
+                              {R2_PURGEABLE(cat.id) && (
+                                <button
+                                  onClick={() => purgeR2Category(cat)}
+                                  disabled={r2Busy !== null}
+                                  className="flex-none bg-transparent border border-rh-border rounded-lg px-2.5 py-1 text-[11px] font-semibold text-rh-muted hover:border-[#FF6B70]/50 hover:text-[#FF6B70] transition-colors disabled:opacity-40"
+                                >
+                                  {r2Busy === cat.id ? '…' : 'Очистити'}
+                                </button>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {r2Error && <div className="text-[11px] text-[#FF6B70]">{r2Error}</div>}
+
+                      <button
+                        onClick={() => setR2ObjectsOpen((v) => !v)}
+                        className="self-start bg-transparent border border-rh-border rounded-lg px-2.5 py-1 text-[11px] font-semibold text-rh-muted hover:border-rh-accent/40 hover:text-white transition-colors"
+                      >
+                        {r2ObjectsOpen ? 'Сховати файли' : 'Подивитись усі файли'}
+                      </button>
+
+                      {r2ObjectsOpen && (
+                        r2Objects === null ? (
+                          <div className="font-mono text-[11px] text-rh-text-dim">Завантаження списку…</div>
+                        ) : (
+                          <div className="max-h-[260px] overflow-y-auto flex flex-col gap-0.5 bg-rh-bg rounded-lg p-2">
+                            {r2Objects.map((o) => (
+                              <div key={o.key} className="flex items-center gap-2 font-mono text-[10.5px]">
+                                <span className="flex-1 min-w-0 truncate text-rh-text-dim" title={o.key}>{o.key}</span>
+                                <span className="flex-none text-rh-text-dim/70">{formatDate(o.uploaded)}</span>
+                                <span className="flex-none w-[60px] text-right">{formatBytes(o.size)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )
+                      )}
+                    </>
                   ) : (
                     <div className="font-mono text-[11px] text-rh-text-dim">Завантаження…</div>
                   )}

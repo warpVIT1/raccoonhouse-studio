@@ -36,3 +36,45 @@ def search_anime(query: str, size: int = 12) -> list[dict]:
             "status": item.get("status"),
         })
     return results
+
+
+_CHAR_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_CHAR_CACHE_TTL = 6 * 3600
+
+
+def get_anime_characters(slug: str) -> list[dict]:
+    """All characters of one Hikka anime (name_ua/en/ja, synonyms, image,
+    main flag), paginated and cached in memory for a few hours - the roles
+    tab can be re-opened repeatedly while casting."""
+    import time
+    cached = _CHAR_CACHE.get(slug)
+    if cached and time.time() - cached[0] < _CHAR_CACHE_TTL:
+        return cached[1]
+    out: list[dict] = []
+    page = 1
+    while page <= 20:
+        resp = requests.get(
+            f"{HIKKA_BASE}/anime/{slug}/characters",
+            params={"page": page, "size": 100},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for item in data.get("list", []):
+            ch = item.get("character") or {}
+            out.append({
+                "slug": ch.get("slug"),
+                "name_ua": ch.get("name_ua"),
+                "name_en": ch.get("name_en"),
+                "name_ja": ch.get("name_ja"),
+                "synonyms": ch.get("synonyms") or [],
+                "image": ch.get("image"),
+                "main": bool(item.get("main")),
+                "source": "hikka",
+            })
+        pages = (data.get("pagination") or {}).get("pages") or 1
+        if page >= pages:
+            break
+        page += 1
+    _CHAR_CACHE[slug] = (time.time(), out)
+    return out

@@ -18,6 +18,19 @@ def _active_profile_is_admin(db: Session) -> bool:
     return is_admin_profile(profile)
 
 
+def _can_manage_profile(db: Session, target: Profile) -> bool:
+    """Active profile may edit/delete itself, an admin may manage anyone, and
+    before any profile is active (first-run setup) only passwordless profiles
+    are open — otherwise any local caller could rewrite or wipe another profile."""
+    settings = db.get(AppSettings, 1)
+    active_id = settings.active_profile_id if settings else None
+    if active_id is None:
+        return not target.password_hash
+    if active_id == target.id:
+        return True
+    return _active_profile_is_admin(db)
+
+
 def _out(profile: Profile) -> ProfileOut:
     # The owner's telegram_id always counts as admin even if the stored
     # column says otherwise — see team_service.is_admin_profile's own
@@ -38,6 +51,8 @@ def list_profiles(db: Session = Depends(get_db)):
 def create_profile(body: ProfileCreate, db: Session = Depends(get_db)):
     data = body.model_dump()
     password = data.pop("password", None)
+    # A client must never be able to self-grant admin at creation time.
+    data["is_admin"] = False
     # Server-side default, not just the frontend's own (2026-09-09): every
     # new profile starts as a plain actor regardless of what a client sends
     # — a team admin grants anything beyond that later (see team_service.
@@ -59,8 +74,15 @@ def update_profile(profile_id: int, body: ProfileCreate, db: Session = Depends(g
     profile = db.get(Profile, profile_id)
     if not profile:
         raise HTTPException(404)
+    if not _can_manage_profile(db, profile):
+        raise HTTPException(403, "Немає прав змінювати цей профіль")
     data = body.model_dump()
     password = data.pop("password", None)
+    # Privilege fields are only changeable by an admin; anyone else keeps
+    # the stored values regardless of what the request body says.
+    if not _active_profile_is_admin(db):
+        data.pop("is_admin", None)
+        data.pop("roles", None)
     for k, v in data.items():
         setattr(profile, k, v)
     # None = leave the existing password (if any) untouched; an empty
@@ -79,6 +101,8 @@ def delete_profile(profile_id: int, db: Session = Depends(get_db)):
     profile = db.get(Profile, profile_id)
     if not profile:
         raise HTTPException(404)
+    if not _can_manage_profile(db, profile):
+        raise HTTPException(403, "Немає прав видаляти цей профіль")
     db.delete(profile)
     settings = db.get(AppSettings, 1)
     if settings and settings.active_profile_id == profile_id:
@@ -99,6 +123,18 @@ def activate_profile(profile_id: int, body: ProfileActivateIn = ProfileActivateI
         db.add(settings)
     settings.active_profile_id = profile_id
     db.commit()
+    # Immediate catch-up for whatever teams THIS profile belongs to — without
+    # it, switching to/activating a profile that's already a team member
+    # shows an empty Titles list until the next periodic pull (~5min) or an
+    # unrelated join action, since the one pull that runs at WS-connect time
+    # (see discovery_service._online_signaling_loop) almost always fires
+    # BEFORE any profile is active yet and finds nothing to do (confirmed
+    # live: a fresh install/first launch — no profile active when the socket
+    # connects, then the profile activates a few seconds later with nothing
+    # left to trigger a pull for it). Same nudge as /teams/join's own.
+    from ..services import sync_service, discovery_service
+    sync_service.pull_and_merge_all_teams(db)
+    discovery_service.broadcast_local({"type": "shared_content_updated", "data": {}})
     return _out(profile)
 
 
@@ -223,5 +259,11 @@ def telegram_login_poll(code: str, roles: str = "", db: Session = Depends(get_db
         db.add(settings)
     settings.active_profile_id = profile.id
     db.commit()
+    # Same immediate catch-up as activate_profile above — a Telegram login is
+    # the other path that activates a profile, and needs the same nudge for
+    # the same reason (see that endpoint's comment).
+    from ..services import sync_service, discovery_service
+    sync_service.pull_and_merge_all_teams(db)
+    discovery_service.broadcast_local({"type": "shared_content_updated", "data": {}})
 
     return {"status": "done", "profile": _out(profile).model_dump()}

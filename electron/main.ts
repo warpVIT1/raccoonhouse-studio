@@ -1,4 +1,5 @@
-import { app, BrowserWindow, ipcMain, dialog, shell, Menu, Tray, nativeImage } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, shell, Menu, Tray, nativeImage, session } from 'electron'
+import { randomBytes } from 'node:crypto'
 import { autoUpdater } from 'electron-updater'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
@@ -59,6 +60,22 @@ if (app.isPackaged) {
   app.setPath('userData', dataDir)
 }
 
+// Single instance per install folder (the lock is keyed by userData, which is
+// install-relative, so a separate copy of the app folder still runs fine).
+// A second launch of the SAME install would otherwise run
+// killAnyoneOnBackendPort() against the first instance's backend (killing its
+// running jobs) and share one database file.
+if (!app.requestSingleInstanceLock()) {
+  app.exit(0)
+}
+app.on('second-instance', () => {
+  if (win) {
+    if (win.isMinimized()) win.restore()
+    win.show()
+    win.focus()
+  }
+})
+
 // Persistent file log for the main process AND the renderer (via the
 // console-message forwarding below) — same logs/ directory the Python
 // backend writes app.log/power_share.log into (RH_DATA_DIR is set to this
@@ -91,6 +108,12 @@ process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL
 // is a dev/testing knob (simulating a second "studio PC" on one machine),
 // set by launching with the env var already in place, before the app reads it.
 const BACKEND_PORT = Number(process.env.RH_BACKEND_PORT) || 8765
+
+// Per-launch secret shared only with the spawned backend (env var) and the
+// renderer's own requests (injected below via webRequest). Without it, any
+// web page open in the user's browser could call http://127.0.0.1:<port>/api/*
+// (CORS is open and the API can stream arbitrary files / delete data).
+const API_TOKEN = randomBytes(24).toString('hex')
 let backendProcess: ChildProcess | null = null
 let win: BrowserWindow | null = null
 
@@ -396,7 +419,7 @@ async function startBackend() {
   logLine('INFO', 'main', 'Starting backend:', backendExe, backendArgs.join(' '))
   backendProcess = spawn(backendExe, backendArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, RH_DATA_DIR: app.getPath('userData'), RH_RESOURCES_DIR: resourcesDir },
+    env: { ...process.env, RH_DATA_DIR: app.getPath('userData'), RH_RESOURCES_DIR: resourcesDir, RH_API_TOKEN: API_TOKEN },
   })
 
   // The Python backend's own stdout/stderr (uvicorn access logs, the
@@ -503,6 +526,16 @@ function createWindow() {
     return { action: 'deny' }
   })
 
+  // Attach the API token to every renderer request aimed at our own backend
+  // (fetch, video/audio streaming, downloads, WebSocket upgrade).
+  session.defaultSession.webRequest.onBeforeSendHeaders(
+    { urls: [`http://127.0.0.1:${BACKEND_PORT}/*`, `http://localhost:${BACKEND_PORT}/*`, `ws://127.0.0.1:${BACKEND_PORT}/*`, `ws://localhost:${BACKEND_PORT}/*`] },
+    (details, callback) => {
+      details.requestHeaders['X-RH-Token'] = API_TOKEN
+      callback({ requestHeaders: details.requestHeaders })
+    },
+  )
+
   if (VITE_DEV_SERVER_URL) {
     win.loadURL(VITE_DEV_SERVER_URL)
     win.webContents.openDevTools()
@@ -520,6 +553,11 @@ function createWindow() {
 
 // --- Auto-update (GitHub Releases) ---
 function sendUpdateStatus(status: string, extra?: Record<string, unknown>) {
+  if (status === 'available' || status === 'downloading' || status === 'downloaded') {
+    lastUpdateState = { status, ...extra }
+  } else if (status === 'not-available') {
+    lastUpdateState = null
+  }
   win?.webContents.send('update:status', { status, ...extra })
 }
 
@@ -533,7 +571,15 @@ function sendUpdateStatus(status: string, extra?: Record<string, unknown>) {
 let updateDownloaded = false
 let preUpdateBackupDone = false
 
-const AUTO_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000 // 4 hours
+const AUTO_CHECK_INTERVAL_MS = 10 * 60 * 1000 // 10 minutes — a fresh release is noticed within minutes, not hours
+const FOCUS_CHECK_MIN_GAP_MS = 2 * 60 * 1000 // also re-check when the window regains focus, at most every 2 min
+
+// The last update state worth showing (available / downloading / downloaded).
+// The launch-time check fires before the renderer has subscribed to
+// 'update:status', so the one-shot 'available' event was simply lost and
+// nothing re-announced it until the next check hours later — the renderer now
+// pulls this on mount (update:getState) instead of relying on catching the event.
+let lastUpdateState: Record<string, unknown> | null = null
 
 function initAutoUpdater() {
   if (!app.isPackaged) return // electron-updater needs a real packaged build + app-update.yml
@@ -573,13 +619,24 @@ function initAutoUpdater() {
     })
   })
 
-  const check = () => autoUpdater.checkForUpdates().catch((err) => logLine('ERROR', 'updater', 'check failed', err))
+  let lastCheckAt = 0
+  const check = () => {
+    // Once an update is already downloaded there is nothing more to find.
+    if (updateDownloaded) return
+    lastCheckAt = Date.now()
+    autoUpdater.checkForUpdates().catch((err) => logLine('ERROR', 'updater', 'check failed', err))
+  }
   check()
   checkForBetaAvailable()
   // Nobody has to remember to click "Перевірити зараз" — this keeps checking
   // in the background for as long as the app stays open.
   setInterval(check, AUTO_CHECK_INTERVAL_MS)
   setInterval(checkForBetaAvailable, AUTO_CHECK_INTERVAL_MS)
+  // Coming back to the app (e.g. after it sat in the tray or behind other
+  // windows) is the moment someone would notice a stale version.
+  app.on('browser-window-focus', () => {
+    if (Date.now() - lastCheckAt >= FOCUS_CHECK_MIN_GAP_MS) check()
+  })
 }
 
 // --- Beta channel nudge (separate from the main auto-update flow above) ---
@@ -665,6 +722,8 @@ ipcMain.handle('update:check', () => {
   autoUpdater.checkForUpdates().catch((err) => logLine('ERROR', 'updater', 'check failed', err))
 })
 
+ipcMain.handle('update:getState', () => lastUpdateState)
+
 ipcMain.handle('update:download', () => {
   autoUpdater.downloadUpdate().catch((err) => sendUpdateStatus('error', { message: err.message }))
 })
@@ -724,13 +783,30 @@ ipcMain.handle('get:appVersion', () => app.getVersion())
 // across drive letters, so this always does a real copy, never a move —
 // irrelevant here anyway since the source must survive (it's still the
 // active/archived stem the app itself tracks).
-ipcMain.handle('fs:saveFileToChosenFolder', async (_event, sourcePath: string) => {
-  if (!win || !sourcePath || !fs.existsSync(sourcePath)) return null
+// The renderer only ever asks to export media/subtitle/project outputs: refuse
+// anything else (e.g. the SQLite database or token files) outright.
+const SAVABLE_EXT = /\.(flac|wav|mp3|m4a|aac|ogg|opus|mp4|mkv|mov|avi|webm|srt|ass|vtt|rpp|csv|txt|zip|png|jpe?g)$/i
+
+ipcMain.handle('fs:saveFileToChosenFolder', async (_event, sourcePaths: string | string[]) => {
+  // One folder prompt for the whole batch (an isolation is an instrumental +
+  // the vocal that was cut out) — missing files are skipped, not fatal.
+  const existing = (Array.isArray(sourcePaths) ? sourcePaths : [sourcePaths])
+    .filter((p): p is string => typeof p === 'string' && !!p && SAVABLE_EXT.test(p) && fs.existsSync(p) && fs.statSync(p).isFile())
+  if (!win || existing.length === 0) return null
   const result = await dialog.showOpenDialog(win, { properties: ['openDirectory'] })
   if (result.canceled || !result.filePaths[0]) return null
-  const destPath = path.join(result.filePaths[0], path.basename(sourcePath))
-  fs.copyFileSync(sourcePath, destPath)
-  return destPath
+  let lastDest: string | null = null
+  for (const sourcePath of existing) {
+    // Never silently overwrite a same-named file in the chosen folder.
+    const parsed = path.parse(sourcePath)
+    let candidate = path.join(result.filePaths[0], parsed.base)
+    for (let n = 1; fs.existsSync(candidate) && n < 1000; n++) {
+      candidate = path.join(result.filePaths[0], `${parsed.name} (${n})${parsed.ext}`)
+    }
+    lastDest = candidate
+    fs.copyFileSync(sourcePath, lastDest)
+  }
+  return lastDest
 })
 
 // Settings → "Скрипти" tab (2026-09-10) — hand-maintained REAPER tools this
@@ -767,6 +843,9 @@ async function fetchScriptManifest(): Promise<ScriptManifestEntry[]> {
 // a stale/tampered filename can never reach an arbitrary raw.githubusercontent
 // path outside reaper-scripts/.
 async function fetchScriptContent(filename: string): Promise<Buffer | null> {
+  // Must be a bare *.lua file name, never a path: the manifest comes from a
+  // remote branch, so a hostile entry with directory parts must not reach path.join.
+  if (typeof filename !== 'string' || filename !== path.win32.basename(filename) || filename !== path.posix.basename(filename) || !/\.lua$/i.test(filename)) return null
   const manifest = await fetchScriptManifest()
   if (!manifest.some((e) => e.filename === filename)) return null
   const resp = await fetch(SCRIPTS_RAW_BASE + encodeURIComponent(filename))
@@ -829,8 +908,18 @@ ipcMain.handle('shell:openExternal', async (_event, url: string) => {
   await shell.openExternal(url)
 })
 
+// Executable/script types are never opened through the OS shell — a hostile
+// path string from the renderer must not be able to launch a program.
+const BLOCKED_OPEN_EXT = /\.(exe|bat|cmd|com|scr|pif|lnk|msi|msp|ps1|psm1|vbs|vbe|js|jse|wsf|wsh|hta|cpl|reg|dll|jar|appx|msix|url)$/i
+
 ipcMain.handle('shell:openPath', async (_event, filePath: string) => {
-  await shell.openPath(filePath)
+  if (typeof filePath !== 'string' || !filePath || BLOCKED_OPEN_EXT.test(filePath)) {
+    logLine('ERROR', 'main', 'shell:openPath refused:', filePath)
+    return 'refused'
+  }
+  const err = await shell.openPath(filePath)
+  if (err) logLine('ERROR', 'main', 'shell:openPath failed:', filePath, err)
+  return err
 })
 
 // Telegram login — a bot deep-link (t.me/<bot>?start=<code>), handed
@@ -893,7 +982,7 @@ app.on('window-all-closed', () => {
 // proceeds with no automated cleanup, per the user's own explicit call.
 async function performPreUpdateBackup(): Promise<void> {
   try {
-    const resp = await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/backup/create`, { method: 'POST' })
+    const resp = await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/backup/create`, { method: 'POST', headers: { 'X-RH-Token': API_TOKEN } })
     const result = await resp.json() as { ok: boolean; needed_bytes?: number; free_bytes?: number }
     if (result.ok) return
 
@@ -915,6 +1004,24 @@ async function performPreUpdateBackup(): Promise<void> {
   }
 }
 
+// Uploads this machine's own logs to R2 right before quitting, so an admin
+// looking at this person's logs while they're offline sees the state the app
+// actually exited in. The backend pushes these on a 15-minute timer anyway —
+// this just makes sure the last one isn't up to 15 minutes stale. Bounded by
+// its own timeout and never allowed to fail the quit: a slow or unreachable
+// Worker must not leave the app hanging with no window on screen.
+async function pushLogSnapshotOnQuit(): Promise<void> {
+  try {
+    await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/teams/log-snapshot`, {
+      method: 'POST',
+      headers: { 'X-RH-Token': API_TOKEN },
+      signal: AbortSignal.timeout(8000),
+    })
+  } catch (err) {
+    logLine('INFO', 'logs', 'log snapshot on quit skipped', err)
+  }
+}
+
 // The single place that actually stops the backend — window-all-closed
 // above defers to this via app.quit() rather than stopping it directly, so
 // this also covers quit paths that never touch a window at all (Cmd+Q on
@@ -923,7 +1030,19 @@ async function performPreUpdateBackup(): Promise<void> {
 // click or autoInstallOnAppQuit's own implicit path on a normal quit),
 // intercept once to run the backup first — with the backend still alive to
 // serve it — then let the quit proceed for real.
+let logSnapshotDone = false
 app.on('before-quit', (event) => {
+  // Both this and the pre-update backup need the backend alive, so the
+  // snapshot runs first and re-enters this handler once it's done rather
+  // than racing stopBackend() below.
+  if (!logSnapshotDone) {
+    event.preventDefault()
+    pushLogSnapshotOnQuit().finally(() => {
+      logSnapshotDone = true
+      app.quit()
+    })
+    return
+  }
   if (updateDownloaded && !preUpdateBackupDone) {
     event.preventDefault()
     performPreUpdateBackup().finally(() => {

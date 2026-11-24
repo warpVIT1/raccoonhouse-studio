@@ -610,6 +610,7 @@ function AddTitleModal({ onClose, onAdded }: AddTitleModalProps) {
           try {
             const withPoster = await post<Title>(`/titles/${created.id}/poster-from-url`, {
               image_url: selectedPoster.image,
+              hikka_slug: selectedPoster.slug,
             })
             onAdded(withPoster)
             return

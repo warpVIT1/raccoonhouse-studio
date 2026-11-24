@@ -80,9 +80,9 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   // archived automatically instead of silently overwritten each time a new
   // run (or a batch-result pick) replaces the current instrumental (see
   // backend's separator_service._archive_previous_isolation). Auto-deleted
-  // after 48h, so this is a short working-memory window, not a full archive.
+  // after 4 days, so this is a short working-memory window, not a full archive.
   const [showHistoryModal, setShowHistoryModal] = useState(false)
-  const [historyItems, setHistoryItems] = useState<{ filename: string; path: string; model: string; created_at: string }[] | null>(null)
+  const [historyItems, setHistoryItems] = useState<{ filename: string; path: string; vocal_path?: string | null; model: string; created_at: string }[] | null>(null)
   const [restoringHistory, setRestoringHistory] = useState<string | null>(null)
   const [savingHistory, setSavingHistory] = useState<string | null>(null)
   const [savedHistoryFlash, setSavedHistoryFlash] = useState<string | null>(null)
@@ -91,7 +91,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   function openHistoryModal() {
     setShowHistoryModal(true)
     setHistoryItems(null)
-    get<{ filename: string; path: string; model: string; created_at: string }[]>(`/episodes/${episodeId}/separation-history`)
+    get<{ filename: string; path: string; vocal_path?: string | null; model: string; created_at: string }[]>(`/episodes/${episodeId}/separation-history`)
       .then(setHistoryItems)
       .catch(() => setHistoryItems([]))
   }
@@ -99,11 +99,11 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   // Copies an isolation result (from history, or the current active stem)
   // out of the app's own internal stems folder to wherever the user picks
   // — see electron/main.ts's fs:saveFileToChosenFolder.
-  async function saveIsolationToFolder(sourcePath: string, key: string) {
+  async function saveIsolationToFolder(sourcePaths: (string | null | undefined)[], key: string) {
     if (!window.electronAPI?.saveFileToChosenFolder) return
     setSavingHistory(key)
     try {
-      const saved = await window.electronAPI.saveFileToChosenFolder(sourcePath)
+      const saved = await window.electronAPI.saveFileToChosenFolder(sourcePaths.filter((p): p is string => !!p))
       if (saved) {
         setSavedHistoryFlash(key)
         setTimeout(() => setSavedHistoryFlash((k) => (k === key ? null : k)), 2000)
@@ -932,12 +932,12 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
   }
 
   // "Take a model, separate the vocal, then split THAT into male/female"
-  async function handleMvsepMaleFemale() {
+  async function handleMvsepMaleFemale(addOpt1: string) {
     if (!backendReady || !vocalIsolated) return
     setMvsepSplitError(null)
     setMvsepSplitBusy(true)
     try {
-      const result = await post<{ job_id: string }>(`/episodes/${episodeId}/mvsep-male-female`, {})
+      const result = await post<{ job_id: string }>(`/episodes/${episodeId}/mvsep-male-female`, { add_opt1: addOpt1 })
       upsertJob({
         id: result.job_id,
         type: 'mvsep_male_female',
@@ -1150,7 +1150,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
           </button>
 
           {/* Past isolation results — see backend's separation-history endpoints */}
-          <button onClick={openHistoryModal} className="rh-btn-outline text-xs" title="Прослухати попередні ізоляції цієї серії (зберігаються 48 годин)">
+          <button onClick={openHistoryModal} className="rh-btn-outline text-xs" title="Прослухати попередні ізоляції цієї серії (зберігаються 4 дні)">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/>
             </svg>
@@ -1162,10 +1162,10 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
               per-item button in the Історія modal below. */}
           {episode?.vocal_stem_path && (
             <button
-              onClick={() => saveIsolationToFolder(episode.vocal_stem_path!, 'current')}
+              onClick={() => saveIsolationToFolder([episode.vocal_stem_path, episode.vocal_only_stem_path], 'current')}
               disabled={savingHistory === 'current'}
               className="rh-btn-outline text-xs"
-              title="Зберегти поточну ізоляцію у вибрану папку на диску"
+              title="Зберегти інструментал і вирізаний вокал у вибрану папку"
             >
               {savingHistory === 'current' ? (
                 <Spinner size={12} />
@@ -1241,6 +1241,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
           maleFemaleEligible={mvsepEligibleForSplit}
           maleFemaleSplitBusy={mvsepSplitBusy}
           onMaleFemaleSplit={handleMvsepMaleFemale}
+          durationSeconds={episode?.duration ?? null}
         />
       )}
 
@@ -1259,7 +1260,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
             <p className="text-xs text-rh-muted">
               Кожна модель дала окремий файл — прослухайте прямо тут і оберіть той, що звучить найкраще:
               він стане інструменталом цієї серії для рендеру. Ця бібліотека тимчасова — файли
-              автоматично видаляються через 48 годин, щоб не займати місце.
+              автоматично видаляються через 4 дні, щоб не займати місце.
             </p>
             <div className="flex flex-col gap-1.5 max-h-[60vh] overflow-y-auto pr-1">
               {batchResults.items.map((r) => (
@@ -1297,7 +1298,7 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
             <p className="text-xs text-rh-muted">
               Щоразу, коли нова ізоляція (чи вибір результату пакетного рендеру) заміняє поточний
               інструментал, попередній автоматично потрапляє сюди — прослухайте й за потреби поверніть.
-              Зберігається 48 годин, потім видаляється автоматично.
+              Зберігається 4 дні, потім видаляється автоматично.
             </p>
             {historyItems === null && (
               <div className="flex justify-center py-6"><Spinner size={18} className="text-rh-accent" /></div>
@@ -1315,10 +1316,10 @@ export function EpisodeWorkspace({ episodeId, titleId }: EpisodeWorkspaceProps) 
                         <div className="text-[10.5px] text-rh-muted">{new Date(item.created_at).toLocaleString()}</div>
                       </div>
                       <button
-                        onClick={() => saveIsolationToFolder(item.path, item.filename)}
+                        onClick={() => saveIsolationToFolder([item.path, item.vocal_path], item.filename)}
                         disabled={savingHistory === item.filename}
                         className="rh-btn-outline text-[11px] px-2.5 py-1 flex-shrink-0"
-                        title="Зберегти файл у вибрану папку на диску"
+                        title="Зберегти інструментал і вирізаний вокал у вибрану папку"
                       >
                         {savingHistory === item.filename ? <Spinner size={11} /> : savedHistoryFlash === item.filename ? '✓ Збережено' : 'Завантажити'}
                       </button>

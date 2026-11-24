@@ -17,7 +17,7 @@ interface AppState {
   incomingModelDownloadRequest: PowerShareModelDownloadPayload | null
   lendingStatus: PowerShareLendingPayload | null
   borrowingStatus: PowerShareBorrowingPayload | null
-  forceUpdateNotice: { from_name: string } | null
+  forceUpdateNotice: { from_name: string; id?: string | null } | null
   teamInviteNotice: { invite_id: string; team_id: string; team_name: string } | null
   // Bumped to Date.now() whenever the backend pulls a fresh shared-titles
   // snapshot (see backend discovery_service.py's "shared_content_updated"
@@ -159,7 +159,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       return
     }
     if (msg.type === 'force_update_request') {
-      set({ forceUpdateNotice: msg.data as unknown as { from_name: string } })
+      set({ forceUpdateNotice: msg.data as unknown as { from_name: string; id?: string | null } })
       return
     }
     if (msg.type === 'team_invite') {

@@ -21,8 +21,19 @@ export type SeparationModel = typeof SEPARATION_MODELS[number]
 // short static thing worth hand-mirroring (see MVSEP_MAX_BATCH below for
 // the one MVSep constant that IS still hardcoded here, since it's a
 // frontend-only UX cap, not a fact about MVSep itself).
-type MvsepModel = { label: string; sepType: string; addOpt1: string; premium: boolean }
+type MvsepModel = { label: string; sepType: string; addOpt1: string; premium: boolean; priceCoefficient: number }
 type MvsepCategory = { category: string; models: MvsepModel[] }
+type MaleFemaleModel = { label: string; addOpt1: string; priceCoefficient: number }
+
+// MVSep's own formula (GET /api/app/algorithms docs): cost = floor(duration
+// in seconds * price_coefficient / 60), minimum 1. Shown as an "≈N хв"
+// estimate next to each MVSep choice so spending is a visible, informed
+// decision before the button is clicked — mirrors mvsep.com's own
+// #credits_approx hint on its separation form.
+function estimateCredits(durationSeconds: number | null, priceCoefficient: number): number | null {
+  if (durationSeconds == null || durationSeconds <= 0) return null
+  return Math.max(1, Math.floor((durationSeconds * priceCoefficient) / 60))
+}
 
 // MVSep costs real studio credits per model run (unlike the free local
 // batch, which always runs every model) — capped here to match the
@@ -113,13 +124,17 @@ interface VocalSeparationModalProps {
   vocalIsolated: boolean
   maleFemaleEligible: boolean
   maleFemaleSplitBusy: boolean
-  onMaleFemaleSplit: () => void
+  onMaleFemaleSplit: (addOpt1: string) => void
+  // Episode.duration (seconds) — null when unknown (e.g. never probed via
+  // ffprobe). Only used for the "≈N хв кредитів" estimate next to MVSep
+  // choices; every other feature in this modal works fine without it.
+  durationSeconds: number | null
 }
 
 export function VocalSeparationModal({
   onClose, onRun, onRequestPower, onRunBatch, onRunDistributed, separating, requestingPower,
   batchRendering, distributedRunning, powerShareEnabled, powerShareError, separationError, disabled,
-  vocalIsolated, maleFemaleEligible, maleFemaleSplitBusy, onMaleFemaleSplit,
+  vocalIsolated, maleFemaleEligible, maleFemaleSplitBusy, onMaleFemaleSplit, durationSeconds,
 }: VocalSeparationModalProps) {
   const backdrop = useBackdropClose(onClose)
   const { get, post, del } = useApi()
@@ -274,6 +289,8 @@ export function VocalSeparationModal({
   const [mvsepBatchSelected, setMvsepBatchSelected] = useState<MvsepModel[]>([])
   const [mvsepBalance, setMvsepBalance] = useState<{ premium_minutes: number | null; premium_enabled: boolean } | null>(null)
   const [mvsepBalanceError, setMvsepBalanceError] = useState<string | null>(null)
+  const [maleFemaleModels, setMaleFemaleModels] = useState<MaleFemaleModel[] | null>(null)
+  const [maleFemaleChoice, setMaleFemaleChoice] = useState<MaleFemaleModel | null>(null)
 
   useEffect(() => {
     get<{ eligible: boolean }>('/teams/mvsep-eligible').then((r) => setMvsepEligible(r.eligible)).catch(() => {})
@@ -293,6 +310,16 @@ export function VocalSeparationModal({
       .then(setMvsepBalance)
       .catch((e) => setMvsepBalanceError(extractApiError(e, 'Не вдалося отримати баланс MVSep')))
   }, [isMvsep, mvsepEligible, mvsepBalance, mvsepBalanceError, get])
+
+  useEffect(() => {
+    if (!maleFemaleEligible || maleFemaleModels !== null) return
+    get<MaleFemaleModel[]>('/teams/mvsep-male-female-models').then((models) => {
+      setMaleFemaleModels(models)
+      // "2" = MelRoformer (2025.01) — the fixed default this always used
+      // before model choice existed (see mvsep_service.MALE_FEMALE_ADD_OPT1).
+      setMaleFemaleChoice(models.find((m) => m.addOpt1 === '2') ?? models[0] ?? null)
+    }).catch(() => {})
+  }, [maleFemaleEligible, maleFemaleModels, get])
 
   function toggleMvsepBatchModel(m: MvsepModel) {
     setMvsepBatchSelected((prev) => {
@@ -607,7 +634,7 @@ export function VocalSeparationModal({
                   Хмарне розділення на mvsep.com — файл іде на сторонній сервер, обробка займає час і витрачає кредити студії.
                 </p>
                 <span className="text-[10px] font-semibold text-cyan-300 bg-cyan-500/15 border border-cyan-500/30 rounded px-1.5 py-0.5 flex-shrink-0">
-                  💳 Кредити
+                  💳 Кредити{mvsepBalance ? `: ${mvsepBalance.premium_minutes ?? 0} хв` : ''}
                 </span>
               </div>
 
@@ -664,6 +691,12 @@ export function VocalSeparationModal({
                       🔒 Ця модель на mvsep.com позначена як преміум — може не спрацювати, якщо на токені студії немає преміум-хвилин.
                     </div>
                   )}
+                  {mvsepChoice && (() => {
+                    const est = estimateCredits(durationSeconds, mvsepChoice.priceCoefficient)
+                    return est != null ? (
+                      <div className="text-[10.5px] text-cyan-300/70 mt-1">≈ {est} хв кредитів на цю серію</div>
+                    ) : null
+                  })()}
                 </Field>
               )}
 
@@ -671,6 +704,9 @@ export function VocalSeparationModal({
                 <div className="flex flex-col gap-1.5">
                   <div className="text-[10.5px] text-cyan-200/70">
                     Обрано {mvsepBatchSelected.length}/{MVSEP_MAX_BATCH}
+                    {durationSeconds != null && mvsepBatchSelected.length > 0 && (
+                      <> · ≈ {mvsepBatchSelected.reduce((sum, m) => sum + (estimateCredits(durationSeconds, m.priceCoefficient) ?? 0), 0)} хв кредитів разом</>
+                    )}
                   </div>
                   <div className="flex flex-col gap-2 max-h-[220px] overflow-y-auto pr-1">
                     {mvsepCategories.map((cat) => (
@@ -742,20 +778,39 @@ export function VocalSeparationModal({
               MVSep, spending credits. Hidden entirely unless eligible, same
               "hide AND block" posture as everything else MVSep. */}
           {isMvsep && maleFemaleEligible && (
-            <div className="border border-rh-border rounded-lg p-2.5 flex items-center gap-2.5">
-              <div className="flex-1 text-[10.5px] text-rh-muted">
+            <div className="border border-rh-border rounded-lg p-2.5 flex flex-col gap-1.5">
+              <div className="text-[10.5px] text-rh-muted">
                 Розділити вже виділений вокал цієї серії на чоловічий/жіночий (MVSep, витрачає кредити)
               </div>
-              <button
-                type="button"
-                onClick={onMaleFemaleSplit}
-                disabled={!vocalIsolated || maleFemaleSplitBusy}
-                className="rh-btn-outline text-xs flex items-center gap-1.5 flex-shrink-0"
-                title={vocalIsolated ? undefined : 'Спершу виділіть вокал для цієї серії'}
-              >
-                {maleFemaleSplitBusy ? <Spinner size={12} /> : null}
-                Ч/Ж
-              </button>
+              {maleFemaleModels && (
+                <select
+                  className="rh-input text-[11px]"
+                  value={maleFemaleChoice?.addOpt1 ?? ''}
+                  onChange={(e) => setMaleFemaleChoice(maleFemaleModels.find((m) => m.addOpt1 === e.target.value) ?? null)}
+                >
+                  {maleFemaleModels.map((m) => (
+                    <option key={m.addOpt1} value={m.addOpt1}>{m.label}</option>
+                  ))}
+                </select>
+              )}
+              <div className="flex items-center gap-2.5">
+                {maleFemaleChoice && (() => {
+                  const est = estimateCredits(durationSeconds, maleFemaleChoice.priceCoefficient)
+                  return est != null ? (
+                    <div className="flex-1 text-[10.5px] text-rh-text-dim">≈ {est} хв кредитів</div>
+                  ) : <div className="flex-1" />
+                })()}
+                <button
+                  type="button"
+                  onClick={() => maleFemaleChoice && onMaleFemaleSplit(maleFemaleChoice.addOpt1)}
+                  disabled={!vocalIsolated || maleFemaleSplitBusy || !maleFemaleChoice}
+                  className="rh-btn-outline text-xs flex items-center gap-1.5 flex-shrink-0"
+                  title={vocalIsolated ? undefined : 'Спершу виділіть вокал для цієї серії'}
+                >
+                  {maleFemaleSplitBusy ? <Spinner size={12} /> : null}
+                  Ч/Ж
+                </button>
+              </div>
             </div>
           )}
           {/* Мій ансамбль is per-profile and purely local (see backend's

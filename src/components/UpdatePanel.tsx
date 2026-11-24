@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react'
 import { Spinner } from './ui/Spinner'
 import { useApi } from '../hooks/useApi'
 import { MiniMarkdown } from '../utils/miniMarkdown'
+import { SEEN_UPDATE_NOTICE_KEY } from './ForceUpdateBanner'
 
 interface UpdateState {
   status: string
@@ -29,8 +30,14 @@ export function UpdatePanel({ isAdmin, noTopMargin }: UpdatePanelProps) {
     setBroadcasting(true)
     setBroadcastResult(null)
     try {
-      const r = await post<{ sent: number }>('/power-share/broadcast-force-update', {})
-      setBroadcastResult(r.sent > 0 ? `Надіслано ${r.sent} ПК` : 'Немає нікого онлайн зараз')
+      const r = await post<{ sent: number; notice_id: string | null }>('/power-share/broadcast-force-update', {})
+      // The sender shouldn't get their own notice back at the next poll.
+      if (r.notice_id) localStorage.setItem(SEEN_UPDATE_NOTICE_KEY, r.notice_id)
+      setBroadcastResult(
+        r.notice_id
+          ? `Збережено для всіх (побачать при запуску) · зараз онлайн: ${r.sent}`
+          : r.sent > 0 ? `Надіслано ${r.sent} ПК (офлайн-збереження недоступне)` : 'Немає нікого онлайн зараз',
+      )
     } catch (e) {
       setBroadcastResult(e instanceof Error ? e.message : 'Не вдалося надіслати')
     } finally {
@@ -112,7 +119,7 @@ export function UpdatePanel({ isAdmin, noTopMargin }: UpdatePanelProps) {
           <div className="flex-1">
             <div className="text-[12px] font-semibold">Попросити всіх оновитись</div>
             <div className="font-mono text-[10.5px] text-rh-text-dim mt-0.5">
-              {broadcastResult ?? 'Надсилає нагадування кожному ПК, що зараз онлайн'}
+              {broadcastResult ?? 'Запам’ятовується й показується кожному один раз — і онлайн, і тим, хто зайде пізніше'}
             </div>
           </div>
           <button

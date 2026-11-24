@@ -25,6 +25,10 @@ class Job:
 
 
 _jobs: dict[str, Job] = {}
+# Strong refs to running run_job tasks: the event loop only keeps weak ones,
+# so a fire-and-forget asyncio.create_task() could be GC'd mid-run and the
+# "complete" WS event would never be sent.
+_running_tasks: set = set()
 _executor = ThreadPoolExecutor(max_workers=4)
 _ws_broadcast: Optional[Callable[[dict], Coroutine]] = None
 
@@ -91,6 +95,10 @@ async def run_job(
     fn: Callable[["ProgressReporter"], Any],
 ):
     """Run `fn` in the thread pool, with progress callbacks feeding back to the WS."""
+    _self_task = asyncio.current_task()
+    if _self_task is not None:
+        _running_tasks.add(_self_task)
+        _self_task.add_done_callback(_running_tasks.discard)
     job.status = "running"
     app_logger.info("job started id=%s type=%s episode_id=%s", job.id, job.type, job.episode_id)
     reporter = ProgressReporter(job, loop)

@@ -114,8 +114,15 @@ def join_team(body: TeamJoinIn, db: Session = Depends(get_db)):
     # Immediate catch-up so shared titles already on the team don't wait for
     # the next periodic pull (~5min) or someone else's next push — see
     # sync_service.pull_and_merge_all_teams.
-    from ..services import sync_service
+    from ..services import sync_service, discovery_service
     sync_service.pull_and_merge_all_teams(db)
+    # The pull above only updates local SQLite — without this, a
+    # TitlesPage/EpisodeWorkspace already mounted before the join (e.g. the
+    # Titles list open in the background while joining via Settings) never
+    # notices the new rows exist until it happens to remount. Same nudge
+    # TitlesPage.tsx already listens for on every ONGOING team content
+    # change (see discovery_service's own "shared_content_updated" handling).
+    discovery_service.broadcast_local({"type": "shared_content_updated", "data": {}})
     return {"ok": True}
 
 
@@ -224,9 +231,11 @@ def respond_to_invite(body: TeamInviteRespondIn, db: Session = Depends(get_db)):
     team_service.respond_to_invite(body.invite_id, body.accept, body.display_name)
     if body.accept:
         # Same immediate catch-up as /join above — this is the other entry
-        # point into a team (invite-accept vs type-name-and-password).
-        from ..services import sync_service
+        # point into a team (invite-accept vs type-name-and-password) — plus
+        # the same already-mounted-UI nudge (see /join's own comment).
+        from ..services import sync_service, discovery_service
         sync_service.pull_and_merge_all_teams(db)
+        discovery_service.broadcast_local({"type": "shared_content_updated", "data": {}})
     return {"ok": True}
 
 
@@ -261,6 +270,30 @@ def server_stats(db: Session = Depends(get_db)):
         raise HTTPException(403, str(e))
 
 
+@router.get("/admin/r2-breakdown")
+def r2_breakdown(db: Session = Depends(get_db)):
+    try:
+        return team_service.get_r2_breakdown(_active_profile_name(db))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+
+
+@router.get("/admin/r2-objects")
+def r2_objects(db: Session = Depends(get_db)):
+    try:
+        return team_service.list_r2_objects(_active_profile_name(db))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+
+
+@router.post("/admin/r2-purge/{category}")
+def r2_purge(category: str, db: Session = Depends(get_db)):
+    try:
+        return team_service.purge_r2_category(category, _active_profile_name(db))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+
+
 @router.get("/users/all")
 def all_known_users(db: Session = Depends(get_db)):
     try:
@@ -271,20 +304,34 @@ def all_known_users(db: Session = Depends(get_db)):
 
 @router.get("/users/{device_id}/log")
 def get_user_log(device_id: str, filename: str, db: Session = Depends(get_db)):
-    """Live console-log viewer for the admin "База даних" tab — reuses the
-    exact same peer-to-peer relay call the Power Share admin log viewer
-    already had (see discovery_service.fetch_peer_log), just resolved by
-    team device_id instead of the power-share peer_id (see
-    fetch_log_by_device_id). Only works while that person is online."""
+    """Console-log viewer for the admin "База даних" tab — reuses the exact
+    same peer-to-peer relay call the Power Share admin log viewer already
+    had (see discovery_service.fetch_peer_log), resolved by team device_id
+    instead of the power-share peer_id (see fetch_log_by_device_id). Prefers
+    a live fetch while that person is online; falls back to their last
+    pushed snapshot otherwise — see fetch_log_by_device_id's own docstring."""
     if not team_service.is_app_admin(_active_profile_name(db)):
         raise HTTPException(403, "Лише адмін програми може переглядати журнали інших")
     from ..services import discovery_service
     try:
-        return {"content": discovery_service.fetch_log_by_device_id(device_id, filename)}
+        return discovery_service.fetch_log_by_device_id(device_id, filename)
     except ValueError as e:
         raise HTTPException(400, str(e))
     except TimeoutError:
         raise HTTPException(504, "Користувач не відповів вчасно")
+
+
+@router.post("/log-snapshot")
+def push_log_snapshot():
+    """Called by Electron's before-quit handler so this machine's logs land
+    in R2 while it's still online — the periodic push in the signaling loop
+    only runs every LOG_SNAPSHOT_INTERVAL_SECONDS, so without this a crash
+    or a quit right after one could leave an admin looking at a snapshot up
+    to 15 minutes stale. No admin check: this only ever uploads the caller's
+    OWN logs, which it already pushes unprompted on that same timer."""
+    from ..services import discovery_service
+    discovery_service.push_own_log_snapshot()
+    return {"ok": True}
 
 
 @router.delete("/users/{device_id}")
@@ -352,6 +399,12 @@ def mvsep_models():
     # to expose regardless of eligibility, same as any other model list.
     from ..services import mvsep_service
     return mvsep_service.get_public_categories()
+
+
+@router.get("/mvsep-male-female-models")
+def mvsep_male_female_models():
+    from ..services import mvsep_service
+    return mvsep_service.get_male_female_models()
 
 
 @router.get("/mvsep-balance")

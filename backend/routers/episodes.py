@@ -4,7 +4,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -72,8 +72,17 @@ def delete_episode_files(episode_id: int) -> None:
     for the next insert, a brand new episode/title can end up reading a
     leftover file (e.g. vocal_isolated.wav) from a completely different,
     already-deleted show that happened to get the same id."""
+    import time as _time
     ep_dir = Path(DATA_DIR) / "episodes" / str(episode_id)
-    shutil.rmtree(ep_dir, ignore_errors=True)
+    # Windows keeps files locked while a just-cancelled ffmpeg/separation
+    # thread still has them open: retry briefly instead of silently leaving
+    # orphans behind (they'd be picked up when SQLite reuses the id).
+    for _attempt in range(5):
+        shutil.rmtree(ep_dir, ignore_errors=True)
+        if not ep_dir.exists():
+            return
+        _time.sleep(0.4)
+    app_logger.warning("delete_episode_files: could not fully remove %s (files still locked?)", ep_dir)
 
 
 def _episode_out(ep: Episode, db: Session) -> EpisodeOut:
@@ -358,14 +367,15 @@ async def delete_episode(ep_id: int, permanent: bool = False, db: Session = Depe
         if not sync_service.delete_shared_episode(shared_id, team_id, device_id, strict=True):
             raise HTTPException(502, "Не вдалося видалити серію у хмарі — спробуйте ще раз")
 
+    # Cancel jobs FIRST so a running ffmpeg/separation stops writing into the
+    # directory we're about to remove; the frontend is told below so it stops
+    # showing a stale percent for a job whose episode no longer exists.
+    cancelled_ids = job_manager.cancel_jobs_for_episode(ep_id)
+
     db.delete(ep)
     db.commit()
     delete_episode_files(ep_id)
 
-    # Cancel any job still running for this episode (e.g. an ffmpeg import in
-    # progress) and tell the frontend so it stops showing a stale percent for
-    # a job whose episode no longer exists.
-    cancelled_ids = job_manager.cancel_jobs_for_episode(ep_id)
     if cancelled_ids and job_manager._ws_broadcast:
         for job_id in cancelled_ids:
             await job_manager._ws_broadcast({"type": "error", "job_id": job_id, "error": "Серію видалено"})
@@ -569,6 +579,11 @@ async def use_batch_result(ep_id: int, request: Request, db: Session = Depends(g
     from ..services.separator_service import _archive_previous_isolation
     _archive_previous_isolation(ep, Path(DATA_DIR) / "episodes" / str(ep_id))
     ep.vocal_stem_path = path
+    # The archive above moved the previous vocal-only file away — adopt the
+    # picked model's own saved vocal (see run_mvsep_batch_separation), or
+    # clear the pointer instead of leaving it aimed at the archived file.
+    sibling_vocal = Path(path).with_name(Path(path).stem + "_vocals" + Path(path).suffix)
+    ep.vocal_only_stem_path = str(sibling_vocal) if sibling_vocal.is_file() else None
     ep.last_separation_model = "Пакетний рендер"
     ep.status = "vocal_isolated"
     bump_title_in_progress(db, ep.title_id)
@@ -578,11 +593,14 @@ async def use_batch_result(ep_id: int, request: Request, db: Session = Depends(g
 
 
 @router.post("/episodes/{ep_id}/mvsep-male-female")
-async def mvsep_male_female(ep_id: int, db: Session = Depends(get_db)):
+async def mvsep_male_female(ep_id: int, body: dict = Body(default={}), db: Session = Depends(get_db)):
     """"Take a model, separate the vocal, then split THAT into male/female"
     — requires a vocal already isolated (any method, local or MVSep) so
     this doesn't spend a redundant round of MVSep credits re-extracting one
-    from scratch; see run_mvsep_male_female_split's own docstring."""
+    from scratch; see run_mvsep_male_female_split's own docstring.
+    Optional body {"add_opt1": "..."} picks which underlying model (see
+    mvsep_service.MALE_FEMALE_MODELS / GET /teams/mvsep-male-female-models)
+    — omitted or None keeps the previous fixed MelRoformer default."""
     ep = db.get(Episode, ep_id)
     if not ep:
         raise HTTPException(404)
@@ -595,10 +613,11 @@ async def mvsep_male_female(ep_id: int, db: Session = Depends(get_db)):
     if not profile or not team_service.is_credits_eligible(profile.name):
         raise HTTPException(403, "MVSep недоступний для цього профілю")
 
+    add_opt1 = body.get("add_opt1")
     job = job_manager.create_job("mvsep_male_female", episode_id=ep_id)
     from ..services.separator_service import run_mvsep_male_female_split
     loop = asyncio.get_event_loop()
-    asyncio.create_task(job_manager.run_job(loop, job, lambda r: run_mvsep_male_female_split(ep_id, r)))
+    asyncio.create_task(job_manager.run_job(loop, job, lambda r: run_mvsep_male_female_split(ep_id, r, add_opt1=add_opt1)))
     return {"job_id": job.id}
 
 
@@ -607,7 +626,7 @@ def get_separation_history(ep_id: int, db: Session = Depends(get_db)):
     """Past isolation results for this episode, archived automatically each
     time a new run (or a batch-result pick) would otherwise silently
     overwrite the current instrumental — see separator_service's
-    _archive_previous_isolation. Auto-deleted after 48h (cleanup_stale_
+    _archive_previous_isolation. Auto-deleted after 4 days (cleanup_stale_
     separation_history, run periodically from main.py's lifespan)."""
     if not db.get(Episode, ep_id):
         raise HTTPException(404)

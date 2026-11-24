@@ -366,7 +366,7 @@ function PosterModal({ titleId, defaultQuery, onClose, onSaved }: PosterModalPro
     if (!selected?.image) return
     setSaving(true)
     try {
-      const updated = await post<Title>(`/titles/${titleId}/poster-from-url`, { image_url: selected.image })
+      const updated = await post<Title>(`/titles/${titleId}/poster-from-url`, { image_url: selected.image, hikka_slug: selected.slug })
       onSaved(updated)
     } catch {
       // ignore — keep modal open so the user can retry

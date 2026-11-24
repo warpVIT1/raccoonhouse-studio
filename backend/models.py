@@ -14,6 +14,9 @@ class Title(Base):
     poster_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="new")  # new/in_progress/done
     show_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)  # for SRT filename
+    # Hikka catalog slug this title was matched to: lets the roles tab fetch
+    # the anime's real character list/portraits instead of guessing by name.
+    hikka_slug: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     # None = personal, local-only (today's behavior, unchanged). Set the
     # moment a title is created with the "Спільний з командою" toggle on —
     # see services/sync_service.py, the only writer of these two columns.
@@ -144,6 +147,12 @@ class Character(Base):
     # GET /team-actors and routers/characters.py's find-or-create-by-
     # team_device_id path.
     team_device_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Portrait shown on the director's roles tab (Hikka CDN URL, loaded live).
+    image_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    # The name this role had in the subtitle file (ASS "Name"). Kept when the
+    # director renames the role (e.g. to Ukrainian) so "Зібрати ролі" still
+    # matches the original name instead of re-creating it.
+    source_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     title: Mapped["Title"] = relationship("Title", back_populates="characters")
     dubber_maps: Mapped[list["CharacterDubberMap"]] = relationship("CharacterDubberMap", back_populates="character", cascade="all, delete-orphan")

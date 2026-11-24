@@ -10,7 +10,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Prompts for a folder and copies a local file there — see
   // electron/main.ts's fs:saveFileToChosenFolder. Returns the saved path,
   // or null if the user cancelled the folder picker.
-  saveFileToChosenFolder: (sourcePath: string) => ipcRenderer.invoke('fs:saveFileToChosenFolder', sourcePath),
+  saveFileToChosenFolder: (sourcePaths: string | string[]) => ipcRenderer.invoke('fs:saveFileToChosenFolder', sourcePaths),
   openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url),
   platform: process.platform,
 
@@ -37,6 +37,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Auto-update
   checkForUpdate: () => ipcRenderer.invoke('update:check'),
+  getUpdateState: () => ipcRenderer.invoke('update:getState'),
   downloadUpdate: () => ipcRenderer.invoke('update:download'),
   installUpdate: () => ipcRenderer.invoke('update:install'),
   onUpdateStatus: (callback: (status: Record<string, unknown>) => void) => {

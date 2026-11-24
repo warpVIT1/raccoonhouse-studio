@@ -8,6 +8,8 @@ __pycache__/
 *.pyo
 build-pyinstaller/
 backend-dist/
+backend-dist-actor/
+release-actor/
 *.db
 *.sqlite
 *.log

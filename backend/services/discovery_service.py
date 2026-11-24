@@ -129,19 +129,58 @@ def get_discovered_peers() -> list[dict]:
         ]
 
 
-def broadcast_force_update_request(from_name: str) -> int:
-    """Admin action — nudges every currently-online peer to go check for an
-    update, regardless of what version each one happens to be running (the
-    admin may know a release is out that the auto-updater's own periodic
-    check hasn't caught yet, or just wants everyone reminded). Fire-and-
-    forget to every peer's own relay id, no reply expected — this is a
-    notice, not a request/response call. Returns how many peers were sent it."""
-    peers = get_discovered_peers()
+def publish_update_notice(from_name: str) -> "dict | None":
+    """Stores the "everyone please update" notice on the Worker so peers that
+    are OFFLINE right now still see it on their next launch (the relay push
+    below only reaches whoever is online at this instant). Returns
+    {id, from_name, created_at}, or None if the Worker is unreachable / not
+    yet redeployed with the /update-notice route — the live push still goes
+    out either way."""
+    base = get_https_base()
+    if not base:
+        return None
+    try:
+        resp = requests.post(f"{base}/update-notice", json={"from_name": from_name}, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        app_logger.warning("publish_update_notice failed: %s", e)
+        return None
+
+
+def fetch_update_notice() -> "dict | None":
+    """The latest stored "everyone please update" notice, or None."""
+    base = get_https_base()
+    if not base:
+        return None
+    try:
+        resp = requests.get(f"{base}/update-notice", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) and data.get("id") else None
+    except Exception as e:
+        app_logger.warning("fetch_update_notice failed: %s", e)
+        return None
+
+
+def broadcast_force_update_request(from_name: str) -> dict:
+    """Admin action — asks everyone to go check for an update, regardless of
+    what version each one happens to be running. Two channels: (1) the notice
+    is saved on the Worker (see publish_update_notice) so it reaches peers
+    that are offline now, shown once per install at its next launch; (2) a
+    live relay push to every currently-online peer, carrying the same notice
+    id so the two channels never show the banner twice. Returns
+    {"sent": <online peers reached>, "notice": <saved notice or None>}."""
+    notice = publish_update_notice(from_name)
+    payload = {"kind": "force_update_request", "from_name": from_name}
+    if notice:
+        payload["notice_id"] = notice["id"]
+        payload["created_at"] = notice.get("created_at")
     sent = 0
-    for peer in peers:
-        if send_relay(peer["id"], {"kind": "force_update_request", "from_name": from_name}):
+    for peer in get_discovered_peers():
+        if send_relay(peer["id"], payload):
             sent += 1
-    return sent
+    return {"sent": sent, "notice": notice}
 
 
 def start(backend_port: int):
@@ -686,6 +725,22 @@ def send_relay(target_id: str, payload: dict) -> bool:
 # to a peer's "view logs" admin feature (see _handle_log_fetch_request).
 LOG_FILENAMES = ["app.log", "power_share.log", "electron.log"]
 LOG_TAIL_BYTES = 200_000
+LOG_SNAPSHOT_INTERVAL_SECONDS = 900
+
+
+def _read_log_tail(filename: str) -> str:
+    """Bounded tail read straight off disk (not the whole file — electron.log
+    has no rotation cap, and even the rotated Python logs can be a few MB
+    across their backups). Shared by the live relay handler below and the
+    periodic snapshot pusher."""
+    path = os.path.join(pss.LOG_DIR, filename)
+    if not os.path.isfile(path):
+        return ""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        if size > LOG_TAIL_BYTES:
+            f.seek(size - LOG_TAIL_BYTES)
+        return f.read().decode("utf-8", errors="replace")
 
 
 def fetch_peer_log(peer_id: str, filename: str) -> str:
@@ -699,42 +754,100 @@ def fetch_peer_log(peer_id: str, filename: str) -> str:
     return result.get("content", "")
 
 
-def fetch_log_by_device_id(device_id: str, filename: str) -> str:
-    """Same live log fetch as fetch_peer_log above, but addressed by the
-    admin "База даних" tab's own device_id (team_device_id) rather than the
-    power-share peer_id — those are different id spaces (peer_id is the
-    ephemeral per-launch client_id, team_device_id is the stable per-
-    profile team identity), and the tab only ever knows the latter. Only
-    works while that person is actually online right now (their own
-    _instance_id has to be live in the peer registry to answer the relay
-    call at all) — there's no offline/queued fallback."""
+def _fetch_log_snapshot(device_id: str, filename: str) -> "dict | None":
+    """Pulls the last snapshot this device pushed via _push_log_snapshot
+    (store-and-forward through the Worker's R2 bucket — see the
+    /log-snapshot/:deviceId/:filename routes in cloudflare-signaling).
+    Returns None if this device has never pushed one (e.g. never updated
+    since this feature shipped, or genuinely never been online long enough
+    to hit the first push)."""
+    base = get_https_base()
+    if not base:
+        return None
+    try:
+        resp = requests.get(f"{base}/log-snapshot/{device_id}/{filename}", timeout=15)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return None
+
+
+def fetch_log_by_device_id(device_id: str, filename: str) -> dict:
+    """Addressed by the admin "База даних" tab's own device_id
+    (team_device_id) rather than the power-share peer_id — those are
+    different id spaces (peer_id is the ephemeral per-launch client_id,
+    team_device_id is the stable per-profile team identity), and the tab
+    only ever knows the latter.
+
+    Prefers a LIVE fetch (fresh, straight off that machine's disk) whenever
+    the target is online right now. Falls back to the last snapshot that
+    machine pushed to the Worker (see _push_log_snapshot) when it's
+    offline, so the admin isn't fully blocked just because nobody happens
+    to be running the app at that moment — the trade-off is staleness,
+    surfaced via the returned `live`/`snapshot_at` fields rather than
+    hidden from the caller."""
+    if filename not in LOG_FILENAMES:
+        raise ValueError(f"Невідомий файл журналу: {filename}")
     peer = next((p for p in get_discovered_peers() if p.get("team_device_id") == device_id), None)
-    if not peer:
-        raise ValueError("Користувач зараз не в мережі")
-    return fetch_peer_log(peer["id"], filename)
+    if peer:
+        try:
+            return {"content": fetch_peer_log(peer["id"], filename), "live": True, "snapshot_at": None}
+        except (TimeoutError, ValueError):
+            pass  # fall through to the snapshot below rather than failing outright
+    snapshot = _fetch_log_snapshot(device_id, filename)
+    if snapshot is None:
+        raise ValueError("Користувач зараз не в мережі, і знімок журналів ще не публікувався")
+    return {"content": snapshot.get("content", ""), "live": False, "snapshot_at": snapshot.get("uploaded_at")}
+
+
+def _push_log_snapshot(team_device_id: str) -> None:
+    """Best-effort periodic push of this machine's own log tails to the
+    Worker (see _online_signaling_loop), so fetch_log_by_device_id above has
+    something to fall back to once this machine goes offline. Never allowed
+    to disrupt the signaling loop it's called from — any failure (offline,
+    Worker unreachable) is swallowed silently, same posture as
+    _dispatch_report in separator_service.py."""
+    base = get_https_base()
+    if not base or not team_device_id:
+        return
+    for filename in LOG_FILENAMES:
+        try:
+            content = _read_log_tail(filename)
+            requests.put(
+                f"{base}/log-snapshot/{team_device_id}/{filename}",
+                json={"content": content},
+                timeout=15,
+            )
+        except Exception:
+            pass
+
+
+def push_own_log_snapshot() -> None:
+    """Pushes this machine's own log snapshot immediately, resolving the
+    team_device_id from the state provider itself. Same best-effort posture
+    as _push_log_snapshot — used by the app-shutdown hook (see
+    POST /teams/log-snapshot) so the freshest possible logs are already in
+    R2 by the time this machine goes offline, rather than whatever the
+    15-minute periodic push last managed to leave there."""
+    _, _, _, team_device_id, _, _, _ = (
+        _state_provider() if _state_provider else ("?", False, False, "", [], None, None)
+    )
+    _push_log_snapshot(team_device_id)
 
 
 def _handle_log_fetch_request(from_id: str, payload: dict):
     """Runs on the machine WHOSE logs are being viewed — reads a bounded tail
-    (not the whole file — electron.log has no rotation cap, and even the
-    rotated Python logs can be a few MB across their backups) straight off
-    disk and relays it back. Read-only by construction: there is no matching
-    'write'/'edit' relay kind anywhere in this module."""
+    off disk and relays it back. Read-only by construction: there is no
+    matching 'write'/'edit' relay kind anywhere in this module."""
     filename = payload.get("filename", "")
     request_id = payload.get("request_id", "")
     if filename not in LOG_FILENAMES:
         send_relay(from_id, {"kind": "log_fetch_response", "request_id": request_id, "error": "Невідомий файл журналу"})
         return
-    path = os.path.join(pss.LOG_DIR, filename)
     try:
-        if not os.path.isfile(path):
-            content = ""
-        else:
-            size = os.path.getsize(path)
-            with open(path, "rb") as f:
-                if size > LOG_TAIL_BYTES:
-                    f.seek(size - LOG_TAIL_BYTES)
-                content = f.read().decode("utf-8", errors="replace")
+        content = _read_log_tail(filename)
         send_relay(from_id, {"kind": "log_fetch_response", "request_id": request_id, "content": content})
     except Exception as exc:
         send_relay(from_id, {"kind": "log_fetch_response", "request_id": request_id, "error": str(exc)})
@@ -835,7 +948,10 @@ def _handle_relay(from_id: str, payload: dict):
         return
 
     if kind == "force_update_request":
-        broadcast_local({"type": "force_update_request", "data": {"from_name": payload.get("from_name", "Адмін")}})
+        broadcast_local({"type": "force_update_request", "data": {
+            "from_name": payload.get("from_name", "Адмін"),
+            "id": payload.get("notice_id"),
+        }})
         return
 
     if kind == "team_invite":
@@ -1081,6 +1197,15 @@ def _online_signaling_loop(backend_port: int, gpu: dict):
                 SHARED_SYNC_INTERVAL_SECONDS = 300
                 threading.Thread(target=_pull_all_shared_teams, daemon=True).start()
                 last_shared_sync = time.monotonic()
+
+                # Same fire-immediately-then-periodic shape as the shared-sync
+                # above — this is what lets fetch_log_by_device_id fall back
+                # to a recent snapshot once this machine goes offline (see
+                # its docstring), so a fresh connect/reconnect should push
+                # one right away rather than waiting up to
+                # LOG_SNAPSHOT_INTERVAL_SECONDS for the first one.
+                threading.Thread(target=push_own_log_snapshot, daemon=True).start()
+                last_log_snapshot = time.monotonic()
                 while True:
                     if time.monotonic() - last_heartbeat >= ONLINE_SIGNALING_HEARTBEAT_SECONDS:
                         send_hello()
@@ -1088,6 +1213,9 @@ def _online_signaling_loop(backend_port: int, gpu: dict):
                     if time.monotonic() - last_shared_sync >= SHARED_SYNC_INTERVAL_SECONDS:
                         threading.Thread(target=_pull_all_shared_teams, daemon=True).start()
                         last_shared_sync = time.monotonic()
+                    if time.monotonic() - last_log_snapshot >= LOG_SNAPSHOT_INTERVAL_SECONDS:
+                        threading.Thread(target=push_own_log_snapshot, daemon=True).start()
+                        last_log_snapshot = time.monotonic()
                     try:
                         raw = ws.recv(timeout=ONLINE_SIGNALING_HEARTBEAT_SECONDS)
                     except TimeoutError:

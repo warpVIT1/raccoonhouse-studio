@@ -789,6 +789,30 @@ export default {
       return new Response(null, { status: 204 });
     }
 
+    // "Everyone please update" notice board. The relay push (kind
+    // force_update_request) only reaches peers that are online at that
+    // instant; this stores the latest notice so every install picks it up
+    // on its next launch/poll regardless. One slot, overwritten by each new
+    // broadcast — its id changes every time, and each client shows a given
+    // id at most once.
+    if (url.pathname === "/update-notice" && request.method === "POST") {
+      const body = await request.json().catch(() => null) as { from_name?: string } | null;
+      const notice = {
+        id: crypto.randomUUID(),
+        from_name: (body?.from_name ?? "").toString().trim().slice(0, 100) || "Адмін",
+        created_at: new Date().toISOString(),
+      };
+      await env.TRANSFERS.put("announcements/update-notice.json", JSON.stringify(notice));
+      return Response.json(notice);
+    }
+
+    if (url.pathname === "/update-notice" && request.method === "GET") {
+      const obj = await env.TRANSFERS.get("announcements/update-notice.json");
+      return new Response(obj ? await obj.text() : "null", {
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
+      });
+    }
+
     if (url.pathname === "/feedback" && request.method === "POST") {
       const body = await request.json().catch(() => null) as { nickname?: string; device_id?: string; message?: string } | null;
       const nickname = (body?.nickname ?? "").toString().trim().slice(0, 100) || "Анонім";
@@ -1250,11 +1274,13 @@ export default {
     const sharedCharacterMatch = url.pathname.match(/^\/shared-characters\/([A-Za-z0-9_-]+)$/);
     if (sharedCharacterMatch && request.method === "PUT") {
       const id = sharedCharacterMatch[1];
-      const body = await request.json().catch(() => null) as { team_device_id?: string | null } | null;
+      const body = await request.json().catch(() => null) as { team_device_id?: string | null; name?: string | null } | null;
       const now = new Date().toISOString();
+      // `name` is optional (a rename); clients that don't send it leave the stored name alone.
+      const newName = typeof body?.name === "string" && body.name.trim() ? body.name.trim() : null;
       await env.MODELS_DB.prepare(
-        `UPDATE shared_characters SET team_device_id = ?, updated_at = ? WHERE id = ?`,
-      ).bind(body?.team_device_id ?? null, now, id).run();
+        `UPDATE shared_characters SET team_device_id = ?, name = COALESCE(?, name), updated_at = ? WHERE id = ?`,
+      ).bind(body?.team_device_id ?? null, newName, now, id).run();
       return Response.json({ ok: true });
     }
 
@@ -1751,6 +1777,36 @@ export default {
       return new Response(await obj.text(), { headers: { "Content-Type": "application/json" } });
     }
 
+    // Store-and-forward fallback for the admin log viewer (discovery_service.
+    // fetch_peer_log) — that path is a LIVE peer-to-peer relay and only works
+    // while the target machine is online right now. Each client periodically
+    // pushes its own log tails here (see discovery_service._push_log_snapshot,
+    // called from _online_signaling_loop) so a snapshot survives after that
+    // machine goes offline. Single-blob-per-file, same overwrite-in-place
+    // pattern as mvsep-config.json above — only the latest snapshot is kept,
+    // no history. Not device-authenticated (matches this Worker's overall
+    // trust model — see ProfileModal.tsx's "trusted circle, not real
+    // security" comment): a device can only ever push its OWN snapshot
+    // because the backend always addresses this with its own team_device_id.
+    const logSnapshotMatch = url.pathname.match(/^\/log-snapshot\/([^/]+)\/([^/]+)$/);
+    if (logSnapshotMatch) {
+      const [, deviceId, filename] = logSnapshotMatch;
+      const key = `log-snapshot/${deviceId}/${filename}.json`;
+      if (request.method === "PUT") {
+        const body = await request.json().catch(() => null) as { content?: string } | null;
+        if (!body || typeof body.content !== "string") {
+          return new Response("content is required", { status: 400 });
+        }
+        await env.TRANSFERS.put(key, JSON.stringify({ content: body.content, uploaded_at: new Date().toISOString() }));
+        return new Response(null, { status: 204 });
+      }
+      if (request.method === "GET") {
+        const obj = await env.TRANSFERS.get(key);
+        if (!obj) return new Response("Not found", { status: 404 });
+        return new Response(await obj.text(), { headers: { "Content-Type": "application/json" } });
+      }
+    }
+
     // Lets the admin bump the recommended audio-separator (the Python
     // separation library, not an app version) without shipping a new
     // RaccoonHouse release — see backend/services/lib_runtime_service.py,
@@ -2092,7 +2148,11 @@ export default {
           }),
         }).catch(() => {});
       }
-      return Response.json({ ok: true });
+      // device_id/team_id let the backend push an immediate shared_content_updated
+      // relay to the just-approved device (see team_service.respond_to_join_request) —
+      // without this, someone accepted via the Telegram bot only sees the
+      // team's titles after their own next periodic pull, not instantly.
+      return Response.json({ ok: true, device_id: reqRow.device_id, team_id: reqRow.team_id });
     }
 
     const teamCreditsMatch = url.pathname.match(/^\/teams\/([A-Za-z0-9]+)\/credits$/);
@@ -2275,6 +2335,90 @@ export default {
         r2_object_count: r2Objects,
         percent_of_free_tier: Math.round((r2Bytes / R2_FREE_TIER_BYTES) * 1000) / 10,
       });
+    }
+
+    // Which R2 key prefix belongs to which human-facing category. Order
+    // matters only in that every key is matched against this list in order
+    // and the first hit wins; anything unmatched falls into "other" rather
+    // than being silently dropped, so the per-category sizes always add up
+    // to the bucket total reported by /admin/db-stats.
+    const R2_CATEGORIES: { id: string; prefix: string }[] = [
+      { id: "episode_video", prefix: "rh-team-video-" },
+      { id: "actor_video", prefix: "rh-team-actorvideo-" },
+      { id: "cleaned_video", prefix: "rh-team-cleanedvideo-" },
+      { id: "actor_audio", prefix: "rh-team-actoraudio-" },
+      { id: "log_snapshot", prefix: "log-snapshot/" },
+      { id: "reports", prefix: "reports/" },
+      { id: "feedback", prefix: "feedback/" },
+      { id: "errors", prefix: "errors/" },
+      { id: "test_junk", prefix: "rh-test-" },
+    ];
+
+    function categoryOf(key: string): string {
+      for (const c of R2_CATEGORIES) if (key.startsWith(c.prefix)) return c.id;
+      if (key === "smoketest456") return "test_junk";
+      return "other";
+    }
+
+    // Per-category breakdown for the admin storage panel — one full bucket
+    // scan grouped by the prefixes above, plus the newest/oldest timestamps
+    // per group so "is this stale junk or live data" is answerable from the
+    // UI without a separate /admin/r2-objects dump.
+    if (url.pathname === "/admin/r2-breakdown" && request.method === "GET") {
+      const groups = new Map<string, { bytes: number; count: number; newest: string | null; oldest: string | null }>();
+      let cursor: string | undefined;
+      do {
+        const listed: R2Objects = await env.TRANSFERS.list(cursor ? { cursor, limit: 1000 } : { limit: 1000 });
+        for (const o of listed.objects) {
+          const id = categoryOf(o.key);
+          const g = groups.get(id) ?? { bytes: 0, count: 0, newest: null, oldest: null };
+          const uploaded = o.uploaded.toISOString();
+          g.bytes += o.size;
+          g.count++;
+          if (!g.newest || uploaded > g.newest) g.newest = uploaded;
+          if (!g.oldest || uploaded < g.oldest) g.oldest = uploaded;
+          groups.set(id, g);
+        }
+        cursor = listed.truncated ? listed.cursor : undefined;
+      } while (cursor);
+
+      return Response.json(
+        [...groups.entries()]
+          .map(([id, g]) => ({ id, ...g }))
+          .sort((a, b) => b.bytes - a.bytes)
+      );
+    }
+
+    // Deletes every object in ONE category (see R2_CATEGORIES above), so the
+    // admin panel can clear e.g. accumulated log snapshots or old error
+    // reports without the all-or-nothing /admin/wipe-r2 below. Requires
+    // ?confirm=yes-delete for the same reason the other destructive routes
+    // here do. "other" is deliberately NOT deletable — it's the catch-all
+    // for keys no category claims (the Apex model catalog, MVSep config,
+    // telegram-login codes), which are live config, not disposable content.
+    const categoryPurgeMatch = url.pathname.match(/^\/admin\/r2-purge\/([a-z_]+)$/);
+    if (categoryPurgeMatch && request.method === "POST") {
+      const categoryId = categoryPurgeMatch[1];
+      if (url.searchParams.get("confirm") !== "yes-delete") {
+        return new Response("Pass ?confirm=yes-delete to actually run this", { status: 400 });
+      }
+      if (categoryId === "other" || !R2_CATEGORIES.some((c) => c.id === categoryId)) {
+        return new Response("Unknown or non-purgeable category", { status: 400 });
+      }
+      let deletedCount = 0;
+      let freedBytes = 0;
+      let cursor: string | undefined;
+      do {
+        const listed: R2Objects = await env.TRANSFERS.list(cursor ? { cursor, limit: 1000 } : { limit: 1000 });
+        for (const o of listed.objects) {
+          if (categoryOf(o.key) !== categoryId) continue;
+          await env.TRANSFERS.delete(o.key);
+          deletedCount++;
+          freedBytes += o.size;
+        }
+        cursor = listed.truncated ? listed.cursor : undefined;
+      } while (cursor);
+      return Response.json({ deleted_count: deletedCount, freed_bytes: freedBytes });
     }
 
     // Diagnostic companion to /admin/db-stats above (2026-09-09) — the
@@ -2581,15 +2725,16 @@ export default {
         }).catch(() => {}); // best-effort — a failed confirmation message shouldn't fail the login itself
       }
 
-      // `join <team_id>` — lets a person who has already logged into the app
-      // via Telegram once (so their telegram_id is on file in known_devices,
-      // see the /start block above) request to join a team without an admin
-      // having to type their device_id by hand. Creates a pending
-      // team_join_requests row; team admins accept/decline it from
-      // TeamsPage.tsx's "Заявки на вступ" section. Does NOT touch
+      // `join <team_id>` or `/join <team_id>` (Telegram auto-suggests slash
+      // commands, so both spellings must work) — lets a person who has
+      // already logged into the app via Telegram once (so their telegram_id
+      // is on file in known_devices, see the /start block above) request to
+      // join a team without an admin having to type their device_id by hand.
+      // Creates a pending team_join_requests row; team admins accept/decline
+      // it from TeamsPage.tsx's "Заявки на вступ" section. Does NOT touch
       // team_invites or /teams/join (name+password) at all — additional
       // path, not a replacement.
-      const joinMatch = message?.text?.match(/^join\s+(\S+)/i);
+      const joinMatch = message?.text?.match(/^\/?join(?:@\S+)?\s+(\S+)/i);
       if (joinMatch && message?.from) {
         const teamId = joinMatch[1].trim();
         const from = message.from;

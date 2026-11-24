@@ -1638,7 +1638,25 @@ def _report_separation_run(episode_id: int, model_name: str, ensemble: bool, dis
         _dispatch_report(report)
 
 
-HISTORY_MAX_AGE_HOURS = 48
+HISTORY_MAX_AGE_HOURS = 96  # 4 days
+
+
+def _archive_file(src: str, dest: Path) -> bool:
+    """shutil.move that survives Windows refusing to delete the source while
+    something has it open (the audio player / waveform streaming it): a move
+    across that is copy-then-delete, so when only the delete fails the copy
+    is already complete — count that as archived and leave the source where
+    it is (the next isolation overwrites it anyway). Previously the
+    exception aborted _archive_previous_isolation before it ever got to the
+    vocal-only file, leaving a history entry with no vocal to download."""
+    try:
+        shutil.move(src, dest)
+        return True
+    except OSError:
+        try:
+            return dest.is_file() and dest.stat().st_size == os.path.getsize(src)
+        except OSError:
+            return False
 
 
 def _archive_previous_isolation(ep: "Episode", ep_dir: Path) -> None:
@@ -1657,18 +1675,14 @@ def _archive_previous_isolation(ep: "Episode", ep_dir: Path) -> None:
     label = _sanitize_filename(ep.last_separation_model or "модель")
     ext = Path(ep.vocal_stem_path).suffix or ".wav"
     dest = history_dir / f"{stamp}_{label}{ext}"
-    try:
-        shutil.move(ep.vocal_stem_path, dest)
-    except OSError:
-        app_logger.exception("_archive_previous_isolation: failed to archive %s", ep.vocal_stem_path)
+    if not _archive_file(ep.vocal_stem_path, dest):
+        app_logger.error("_archive_previous_isolation: failed to archive %s", ep.vocal_stem_path)
         return
     if ep.vocal_only_stem_path and os.path.isfile(ep.vocal_only_stem_path):
         only_ext = Path(ep.vocal_only_stem_path).suffix or ".wav"
         dest_only = history_dir / f"{stamp}_{label}_only{only_ext}"
-        try:
-            shutil.move(ep.vocal_only_stem_path, dest_only)
-        except OSError:
-            pass
+        if not _archive_file(ep.vocal_only_stem_path, dest_only):
+            app_logger.error("_archive_previous_isolation: failed to archive %s", ep.vocal_only_stem_path)
 
 
 def snapshot_current_into_history(ep: "Episode", ep_dir: Path) -> None:
@@ -1707,8 +1721,8 @@ def snapshot_current_into_history(ep: "Episode", ep_dir: Path) -> None:
 def list_separation_history(episode_id: int) -> list[dict]:
     """Every archived past isolation for this episode, newest first — see
     _archive_previous_isolation. Only the main instrumental half of each
-    archived pair is listed (the "_only" vocal-only counterpart is an
-    internal VAD input, not something to browse/listen to here)."""
+    archived pair is listed for browsing/listening; the "_only" vocal-only
+    counterpart is reported as vocal_path so downloading can include it."""
     history_dir = Path(DATA_DIR) / "episodes" / str(episode_id) / "stems" / "history"
     if not history_dir.is_dir():
         return []
@@ -1724,9 +1738,16 @@ def list_separation_history(episode_id: int) -> list[dict]:
             created = datetime.strptime(f"{date_part}_{time_part}", "%Y%m%d_%H%M%S")
         except ValueError:
             continue
+        # The archived "_only" file (the vocal that was cut out) sits next
+        # to the instrumental under the same stamp/label — expose it so the
+        # UI can offer both when downloading.
+        vocal_counterpart = next(
+            (c for c in history_dir.glob(f"{f.stem}_only.*") if c.is_file()), None
+        )
         items.append({
             "filename": f.name,
             "path": str(f),
+            "vocal_path": str(vocal_counterpart) if vocal_counterpart else None,
             "model": label.replace("_", " "),
             "created_at": created.isoformat(),
         })
@@ -1774,7 +1795,7 @@ def restore_separation_history(episode_id: int, filename: str, db: Session) -> d
 
 def cleanup_stale_separation_history() -> int:
     """Deletes individual stems/history/ files older than
-    HISTORY_MAX_AGE_HOURS (48h) — unlike the batch-comparison library (one
+    HISTORY_MAX_AGE_HOURS (4 days) — unlike the batch-comparison library (one
     folder created and discarded as a whole, see
     cleanup_stale_batch_libraries), history entries accumulate one at a time
     over an episode's entire working life, so each file's own age is
@@ -1982,13 +2003,13 @@ def separate_file_batch(
     return results
 
 
-BATCH_LIBRARY_MAX_AGE_HOURS = 48
+BATCH_LIBRARY_MAX_AGE_HOURS = 96  # 4 days
 
 
 def cleanup_stale_batch_libraries() -> int:
     """Deletes any per-episode batch-separation folder (separate_file_batch's
     "every model, listen and pick" library) older than
-    BATCH_LIBRARY_MAX_AGE_HOURS (48h) — it's meant as a temporary A/B
+    BATCH_LIBRARY_MAX_AGE_HOURS (4 days) — it's meant as a temporary A/B
     comparison while deciding which model to render with, not permanent
     storage, and every curated model's own FLAC output can add up to
     several GB per episode across ~29 models. Called periodically from
@@ -2055,8 +2076,8 @@ def run_mvsep_batch_separation(
     """MVSep equivalent of run_batch_separation above — but unlike the local
     batch (which always runs every free local model, no picking), MVSep
     costs real studio credits per model run, so the caller explicitly picks
-    which ones to spend on rather than everything in MVSEP_CATEGORIES
-    running unattended. Runs strictly one at a time (MVSep itself only
+    which ones to spend on rather than the whole live catalog (see
+    mvsep_service.get_public_categories) running unattended. Runs strictly one at a time (MVSep itself only
     allows 1 concurrent job per non-Premium account) and, like the local
     batch, keeps every result as its own separate file — same
     {"<label>": path} shape as separate_file_batch's `results`, so
@@ -2079,6 +2100,7 @@ def run_mvsep_batch_separation(
         output_dir.mkdir(parents=True, exist_ok=True)
 
         results: dict[str, str] = {}
+        vocals: dict[str, str] = {}
         total = len(models)
         for idx, m in enumerate(models):
             if reporter.cancelled:
@@ -2097,14 +2119,24 @@ def run_mvsep_batch_separation(
             dest = output_dir / f"{_sanitize_filename(label)}.wav"
             shutil.copy2(result["instrumental_path"], dest)
             results[f"MVSep — {label}"] = str(dest)
+            # MVSep already returns the cut-out vocal alongside the
+            # instrumental — keep it right away (<label>_vocals.wav, same
+            # folder, cleaned up with the rest of the batch library after
+            # BATCH_LIBRARY_MAX_AGE_HOURS) so picking this result later can
+            # restore BOTH files instead of an instrumental with no vocal.
+            vocal_src = result.get("vocal_path")
+            if vocal_src and os.path.isfile(vocal_src):
+                vocal_dest = output_dir / f"{_sanitize_filename(label)}_vocals.wav"
+                shutil.copy2(vocal_src, vocal_dest)
+                vocals[f"MVSep — {label}"] = str(vocal_dest)
 
         app_logger.info("run_mvsep_batch_separation: episode %s done, output_dir=%s", episode_id, output_dir)
-        return {"output_dir": str(output_dir), "models": results}
+        return {"output_dir": str(output_dir), "models": results, "vocals": vocals}
     finally:
         db.close()
 
 
-def run_mvsep_male_female_split(episode_id: int, reporter: ProgressReporter) -> dict:
+def run_mvsep_male_female_split(episode_id: int, reporter: ProgressReporter, add_opt1: "str | None" = None) -> dict:
     """"Take a model, separate the vocal, then split THAT into male/female"
     — the isolated-vocal-first requirement means this deliberately never
     triggers a fresh vocal extraction itself: it reuses whatever
@@ -2132,7 +2164,7 @@ def run_mvsep_male_female_split(episode_id: int, reporter: ProgressReporter) -> 
         output_dir = Path(DATA_DIR) / "episodes" / str(episode_id) / "stems" / "male_female"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        result = mvsep_service.run_male_female_split(ep.vocal_only_stem_path, str(output_dir), on_progress=reporter.update)
+        result = mvsep_service.run_male_female_split(ep.vocal_only_stem_path, str(output_dir), add_opt1=add_opt1, on_progress=reporter.update)
         app_logger.info("run_mvsep_male_female_split: episode %s done, files=%s", episode_id, list(result.keys()))
         return {"output_dir": str(output_dir), "stems": result}
     finally:

@@ -1,5 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import type { SubtitleLine, Character, TeamActor } from '../../types'
+import { RolePalette } from './RolePalette'
 
 function msToTimecode(ms: number): string {
   const h = Math.floor(ms / 3_600_000)
@@ -196,6 +197,8 @@ interface SubtitleGridProps {
   ) => void
   onCreateCharacter: (name: string) => Promise<Character | null>
   onPickTeamActor: (deviceId: string, displayName: string) => Promise<Character | null>
+  // Director's quick casting bar (role chips + number hotkeys) above the grid.
+  rolePalette?: boolean
 }
 
 export function SubtitleGrid({
@@ -214,6 +217,7 @@ export function SubtitleGrid({
   onPasteLines,
   onCreateCharacter,
   onPickTeamActor,
+  rolePalette = false,
 }: SubtitleGridProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [editingCell, setEditingCell] = useState<{ row: number; col: string } | null>(null)
@@ -454,6 +458,57 @@ export function SubtitleGrid({
     [selectedRows, onLineChange]
   )
 
+  // --- Role palette (director): assign a role to the selected rows, or to the
+  // active line when nothing is selected; optionally jump to the next line
+  // that still has no role so a whole episode can be cast from the keyboard.
+  const [autoAdvance, setAutoAdvance] = useState(true)
+  const paletteRoles = useMemo(() => {
+    const counts = new Map<number, number>()
+    for (const l of lines) if (l.character_id != null) counts.set(l.character_id, (counts.get(l.character_id) ?? 0) + 1)
+    return characters
+      .map((c) => ({ ...c, line_count: counts.get(c.id) ?? 0 }))
+      .sort((a, b) => b.line_count - a.line_count || a.name.localeCompare(b.name))
+  }, [characters, lines])
+  const unassignedCount = useMemo(() => lines.reduce((n, l) => n + (l.character_id == null ? 1 : 0), 0), [lines])
+  const assignRole = useCallback(
+    (characterId: number | null) => {
+      const rows = selectedRows.size > 0 ? [...selectedRows] : activeIndex !== null ? [activeIndex] : []
+      if (rows.length === 0) return
+      for (const r of rows) onLineChange(r, { character_id: characterId })
+      if (selectedRows.size > 0) setSelectedRows(new Set())
+      if (autoAdvance && rows.length === 1 && characterId !== null) {
+        const from = rows[0]
+        let next = -1
+        for (let i = from + 1; i < lines.length; i++) {
+          if (lines[i].character_id == null) { next = i; break }
+        }
+        if (next >= 0) onLineClick(next)
+      }
+    },
+    [selectedRows, activeIndex, onLineChange, onLineClick, autoAdvance, lines]
+  )
+  useEffect(() => {
+    if (!rolePalette) return
+    function onKey(e: KeyboardEvent) {
+      const el = e.target as HTMLElement | null
+      const typing = el?.tagName === 'INPUT' || el?.tagName === 'TEXTAREA' || el?.tagName === 'SELECT' || !!el?.isContentEditable
+      if (typing || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return
+      if (!/^[0-9]$/.test(e.key)) return
+      if (e.key === '0') {
+        e.preventDefault()
+        assignRole(null)
+        return
+      }
+      const role = paletteRoles[Number(e.key) - 1]
+      if (role) {
+        e.preventDefault()
+        assignRole(role.id)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [rolePalette, paletteRoles, assignRole])
+
   // Actor is plain text just like the "Текст" column — type a name and it
   // either matches an existing character (case-insensitive) or creates a
   // brand new one on the fly, instead of forcing a pick-from-list-only menu.
@@ -525,6 +580,15 @@ export function SubtitleGrid({
       style={{ zoom: fontScale }}
       onWheel={handleWheel}
     >
+      {rolePalette && (
+        <RolePalette
+          roles={paletteRoles}
+          unassignedCount={unassignedCount}
+          autoAdvance={autoAdvance}
+          onAutoAdvanceChange={setAutoAdvance}
+          onAssign={assignRole}
+        />
+      )}
       {/* Column headers */}
       <div className="flex items-center border-b border-rh-border bg-rh-card2 px-2 flex-shrink-0">
         {COLS.map((col) => {

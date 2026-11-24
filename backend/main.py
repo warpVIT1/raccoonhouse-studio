@@ -6,6 +6,7 @@ Listens on localhost:8765 (port configurable via --port).
 import argparse
 import asyncio
 import os
+import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -148,7 +149,21 @@ async def lifespan(app: FastAPI):
     # looking at Titles/switching screens, so by the time they actually open
     # the Browser it's usually already warm — without reintroducing the
     # original blocking-startup problem this was split out to avoid.
-    asyncio.get_event_loop().run_in_executor(None, separator_service.registry_entries_for_method, "MDX-Net")
+    #
+    # Delayed (measured 2026-11-23): importing torch/onnxruntime holds the GIL
+    # in long stretches, and kicking this off immediately made the renderer's
+    # first requests (/titles, /settings, ...) take 300-450 ms instead of ~7 ms
+    # while the UI was still loading. Waiting lets the first screen render first.
+    async def _prewarm_separator_registry():
+        await asyncio.sleep(20)
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, separator_service.registry_entries_for_method, "MDX-Net"
+            )
+        except Exception:
+            app_logger.exception("separator registry prewarm failed")
+
+    _prewarm_task = asyncio.create_task(_prewarm_separator_registry())  # noqa: F841 - keeps a strong ref
 
     async def _batch_library_cleanup_loop():
         # Runs once shortly after launch and then every few hours for the
@@ -189,6 +204,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Per-launch API token (set by Electron main via RH_API_TOKEN, injected into
+# every renderer request). When unset (standalone dev run) nothing is enforced.
+_API_TOKEN = os.environ.get("RH_API_TOKEN") or ""
+
+
+@app.middleware("http")
+async def require_api_token(request: Request, call_next):
+    if (
+        _API_TOKEN
+        and request.method != "OPTIONS"
+        and request.url.path.startswith("/api")
+        and not secrets.compare_digest(request.headers.get("x-rh-token", ""), _API_TOKEN)
+    ):
+        return JSONResponse({"detail": "Forbidden"}, status_code=403)
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -252,6 +284,9 @@ app.include_router(backup.router, prefix="/api")
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    if _API_TOKEN and not secrets.compare_digest(ws.headers.get("x-rh-token", ""), _API_TOKEN):
+        await ws.close(code=1008)
+        return
     await ws.accept()
     ws_clients.add(ws)
     try:

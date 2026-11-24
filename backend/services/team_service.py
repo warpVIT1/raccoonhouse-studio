@@ -318,6 +318,19 @@ def respond_to_join_request(request_id: str, accept: bool, team_id: str, profile
         "request_id": request_id, "accept": accept,
     }, timeout=15)
     resp.raise_for_status()
+    # Unlike /join and /invites/respond (called FROM the joiner's own
+    # machine, so their local pull_and_merge_all_teams call in routers/teams.py
+    # already covers them), this endpoint runs on the ADMIN's machine —
+    # the actual new member is a different device that has no idea it was
+    # just approved. Nudge it directly so its own backend pulls the team's
+    # titles and tells its UI to refetch immediately, same relay kind the
+    # Worker's /notify-team-content path already uses for ongoing changes
+    # (see discovery_service._handle_relay's "shared_content_updated" branch).
+    if accept:
+        data = resp.json()
+        device_id = data.get("device_id")
+        if device_id:
+            discovery_service.send_relay(device_id, {"kind": "shared_content_updated", "team_id": data.get("team_id", team_id)})
 
 
 def remove_member(team_id: str, device_id: str, profile_name: str) -> None:
@@ -393,6 +406,43 @@ def get_server_stats(profile_name: str) -> dict:
     if not is_app_admin(profile_name):
         raise PermissionError("Лише адмін програми бачить статистику сервера")
     resp = requests.get(f"{_base()}/admin/db-stats", timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_r2_breakdown(profile_name: str) -> list[dict]:
+    """Per-category storage breakdown for the admin panel — proxies the
+    Worker's GET /admin/r2-breakdown (see R2_CATEGORIES there for what the
+    category ids mean). Complements get_server_stats above, which only
+    reports the bucket total."""
+    if not is_app_admin(profile_name):
+        raise PermissionError("Лише адмін програми бачить статистику сервера")
+    resp = requests.get(f"{_base()}/admin/r2-breakdown", timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def list_r2_objects(profile_name: str) -> list[dict]:
+    """Every object in the bucket, largest first — the "подивитись" half of
+    the admin storage panel, so a category that looks too big can be opened
+    up to see which exact files account for it."""
+    if not is_app_admin(profile_name):
+        raise PermissionError("Лише адмін програми бачить статистику сервера")
+    resp = requests.get(f"{_base()}/admin/r2-objects", timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def purge_r2_category(category: str, profile_name: str) -> dict:
+    """Empties one storage category (see the Worker's own R2_CATEGORIES).
+    Destructive and irreversible — the frontend confirms with the user
+    before calling this, and the Worker additionally refuses without its
+    own ?confirm=yes-delete."""
+    if not is_app_admin(profile_name):
+        raise PermissionError("Лише адмін програми може очищати сховище")
+    resp = requests.post(
+        f"{_base()}/admin/r2-purge/{category}", params={"confirm": "yes-delete"}, timeout=120,
+    )
     resp.raise_for_status()
     return resp.json()
 

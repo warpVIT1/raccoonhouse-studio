@@ -682,7 +682,7 @@ def push_character_team_actor(character_id: int, db: Session) -> None:
     try:
         requests.put(
             f"{base}/shared-characters/{char.shared_id}",
-            json={"team_device_id": char.team_device_id}, timeout=15,
+            json={"team_device_id": char.team_device_id, "name": char.name}, timeout=15,
         ).raise_for_status()
     except Exception:
         logger.exception("push_character_team_actor: failed for character %s", character_id)

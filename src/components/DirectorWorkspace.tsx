@@ -7,8 +7,11 @@ import { SubtitleGrid } from './workspace/SubtitleGrid'
 import { SubtitleEditBox } from './workspace/SubtitleEditBox'
 import { MarkersTab } from './workspace/MarkersTab'
 import { Spinner } from './ui/Spinner'
+import { RoleCard } from './workspace/RoleCard'
+import { FindCharacterImages } from './workspace/FindCharacterImages'
+import { IS_ACTOR_BUILD } from '../buildVariant'
 import type {
-  ActorAudioSubmission, Episode, SubtitleLine, Marker, Character, Dubber, Profile, Title, TeamActor,
+  CharacterImageCandidate, CharacterImageSuggestion, RolesFromSubtitlesResult, ActorAudioSubmission, Episode, SubtitleLine, Marker, Character, Dubber, Profile, Title, TeamActor,
 } from '../types'
 
 interface DirectorWorkspaceProps {
@@ -68,6 +71,9 @@ export function DirectorWorkspace({ episodeId, titleId }: DirectorWorkspaceProps
   const fixMarkerInputRefs = useRef<Record<number, HTMLInputElement | null>>({})
 
   const [characters, setCharacters] = useState<Character[]>([])
+  // Hikka portrait candidates per character id (from "Знайти картинки").
+  const [imageCandidates, setImageCandidates] = useState<Record<number, CharacterImageCandidate[]>>({})
+  const [titleName, setTitleName] = useState('')
   const [teamActors, setTeamActors] = useState<TeamActor[]>([])
   const [dubbers, setDubbers] = useState<Dubber[]>([])
   const [profiles, setProfiles] = useState<Profile[]>([])
@@ -111,7 +117,7 @@ export function DirectorWorkspace({ episodeId, titleId }: DirectorWorkspaceProps
       get<Episode>(`/episodes/${episodeId}`),
       get<SubtitleLine[]>(`/episodes/${episodeId}/subtitle-lines`),
       get<Marker[]>(`/episodes/${episodeId}/markers`),
-      get<Character[]>(`/characters?title_id=${titleId}`),
+      get<Character[]>(`/characters?title_id=${titleId}&episode_id=${episodeId}`),
     ])
       .then(([ep, subs, mkrs, chars]) => {
         setEpisode(ep)
@@ -128,7 +134,7 @@ export function DirectorWorkspace({ episodeId, titleId }: DirectorWorkspaceProps
   const loadRoles = useCallback(async () => {
     try {
       const [chars, dubs, profs] = await Promise.all([
-        get<Character[]>(`/characters?title_id=${titleId}`),
+        get<Character[]>(`/characters?title_id=${titleId}&episode_id=${episodeId}`),
         get<Dubber[]>('/dubbers'),
         get<Profile[]>('/profiles'),
       ])
@@ -139,7 +145,7 @@ export function DirectorWorkspace({ episodeId, titleId }: DirectorWorkspaceProps
     } catch (e) {
       setRolesError(extractApiError(e, 'Не вдалося завантажити дані'))
     }
-  }, [get, titleId])
+  }, [get, titleId, episodeId])
 
   useEffect(() => { loadRoles() }, [loadRoles])
 
@@ -150,6 +156,7 @@ export function DirectorWorkspace({ episodeId, titleId }: DirectorWorkspaceProps
   useEffect(() => {
     if (!backendReady) return
     get<Title>(`/titles/${titleId}`)
+      .then((title) => { setTitleName(title.name_original || title.name_ua); return title })
       .then((title) => (title.team_id ? get<TeamActor[]>(`/teams/${title.team_id}/actors`) : []))
       .then(setTeamActors)
       .catch(() => setTeamActors([]))
@@ -780,6 +787,64 @@ export function DirectorWorkspace({ episodeId, titleId }: DirectorWorkspaceProps
     }
   }
 
+  async function renameCharacter(id: number, next: string) {
+    try {
+      await put(`/characters/${id}/name`, { name: next })
+      await loadRoles()
+    } catch (e) {
+      setRolesError(extractApiError(e, 'Не вдалося перейменувати роль'))
+    }
+  }
+
+  async function uploadCharacterImage(id: number, dataUrl: string) {
+    try {
+      const updated = await put<Character>(`/characters/${id}/image-upload`, { data_url: dataUrl })
+      setCharacters((prev) => prev.map((c) => (c.id === id ? { ...c, image_url: updated.image_url } : c)))
+    } catch (e) {
+      setRolesError(extractApiError(e, 'Не вдалося зберегти картинку'))
+      throw e
+    }
+  }
+
+  const [buildingRoles, setBuildingRoles] = useState(false)
+  const [rolesBuildResult, setRolesBuildResult] = useState<RolesFromSubtitlesResult | null>(null)
+
+  // Creates one role per speaking name in this episode's ASS and tags the
+  // still-unassigned lines with it (lines that already have a role are kept).
+  async function buildRolesFromSubtitles() {
+    setBuildingRoles(true)
+    try {
+      const res = await post<RolesFromSubtitlesResult>(`/episodes/${episodeId}/roles-from-subtitles`, {})
+      setRolesBuildResult(res)
+      const [chars, subs] = await Promise.all([
+        get<Character[]>(`/characters?title_id=${titleId}&episode_id=${episodeId}`),
+        get<SubtitleLine[]>(`/episodes/${episodeId}/subtitle-lines`),
+      ])
+      setCharacters(chars)
+      setSubtitles(subs)
+    } catch (e) {
+      setRolesError(extractApiError(e, 'Не вдалося зібрати ролі з субтитрів'))
+    } finally {
+      setBuildingRoles(false)
+    }
+  }
+
+  async function applyImageSuggestions(suggestions: CharacterImageSuggestion[]) {
+    const next: Record<number, CharacterImageCandidate[]> = {}
+    for (const s of suggestions) next[s.character_id] = s.candidates
+    setImageCandidates(next)
+    await loadRoles()
+  }
+
+  async function pickCharacterImage(characterId: number, imageUrl: string | null) {
+    try {
+      await put(`/characters/${characterId}/image`, { image_url: imageUrl })
+      await loadRoles()
+    } catch (e) {
+      setRolesError(extractApiError(e, 'Не вдалося зберегти картинку'))
+    }
+  }
+
   async function removeCharacter(id: number) {
     try {
       await del(`/characters/${id}`)
@@ -806,7 +871,7 @@ export function DirectorWorkspace({ episodeId, titleId }: DirectorWorkspaceProps
   async function assignTeamActor(characterId: number, deviceId: string | null) {
     try {
       const updated = await put<Character>(`/characters/${characterId}/team-actor`, { team_device_id: deviceId })
-      setCharacters((prev) => prev.map((c) => (c.id === characterId ? updated : c)))
+      setCharacters((prev) => prev.map((c) => (c.id === characterId ? { ...c, ...updated, line_count: c.line_count, source_name: c.source_name } : c)))
     } catch (e) {
       setRolesError(extractApiError(e, 'Не вдалося призначити актора'))
     }
@@ -1082,6 +1147,7 @@ export function DirectorWorkspace({ episodeId, titleId }: DirectorWorkspaceProps
                     onPasteLines={handlePasteSubLines}
                     onCreateCharacter={handleCreateCharacter}
                     onPickTeamActor={handlePickTeamActor}
+                    rolePalette={!IS_ACTOR_BUILD}
                   />
                 </div>
               </div>
@@ -1237,47 +1303,61 @@ export function DirectorWorkspace({ episodeId, titleId }: DirectorWorkspaceProps
                   </div>
                 )}
 
-                <div className="bg-rh-card border border-rh-border rounded-2xl overflow-hidden mb-5 max-w-[760px]">
-                  <div className="px-4 py-3 border-b border-rh-border/70 text-[12.5px] font-bold">Персонажі цього тайтлу</div>
-                  <div className="flex flex-col">
-                    {characters.length === 0 && (
-                      <div className="px-4 py-3 text-[11.5px] text-rh-muted">Ще немає жодного персонажа — додайте нижче.</div>
+                <div className="bg-rh-card border border-rh-border rounded-2xl mb-5 max-w-[1100px]">
+                  <div className="px-4 py-3 border-b border-rh-border/70 flex items-start justify-between gap-3">
+                    <div className="text-[12.5px] font-bold">Персонажі цього тайтлу</div>
+                    {!IS_ACTOR_BUILD && (
+                      <button
+                        type="button"
+                        onClick={buildRolesFromSubtitles}
+                        disabled={buildingRoles}
+                        title="Створити ролі з імен у субтитрах цієї серії й проставити їх репліками"
+                        className="rh-btn-outline text-[11px] px-2.5 py-1 flex items-center gap-1"
+                      >
+                        {buildingRoles ? <Spinner size={10} /> : '🎭'} Зібрати ролі з субтитрів
+                      </button>
                     )}
-                    {characters.map((c) => (
-                      <div key={c.id} className="flex items-center gap-2.5 px-4 py-2.5 border-b border-rh-border/50 last:border-b-0">
-                        <div className="flex-1 min-w-0">
-                          <span className="text-[12.5px] font-semibold">{c.name}</span>
-                          {c.code && <span className="ml-1.5 text-[10.5px] font-mono text-rh-muted">{c.code}</span>}
-                        </div>
-                        {/* Assigns Character.team_device_id directly — the
-                            same field the subtitle grid's own АКТОР dropdown
-                            sets, so an actor who already picked themselves
-                            there shows up pre-selected here too (see
-                            assignTeamActor's own comment). Replaces the old
-                            local-profile-only Dubber dropdown, which real
-                            team actors could never appear in. */}
-                        <select
-                          value={c.team_device_id ?? ''}
-                          onChange={(e) => assignTeamActor(c.id, e.target.value || null)}
-                          className="bg-rh-bg border border-rh-border rounded-lg px-2 py-1 text-[11px] max-w-[180px]"
-                        >
-                          <option value="">— без актора —</option>
-                          {teamActors.map((a) => (
-                            <option key={a.device_id} value={a.device_id}>{a.display_name}</option>
-                          ))}
-                        </select>
-                        <button
-                          onClick={() => handleSendToOneActor(c.id)}
-                          disabled={!c.team_device_id || c.team_device_id === 'everyone' || sendingToActorId === c.id}
-                          title="Надіслати відео та субтитри тільки цьому актору"
-                          className="rh-btn-outline text-[10.5px] px-2 py-1 flex-shrink-0 disabled:opacity-30 flex items-center gap-1"
-                        >
-                          {sendingToActorId === c.id ? <Spinner size={10} /> : '📨'}
-                        </button>
-                        <button onClick={() => removeCharacter(c.id)} className="text-rh-muted hover:text-red-400 text-xs flex-shrink-0">✕</button>
-                      </div>
-                    ))}
+                    {!IS_ACTOR_BUILD && (
+                      <FindCharacterImages
+                        titleId={titleId}
+                        titleName={titleName}
+                        onResult={applyImageSuggestions}
+                        onError={setRolesError}
+                      />
+                    )}
                   </div>
+                  {rolesBuildResult && (
+                    <div className="px-4 py-2 text-[11px] text-rh-muted border-b border-rh-border/50 flex items-start gap-2">
+                      <span className="flex-1">
+                        Нових ролей: {rolesBuildResult.created}, вже були: {rolesBuildResult.existing}, реплік призначено: {rolesBuildResult.assigned_lines}.
+                        {rolesBuildResult.skipped.length > 0 && (
+                          <> Пропущено (написи/накладки): {rolesBuildResult.skipped.map((s) => `${s.name} (${s.count})`).join(', ')}.</>
+                        )}
+                      </span>
+                      <button onClick={() => setRolesBuildResult(null)} className="hover:text-white">✕</button>
+                    </div>
+                  )}
+                  {characters.length === 0 ? (
+                    <div className="px-4 py-3 text-[11.5px] text-rh-muted">Ще немає жодного персонажа — додайте нижче або зберіть з субтитрів.</div>
+                  ) : (
+                    <div className="grid gap-4 p-4 grid-cols-[repeat(auto-fill,minmax(180px,1fr))]">
+                      {characters.map((c) => (
+                        <RoleCard
+                          key={c.id}
+                          character={c}
+                          candidates={imageCandidates[c.id] ?? []}
+                          teamActors={teamActors}
+                          sending={sendingToActorId === c.id}
+                          onRename={(name) => renameCharacter(c.id, name)}
+                          onAssignActor={(deviceId) => assignTeamActor(c.id, deviceId)}
+                          onSendToActor={() => handleSendToOneActor(c.id)}
+                          onRemove={() => removeCharacter(c.id)}
+                          onPickImage={(url) => pickCharacterImage(c.id, url)}
+                          onUploadImage={(dataUrl) => uploadCharacterImage(c.id, dataUrl)}
+                        />
+                      ))}
+                    </div>
+                  )}
                   <div className="flex items-center gap-1.5 px-4 py-3 border-t border-rh-border/70">
                     <input
                       value={newCharName}

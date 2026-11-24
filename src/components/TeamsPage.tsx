@@ -655,6 +655,14 @@ function UsersTab() {
   const [busyId, setBusyId] = useState<string | null>(null)
   const [mvsepEnabled, setMvsepEnabled] = useState(false)
   const [mvsepBusy, setMvsepBusy] = useState(false)
+  // Whether the Worker already has a non-empty api_token stored — the only
+  // thing GET /teams/mvsep-config ever reveals about the token itself (see
+  // team_service.get_mvsep_public_config), it deliberately never echoes the
+  // token back so there is nothing here to leak into this component's state.
+  const [mvsepConfigured, setMvsepConfigured] = useState(false)
+  const [mvsepTokenDraft, setMvsepTokenDraft] = useState('')
+  const [mvsepTokenBusy, setMvsepTokenBusy] = useState(false)
+  const [mvsepTokenSaved, setMvsepTokenSaved] = useState(false)
   // Inline Telegram compose, one row open at a time — mirrors busyId's
   // "just track which row" pattern above rather than per-row state objects.
   const [messagingId, setMessagingId] = useState<string | null>(null)
@@ -666,10 +674,11 @@ function UsersTab() {
     try {
       const [data, mvsep] = await Promise.all([
         get<KnownUser[]>('/teams/users/all'),
-        get<{ enabled: boolean }>('/teams/mvsep-config'),
+        get<{ enabled: boolean; configured: boolean }>('/teams/mvsep-config'),
       ])
       setUsers(data)
       setMvsepEnabled(mvsep.enabled)
+      setMvsepConfigured(mvsep.configured)
       setError(null)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Немає доступу')
@@ -721,6 +730,23 @@ function UsersTab() {
     }
   }
 
+  async function saveMvsepToken() {
+    const token = mvsepTokenDraft.trim()
+    if (!token) return
+    setMvsepTokenBusy(true)
+    try {
+      await put('/teams/mvsep-config/token', { api_token: token })
+      setMvsepConfigured(true)
+      setMvsepTokenDraft('')
+      setMvsepTokenSaved(true)
+      setTimeout(() => setMvsepTokenSaved(false), 2500)
+    } catch {
+      // ignore
+    } finally {
+      setMvsepTokenBusy(false)
+    }
+  }
+
   if (loading) return <div className="text-xs text-rh-muted">Завантаження…</div>
   if (error) return <div className="text-xs text-rh-muted">{error}</div>
 
@@ -737,10 +763,29 @@ function UsersTab() {
           <div className="flex-1">
             <div className="text-[12.5px] font-bold">Кредитні нейромережі MVSep — глобально</div>
             <div className="font-mono text-[11px] text-rh-text-dim mt-0.5">
-              Вимикає використання кредитів для всіх одразу, незалежно від команд і особистих дозволів
+              Дозволяє використання кредитів для всіх одразу — головний перемикач, він перебиває командні та особисті дозволи нижче
             </div>
           </div>
           <Toggle checked={mvsepEnabled} onChange={toggleMvsep} className={mvsepBusy ? 'opacity-50 pointer-events-none' : ''} />
+        </div>
+        <div className="flex items-center gap-2 py-3 px-4 border-t border-rh-border/70">
+          <input
+            type="password"
+            value={mvsepTokenDraft}
+            onChange={(e) => setMvsepTokenDraft(e.target.value)}
+            placeholder={mvsepConfigured ? 'Токен вже налаштовано — вставте новий, щоб замінити' : 'Вставте MVSep API-токен (mvsep.com)'}
+            className="rh-input flex-1 text-[11px] font-mono"
+          />
+          <button
+            onClick={saveMvsepToken}
+            disabled={mvsepTokenBusy || !mvsepTokenDraft.trim()}
+            className="rh-btn-outline text-[11px] px-2.5 py-1.5 flex-shrink-0"
+          >
+            {mvsepTokenBusy ? <Spinner size={11} /> : mvsepTokenSaved ? 'Збережено!' : 'Зберегти'}
+          </button>
+          <span className={`text-[10.5px] flex-shrink-0 ${mvsepConfigured ? 'text-emerald-400' : 'text-rh-muted'}`}>
+            {mvsepConfigured ? '✓ налаштовано' : 'не налаштовано'}
+          </span>
         </div>
       </div>
 
@@ -840,6 +885,10 @@ function DatabaseTab() {
   const [logContent, setLogContent] = useState<string | null>(null)
   const [logError, setLogError] = useState<string | null>(null)
   const [logLoading, setLogLoading] = useState(false)
+  // null while live/never fetched, an ISO string once a stale snapshot (the
+  // person is offline) was returned instead of a fresh live read — see
+  // discovery_service.fetch_log_by_device_id.
+  const [logSnapshotAt, setLogSnapshotAt] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     try {
@@ -872,21 +921,37 @@ function DatabaseTab() {
   }, [expandedId, get, reports, feedback, errors])
 
   // On-demand, not auto-fetched — this is a live relay call to the target
-  // person's own machine (see backend discovery_service.fetch_log_by_device_id),
-  // only works while they're online, and can take up to ~20s to time out
-  // when they're not — no reason to fire it just from expanding a row.
+  // person's own machine (see backend discovery_service.fetch_log_by_device_id)
+  // when they're online (can take up to ~20s to time out when they're not),
+  // falling back to their last pushed snapshot otherwise — no reason to
+  // fire it just from expanding a row.
   async function fetchLog(deviceId: string, filename: string) {
     setLogLoading(true)
     setLogError(null)
     setLogContent(null)
+    setLogSnapshotAt(null)
     try {
-      const result = await get<{ content: string }>(`/teams/users/${deviceId}/log?filename=${filename}`)
+      const result = await get<{ content: string; live: boolean; snapshot_at: string | null }>(
+        `/teams/users/${deviceId}/log?filename=${filename}`
+      )
       setLogContent(result.content || '(порожньо)')
+      setLogSnapshotAt(result.live ? null : result.snapshot_at)
     } catch (e) {
       setLogError(e instanceof Error ? e.message : 'Не вдалося отримати журнал')
     } finally {
       setLogLoading(false)
     }
+  }
+
+  function downloadLog(displayName: string, filename: string) {
+    if (logContent == null) return
+    const blob = new Blob([logContent], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${displayName}_${filename}`
+    a.click()
+    URL.revokeObjectURL(url)
   }
 
   async function deleteUser(deviceId: string) {
@@ -929,6 +994,7 @@ function DatabaseTab() {
                 setDetailTab('console')
                 setLogContent(null)
                 setLogError(null)
+                setLogSnapshotAt(null)
               }}
             >
               {u.telegram_id != null && avatarBase ? (
@@ -1003,17 +1069,29 @@ function DatabaseTab() {
                         disabled={logLoading}
                         className="rh-btn-outline text-[10px] px-2 py-1 ml-auto flex-shrink-0"
                       >
-                        {logLoading ? <Spinner size={11} /> : 'Завантажити'}
+                        {logLoading ? <Spinner size={11} /> : 'Отримати'}
+                      </button>
+                      <button
+                        onClick={() => downloadLog(u.display_name, logFile)}
+                        disabled={logContent == null}
+                        className="rh-btn-outline text-[10px] px-2 py-1 flex-shrink-0"
+                      >
+                        Скачати файл
                       </button>
                     </div>
                     {logError && <div className="text-[11px] text-[#FF6B70]">{logError}</div>}
+                    {logSnapshotAt && (
+                      <div className="text-[10.5px] text-amber-400/90">
+                        Людина зараз офлайн — показано останній знімок від {new Date(logSnapshotAt).toLocaleString()}, а не живий журнал.
+                      </div>
+                    )}
                     {logContent != null && (
                       <pre className="text-[10px] font-mono text-rh-text-dim bg-rh-bg border border-rh-border rounded-lg p-2.5 max-h-72 overflow-auto whitespace-pre-wrap break-words">
                         {logContent}
                       </pre>
                     )}
                     {logContent == null && !logError && !logLoading && (
-                      <div className="text-xs text-rh-muted">Натисніть «Завантажити», щоб отримати свіжий журнал (лише поки людина в мережі).</div>
+                      <div className="text-xs text-rh-muted">Натисніть «Отримати» — живий журнал, поки людина в мережі, інакше останній збережений знімок.</div>
                     )}
                   </div>
                 )}

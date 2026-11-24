@@ -20,6 +20,7 @@ import { BackupRestoredBanner } from './components/BackupRestoredBanner'
 import { useAppStore } from './stores/appStore'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useApi } from './hooks/useApi'
+import { IS_ACTOR_BUILD } from './buildVariant'
 import type { AppSettings } from './types'
 
 export default function App() {
@@ -107,7 +108,7 @@ export default function App() {
         />
         <main className="flex-1 overflow-hidden">
           {currentView === 'settings' && <SettingsPage />}
-          {currentView === 'browser' && <ModelBrowserPage />}
+          {currentView === 'browser' && !IS_ACTOR_BUILD && <ModelBrowserPage />}
           {currentView === 'teams' && <TeamsPage />}
           {currentView === 'contact' && <ContactPage />}
           {currentView === 'titles' && <TitlesPage />}
@@ -120,10 +121,17 @@ export default function App() {
           )}
         </main>
       </div>
-      <PowerShareConsentPopup />
-      <PowerShareModelDownloadPopup />
-      <PowerShareLendingBanner />
-      <PowerShareBorrowingBanner />
+      {/* Power-sharing lends/borrows GPU separation work between studio PCs —
+          meaningless on a build with no separation stack of its own to
+          offer or receive (see buildVariant.ts). */}
+      {!IS_ACTOR_BUILD && (
+        <>
+          <PowerShareConsentPopup />
+          <PowerShareModelDownloadPopup />
+          <PowerShareLendingBanner />
+          <PowerShareBorrowingBanner />
+        </>
+      )}
       <ForceUpdateBanner />
       <TeamInviteBanner />
       <UpdateDialog />

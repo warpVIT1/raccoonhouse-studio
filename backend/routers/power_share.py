@@ -104,14 +104,24 @@ def model_download_respond(body: PowerShareRespondIn):
 def broadcast_force_update(db: Session = Depends(get_db)):
     # Admin-only nudge, not an actual forced download/install (an admin
     # forcibly restarting someone else's app mid-render would destroy active
-    # work) — just a dismissible "go check for an update" notice pushed to
-    # every currently-online peer over the relay.
+    # work) — just a dismissible "go check for an update" notice: saved on
+    # the Worker for everyone (shown once at their next launch) and pushed
+    # live to every peer that is online right now.
     settings = db.get(AppSettings, 1)
     profile = db.get(Profile, settings.active_profile_id) if settings and settings.active_profile_id else None
     if not team_service.is_admin_profile(profile):
         raise HTTPException(403, "Лише адмін може надсилати це всім")
-    sent = discovery_service.broadcast_force_update_request(profile.name)
-    return {"sent": sent}
+    result = discovery_service.broadcast_force_update_request(profile.name)
+    notice = result["notice"]
+    return {"sent": result["sent"], "notice_id": notice["id"] if notice else None}
+
+
+@router.get("/power-share/update-notice")
+def get_update_notice():
+    # Polled by every install (on launch, then periodically) — the stored
+    # counterpart of the live relay push above, so the notice also reaches
+    # whoever was offline when the admin sent it.
+    return discovery_service.fetch_update_notice()
 
 
 @router.get("/power-share/peers/{peer_id}/log")

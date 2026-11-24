@@ -15,26 +15,36 @@ real output files. The non-vocal stem comes back labeled "Other", NOT
 which one a given MVSep model uses isn't consistent.
 
 mvsep.com's real full catalog (confirmed against the actual site, not just
-docs) has 130+ sep_types, but almost all of them (single instrument
+docs) has 120+ active algorithms, but most of them (single instrument
 isolators — tuba, banjo, clarinet…; TTS/voice cloning; song generation;
 MIDI transcription; audio upscaling) are a different job entirely from
 "isolate vocal from instrumental for dubbing": some don't even take an
 audio file as input, others return stems that have nothing to do with
-vocals/instrumental. MVSEP_CATEGORIES below is restricted to sep_types that
-can produce a genuine vocal + full-instrumental pair — see run_separation's
-"sum every non-vocal stem" approach, which is what makes multistem entries
-like BS Roformer SW or MVSep DnR v3 (3+ stems, no single file literally
-typed "Instrumental") work correctly rather than quietly shipping an
-instrumental that's missing its drums/bass/effects. Two categories of
-model still can NEVER work here and are deliberately left out even though
-they're technically "separation" too: anything with zero vocal-typed
-output (e.g. DrumSep — kick/snare/cymbals/…, no vocals stem at all) and
-anything with zero non-vocal output (e.g. MVSep Male/Female separation —
-splits the vocal itself into male_vocals/female_vocals, nothing else) —
-run_separation's own vocal/instrumental-file checks would reject both with
-a clear error every single time, so exposing them in the picker would just
-be false advertising of something guaranteed to fail.
+vocals/instrumental. Rather than hand-maintaining a static allowlist that
+silently goes stale whenever mvsep.com adds/removes/reprices something,
+get_public_categories() below builds the picker LIVE from mvsep.com's own
+public GET /api/app/algorithms (see _get_cached_algorithms), filtered down
+to algorithms that can produce a genuine vocal + full-instrumental pair —
+see run_separation's "sum every non-vocal stem" approach, which is what
+makes multistem entries like BS Roformer SW or MVSep DnR v3 (3+ stems, no
+single file literally typed "Instrumental") work correctly rather than
+quietly shipping an instrumental that's missing its drums/bass/effects.
+Two shapes are filtered out because run_separation's own vocal/
+instrumental-file checks would reject them with a clear error every single
+time, so exposing them in the picker would just be false advertising of
+something guaranteed to fail: zero vocal-typed output (e.g. DrumSep —
+kick/snare/cymbals/…, no vocals stem at all) and multiple vocal-typed
+outputs with no single unambiguous one (e.g. MVSep Karaoke, which splits
+into lead+backing vocals — both stems match the vocal-type check, so
+run_separation's "exactly one vocal file" guard would reject it too). See
+_produces_exactly_one_vocal_stem for the exact rule. MVSep Male/Female
+separation (zero non-vocal output — splits the vocal itself into male/
+female) is excluded the same way since mvsep.com's own catalog carries no
+output_stems metadata for it at all, which this filter already treats as
+"can't confirm this shape, leave it out" — see get_male_female_models for
+its own dedicated (also live) picker.
 """
+import json
 import os
 import shutil
 import time
@@ -44,40 +54,103 @@ import requests
 
 MVSEP_API_BASE = "https://mvsep.com/api"
 
-# (display label, sep_type, add_opt1 or "" if the algorithm takes none,
-# premium — True for the mvsep.com-marked 🔒-only entries, which likely
-# fail on a non-Premium account/token). Only sep_type=40/add_opt1=81 (BS
-# Roformer) has been exercised against the real API so far; the rest are
-# taken on faith from mvsep.com's own site listing/docs and should be
-# spot-checked the first time each is actually used — MVSep returns a clear
-# {"success": false, "data": {"message": ...}} on a bad id/unavailable
-# model, so a wrong or premium-gated one fails loudly rather than silently
-# misbehaving (see run_separation below).
-MVSEP_CATEGORIES: list[tuple[str, list[tuple[str, str, str, bool]]]] = [
-    ("Вокал / Інструментал", [
-        ("BS Roformer (2025.07)", "40", "81", False),
-        ("BS PolarFormer (124 bands)", "123", "163", False),
-        ("MelBand Roformer (2024.10)", "48", "4", False),
-        ("MDX23C (8K FFT)", "25", "7", False),
-        ("SCNet", "46", "5", False),
-        ("Demucs4 Vocals 2023", "27", "", False),
-        ("MVSep Multichannel BS", "43", "0", False),
-    ]),
-    ("Мультистем (стеми сумуються в один інструментал)", [
-        ("BS Roformer SW (vocals, bass, drums, guitar, piano, other)", "63", "", False),
-        ("MVSep DnR v3 (speech, music, effects)", "56", "2", False),
-    ]),
-    ("Ансамблі (преміум)", [
-        ("Ensemble (vocals, instrum)", "26", "7", True),
-        ("Ensemble (vocals, instrum, bass, drums, other)", "28", "11", True),
-    ]),
-    ("Старі моделі", [
-        ("Vit Large 23 (v2)", "33", "1", False),
-        ("UVRv5 Demucs", "17", "0", False),
-        ("MVSep Old Vocal Model", "19", "", False),
-        ("spleeter", "0", "0", False),
-    ]),
-]
+# In-memory cache for mvsep.com's own public GET /api/app/algorithms — the
+# single source of truth get_public_categories() and get_male_female_models()
+# both build their live, auto-updating pickers from, so a model mvsep.com
+# adds/removes/reprices shows up here without an app update. Cached rather
+# than fetched on every modal open (avoids a network round trip in the hot
+# path and keeps the picker working during a brief mvsep.com outage) but
+# still bounded so a real catalog change reaches users within hours, not
+# only at the next release.
+_ALGORITHMS_CACHE_TTL_SECONDS = 6 * 3600
+_algorithms_cache: dict = {"data": None, "fetched_at": 0.0}
+
+
+def _get_cached_algorithms() -> list[dict]:
+    now = time.monotonic()
+    if _algorithms_cache["data"] is not None and now - _algorithms_cache["fetched_at"] < _ALGORITHMS_CACHE_TTL_SECONDS:
+        return _algorithms_cache["data"]
+    try:
+        resp = requests.get(f"{MVSEP_API_BASE}/app/algorithms", timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        _algorithms_cache["data"] = data
+        _algorithms_cache["fetched_at"] = now
+        return data
+    except Exception:
+        # Best-effort — keep serving the last good fetch (even stale) rather
+        # than breaking the picker over a transient mvsep.com hiccup; only
+        # truly empty if this is the very first call and it failed.
+        return _algorithms_cache["data"] or []
+
+
+def _stem_list(algorithm: dict) -> list[str]:
+    """output_stems comes back as a JSON-encoded STRING inside the JSON
+    response (confirmed live 2026-09-16), not a real array — decode it, or
+    treat missing/malformed metadata as "no stems known" rather than
+    guessing, since a wrong guess here is what would surface a
+    guaranteed-to-fail model in the picker (see module docstring)."""
+    raw = algorithm.get("output_stems")
+    if not isinstance(raw, str):
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _produces_exactly_one_vocal_stem(stems: list[str]) -> bool:
+    vocal_matches = [s for s in stems if s == "speech" or s.startswith("vocals")]
+    return len(vocal_matches) == 1 and len(stems) > len(vocal_matches)
+
+
+def _default_add_opt1(algorithm: dict) -> str:
+    for f in algorithm.get("algorithm_fields") or []:
+        if f.get("name") == "add_opt1":
+            return str(f.get("default_key") or "")
+    return ""
+
+
+# mvsep.com's catalog carries no explicit premium/registered-only flag on
+# the algorithm object itself (confirmed live 2026-09-16 — every Ensembles-
+# group entry observed is premium-locked on the site, nothing else is), so
+# this is a heuristic, not ground truth. Worst case a wrongly-unmarked
+# premium model fails loudly with MVSep's own error on /separation/create
+# (see run_separation) rather than silently misbehaving.
+_PREMIUM_GROUPS = {"Ensembles"}
+
+# spleeter (render_id=0) predates mvsep.com's own output_stems metadata —
+# confirmed live 2026-09-16 it returns output_stems=None despite genuinely
+# working (vocals + accompaniment), so the live filter above can't confirm
+# its shape and would otherwise drop it. Kept as a single manually-verified
+# exception rather than trusting metadata mvsep.com itself doesn't have.
+_LEGACY_RENDER_IDS_WITHOUT_STEM_METADATA = {0}
+
+
+def get_public_categories() -> list[dict]:
+    """Live, auto-updating model picker — every active mvsep.com algorithm
+    that can produce a genuine vocal + instrumental pair (see module
+    docstring), grouped by mvsep.com's own algorithm_group. No secrets in
+    here (just labels/ids/premium flags/price coefficients)."""
+    models_by_group: dict[str, list[dict]] = {}
+    for a in _get_cached_algorithms():
+        if not a.get("is_active") or a.get("render_id") is None:
+            continue
+        stems = _stem_list(a)
+        if not _produces_exactly_one_vocal_stem(stems) and a["render_id"] not in _LEGACY_RENDER_IDS_WITHOUT_STEM_METADATA:
+            continue
+        group_name = ((a.get("algorithm_group") or {}).get("name")) or "Інше"
+        models_by_group.setdefault(group_name, []).append({
+            "label": a["name"],
+            "sepType": str(a["render_id"]),
+            "addOpt1": _default_add_opt1(a),
+            "premium": group_name in _PREMIUM_GROUPS,
+            "priceCoefficient": a.get("price_coefficient", 1),
+        })
+    return [{"category": group, "models": models} for group, models in models_by_group.items()]
+
+
 MVSEP_METHOD = "MVSep"
 
 # "Speech" is DnR-style models' name for the dialogue/vocal stem — not just
@@ -279,29 +352,85 @@ def run_separation(audio_path: str, sep_type: str, add_opt1: str, output_dir: st
 
 # Male/Female separation splits an already-isolated vocal into male_vocals/
 # female_vocals — no instrumental output at all, so it deliberately never
-# goes through run_separation's vocal+instrumental logic above. sep_type=57,
-# add_opt1=2 (MelRoformer, mvsep.com's own default); add_opt2 (0: "Extract
-# directly" vs 1: "Extract vocals first") is left at its default of 0
-# because the input here is ALREADY a clean isolated vocal (see
-# run_mvsep_male_female_split in separator_service.py, which requires
+# goes through run_separation's vocal+instrumental logic above. sep_type=57;
+# add_opt2 (0: "Extract directly" vs 1: "Extract vocals first") is left at
+# its default of 0 because the input here is ALREADY a clean isolated vocal
+# (see run_mvsep_male_female_split in separator_service.py, which requires
 # Episode.vocal_only_stem_path to already exist before this ever runs) —
-# asking MVSep to extract vocals again would be redundant.
+# asking MVSep to extract vocals again would be redundant, so only add_opt1
+# (which underlying model) is exposed as a choice.
 MALE_FEMALE_SEP_TYPE = "57"
-MALE_FEMALE_ADD_OPT1 = "2"
+MALE_FEMALE_ADD_OPT1 = "2"  # MelRoformer (2025.01) — kept as the default choice below
+
+# Fallback only — used when the live catalog (get_male_female_models below)
+# is unreachable or mvsep.com restructures this algorithm's fields. Last
+# confirmed live 2026-09-16 against the live form's rendered <select> (SDR
+# figures are mvsep.com's own). Order matches the live dropdown at that time.
+MALE_FEMALE_MODELS = [
+    ("BSRoformer by Sucial (SDR: 6.52)", "0"),
+    ("BSRoformer by aufr33 (SDR: 8.18)", "3"),
+    ("SCNet XL (SDR: 11.83)", "1"),
+    ("MelRoformer (2025.01) (SDR: 13.03)", "2"),
+]
+# Same price_coefficient for all four — confirmed 2026-09-16 against
+# GET /api/app/algorithms (render_id=57): no per-option price_rules on this
+# algorithm's add_opt1 field, unlike some others (e.g. BS Roformer's overlap
+# option).
+MALE_FEMALE_PRICE_COEFFICIENT = 1
 
 
-def run_male_female_split(vocal_audio_path: str, output_dir: str, on_progress=None) -> dict:
+def get_male_female_models() -> list[dict]:
+    """Live, auto-updating add_opt1 choices for MVSep Male/Female separation
+    (render_id=57) — same cached catalog as get_public_categories(), scoped
+    to this one algorithm's own model_type options, so a model mvsep.com
+    adds/removes there shows up here too without an app update. Falls back
+    to MALE_FEMALE_MODELS if the live catalog can't be read."""
+    for a in _get_cached_algorithms():
+        if a.get("render_id") != int(MALE_FEMALE_SEP_TYPE):
+            continue
+        for f in a.get("algorithm_fields") or []:
+            if f.get("name") != "add_opt1":
+                continue
+            options = f.get("options")
+            if isinstance(options, str):
+                try:
+                    options = json.loads(options)
+                except (TypeError, ValueError):
+                    options = None
+            if isinstance(options, dict) and options:
+                coefficient = a.get("price_coefficient", MALE_FEMALE_PRICE_COEFFICIENT)
+                return [
+                    {"label": label, "addOpt1": key, "priceCoefficient": coefficient}
+                    for key, label in options.items()
+                ]
+    return [
+        {"label": label, "addOpt1": add_opt1, "priceCoefficient": MALE_FEMALE_PRICE_COEFFICIENT}
+        for label, add_opt1 in MALE_FEMALE_MODELS
+    ]
+
+
+def run_male_female_split(vocal_audio_path: str, output_dir: str, add_opt1: "str | None" = None, on_progress=None) -> dict:
     """Second stage of the "isolate vocal, then split by gender" chain —
     takes an ALREADY-isolated vocal file (not the original mixed audio) and
     returns {"<type>": path, ...} for every stem MVSep hands back (expected:
     two, but downloading by whatever "type" string actually comes back
     rather than hardcoding "male"/"female" — that exact wording isn't
-    confirmed live, unlike run_separation's "Vocals"/"Other")."""
+    confirmed live, unlike run_separation's "Vocals"/"Other").
+
+    `add_opt1` picks which underlying model (see get_male_female_models) —
+    defaults to MALE_FEMALE_ADD_OPT1 (MelRoformer) when not given, same
+    choice this always made before model selection existed. Not pre-
+    validated against the live list here — MVSep itself rejects a bad
+    add_opt1 with a clear error on /separation/create, and re-checking
+    against a cache that might be stale would only risk a false rejection."""
+    if add_opt1 is None:
+        add_opt1 = MALE_FEMALE_ADD_OPT1
+
     def progress(pct, msg):
         if on_progress:
             on_progress(pct, msg)
 
-    files = _create_and_wait(vocal_audio_path, MALE_FEMALE_SEP_TYPE, MALE_FEMALE_ADD_OPT1, progress)
+    files = _create_and_wait(vocal_audio_path, MALE_FEMALE_SEP_TYPE, add_opt1, progress)
     if len(files) < 2:
         raise MVSepError(f"MVSep повернув недостатньо доріжок для розділення за статтю: {[f.get('type') for f in files]}")
     progress(70, "Завантажую результат…")
@@ -315,21 +444,6 @@ def run_male_female_split(vocal_audio_path: str, output_dir: str, on_progress=No
         progress(70 + int((i + 1) / len(files) * 25), "Завантажую результат…")
     progress(100, "Готово")
     return result
-
-
-def get_public_categories() -> list[dict]:
-    """MVSEP_CATEGORIES reshaped for the frontend — no secrets in here (just
-    labels/ids/premium flags), unlike get_config()."""
-    return [
-        {
-            "category": category,
-            "models": [
-                {"label": label, "sepType": sep_type, "addOpt1": add_opt1, "premium": premium}
-                for label, sep_type, add_opt1, premium in models
-            ],
-        }
-        for category, models in MVSEP_CATEGORIES
-    ]
 
 
 def get_balance() -> dict:

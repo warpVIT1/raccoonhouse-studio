@@ -275,13 +275,18 @@ export class PeerRegistry {
         // /notify-director (translator -> director handoff) can find
         // "teammates with role X who have Telegram linked" without a
         // dedicated sync channel — see known_devices' schema.sql comment.
+        // Roles are granted by a team admin (PUT /known-devices/:id/roles), never
+        // self-edited, so a hello must NOT overwrite a row that already has them:
+        // the device's own (possibly stale) local copy used to win on every
+        // reconnect and silently revert the admin's change. It only seeds roles
+        // for a device the Worker has not stored any for yet.
         const roles = Array.isArray(msg.roles) ? JSON.stringify(msg.roles) : null;
         const telegramId = typeof msg.telegram_id === "number" ? msg.telegram_id : null;
         const telegramUsername = typeof msg.telegram_username === "string" && msg.telegram_username ? msg.telegram_username : null;
         this.ctx.waitUntil(
           this.env.MODELS_DB.prepare(
             `INSERT INTO known_devices (device_id, display_name, first_seen_at, last_seen_at, roles, telegram_id, telegram_username) VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(device_id) DO UPDATE SET display_name = excluded.display_name, last_seen_at = excluded.last_seen_at, roles = excluded.roles, telegram_id = excluded.telegram_id, telegram_username = excluded.telegram_username`,
+             ON CONFLICT(device_id) DO UPDATE SET display_name = excluded.display_name, last_seen_at = excluded.last_seen_at, roles = COALESCE(known_devices.roles, excluded.roles), telegram_id = excluded.telegram_id, telegram_username = excluded.telegram_username`,
           ).bind(teamDeviceId, String(msg.name ?? "?"), now, now, roles, telegramId, telegramUsername).run().catch(() => {}),
         );
       }
